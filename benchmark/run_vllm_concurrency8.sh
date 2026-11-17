@@ -1,90 +1,173 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   ./benchmark/run_vllm_concurrency8.sh \
-#     /path/to/omnidocbench /path/to/midv500 /path/to/midv-lait \
-#     /path/to/model /path/to/results
-
+# Run from any directory. Results must be new: no historical output reuse.
 OMNIDOC_ROOT=${1:?missing OmniDocBench image root}
 MIDV500_ROOT=${2:?missing MIDV-500 image root}
 MIDV_LAIT_ROOT=${3:?missing MIDV-LAIT image root}
 MODEL_PATH=${4:?missing model path}
 RESULT_ROOT=${5:?missing result root}
-
 GPU_ID=${GPU_ID:-1}
 PORT=${PORT:-26000}
 MODEL_NAME=${MODEL_NAME:-Xiaomi-OCR-0}
-GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.80}
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-600}
-MAX_TOKENS=${MAX_TOKENS:-16384}
-
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
+DTYPE=${DTYPE:-auto}
+WARMUP=${WARMUP:-5}
+REPRESENTATIVES=${REPRESENTATIVES:-5}
+PROFILE_MAX_ITERATIONS=${PROFILE_MAX_ITERATIONS:-64}
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT_DIR"
+if [[ -e "$RESULT_ROOT" ]]; then
+  echo "Refusing to reuse result directory: $RESULT_ROOT" >&2
+  exit 2
+fi
+mkdir -p "$RESULT_ROOT"
+RESULT_ROOT=$(cd "$RESULT_ROOT" && pwd)
+LOG_DIR="$RESULT_ROOT/logs"
+mkdir -p "$LOG_DIR" "$RESULT_ROOT/profiler_raw"
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export TOKENIZERS_PARALLELISM=false
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+# Required by vLLM versions which gate /collective_rpc and profiler endpoints.
+# Bind localhost only: never expose these development endpoints to a network.
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_TORCH_PROFILER_DIR="$RESULT_ROOT/profiler_raw"
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MANIFEST_DIR="$RESULT_ROOT/manifests"
-LOG_DIR="$RESULT_ROOT/logs"
-mkdir -p "$RESULT_ROOT" "$LOG_DIR"
+PREP_ARGS=()
+[[ -z "${OMNIDOC_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--omnidocbench-annotations "$OMNIDOC_ANNOTATIONS")
+[[ -z "${MIDV500_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--midv500-annotations "$MIDV500_ANNOTATIONS")
+[[ -z "${MIDV_LAIT_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--midv-lait-annotations "$MIDV_LAIT_ANNOTATIONS")
+python -m benchmark.prepare_datasets --output-dir "$RESULT_ROOT/manifests" \
+  --omnidocbench "$OMNIDOC_ROOT" --midv500 "$MIDV500_ROOT" --midv-lait "$MIDV_LAIT_ROOT" "${PREP_ARGS[@]}"
 
-python "$ROOT_DIR/benchmark/prepare_datasets.py" \
-  --output-dir "$MANIFEST_DIR" \
-  --omnidocbench "$OMNIDOC_ROOT" \
-  --midv500 "$MIDV500_ROOT" \
-  --midv-lait "$MIDV_LAIT_ROOT"
-
-# Start one vLLM server on physical GPU 1. No --enforce-eager: keep vLLM defaults.
-vllm serve "$MODEL_PATH" \
-  --served-model-name "$MODEL_NAME" \
-  --host 127.0.0.1 \
-  --port "$PORT" \
-  --gpu-memory-utilization "$GPU_MEM_UTIL" \
-  --max-model-len 16384 \
-  > "$LOG_DIR/vllm_server.log" 2>&1 &
-VLLM_PID=$!
-trap 'kill "$VLLM_PID" 2>/dev/null || true' EXIT
-
+vllm --version > "$LOG_DIR/vllm_version.txt" 2>&1
+if ! vllm serve --help=all > "$LOG_DIR/vllm_serve_help.txt" 2>&1; then
+  vllm serve --help > "$LOG_DIR/vllm_serve_help.txt" 2>&1
+fi
+if ! grep -q -- '--worker-extension-cls' "$LOG_DIR/vllm_serve_help.txt"; then
+  echo "This vLLM lacks --worker-extension-cls. Supply its version before adapting worker instrumentation; no fake metrics will be produced." >&2
+  exit 2
+fi
+EXTRA_ARGS=(--worker-extension-cls benchmark.worker_extension.BenchmarkWorkerExtension --generation-config vllm)
+if [[ "${TRUST_REMOTE_CODE:-0}" == 1 ]]; then
+  EXTRA_ARGS+=(--trust-remote-code)
+fi
+# New versions use a JSON profiler config. Older versions use the documented env interface.
+if grep -q -- '--profiler-config' "$LOG_DIR/vllm_serve_help.txt"; then
+  PROFILER_CONFIG=$(python - "$RESULT_ROOT/profiler_raw" "$PROFILE_MAX_ITERATIONS" <<'PY'
+import json, sys
+from vllm.config import ProfilerConfig
+fields = set(getattr(ProfilerConfig, "__dataclass_fields__", {})) | set(getattr(ProfilerConfig, "__annotations__", {}))
+config = {"profiler": "torch", "torch_profiler_dir": sys.argv[1],
+          "torch_profiler_with_stack": True, "torch_profiler_record_shapes": True,
+          "torch_profiler_with_memory": True, "torch_profiler_with_flops": True}
+if "max_iterations" in fields:
+    config["max_iterations"] = int(sys.argv[2])
+if "ignore_frontend" in fields:
+    config["ignore_frontend"] = True
+print(json.dumps(config))
+PY
+)
+  EXTRA_ARGS+=(--profiler-config "$PROFILER_CONFIG")
+else
+  export VLLM_TORCH_PROFILER_WITH_STACK=1
+  export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
+  export VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY=1
+  export VLLM_TORCH_PROFILER_WITH_FLOPS=1
+fi
+python - "$RESULT_ROOT/server_command.json" "$MODEL_PATH" "$MODEL_NAME" "$PORT" "$GPU_MEM_UTIL" "$MAX_MODEL_LEN" "$DTYPE" "${EXTRA_ARGS[@]}" <<'PY'
+import json, sys
+path, model, name, port, util, length, dtype, *extra = sys.argv[1:]
+command = ["vllm", "serve", model, "--served-model-name", name, "--host", "127.0.0.1", "--port", port,
+           "--gpu-memory-utilization", util, "--max-model-len", length, "--dtype", dtype, *extra]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(command, f, indent=2)
+PY
 python - "$PORT" <<'PY'
-import sys, time, urllib.request
-url = f"http://127.0.0.1:{sys.argv[1]}/v1/models"
+import socket, sys
+with socket.socket() as sock:
+    try:
+        sock.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError as exc:
+        raise SystemExit(f"Benchmark port is unavailable; refusing to attach to an unrelated server: {exc}")
+PY
+SERVER_START=$(python -c 'import time; print(time.time())')
+vllm serve "$MODEL_PATH" --served-model-name "$MODEL_NAME" --host 127.0.0.1 \
+  --port "$PORT" --gpu-memory-utilization "$GPU_MEM_UTIL" --max-model-len "$MAX_MODEL_LEN" \
+  --dtype "$DTYPE" "${EXTRA_ARGS[@]}" > "$LOG_DIR/vllm_server.log" 2>&1 &
+VLLM_PID=$!
+cleanup() {
+  # Only this launcher-recorded PID. No pgrep/pkill or shared-host process matching.
+  if kill -0 "$VLLM_PID" 2>/dev/null; then
+    kill "$VLLM_PID" 2>/dev/null || true
+    wait "$VLLM_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+python - "$PORT" "$VLLM_PID" "$SERVER_START" "$RESULT_ROOT/server_startup.json" <<'PY'
+import json, os, sys, time, urllib.request
+port, pid, start, output = sys.argv[1:]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 for _ in range(240):
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        raise SystemExit("vLLM exited during startup; inspect logs/vllm_server.log")
+    try:
+        with opener.open(f"http://127.0.0.1:{port}/v1/models", timeout=5) as response:
             if response.status == 200:
-                print("vLLM server is ready")
-                raise SystemExit(0)
+                ready = time.time()
+                with open(output, "w") as f:
+                    json.dump({"server_start_wall_s": float(start), "server_ready_wall_s": ready,
+                               "cold_start_latency_s": ready - float(start), "server_pid": int(pid),
+                               "cold_start_scope": "launch through HTTP readiness, includes load/compile/graph capture",
+                               "model_load_time_s": None, "cuda_initialization_time_s": None}, f, indent=2)
+                break
     except Exception:
         time.sleep(5)
-raise SystemExit("vLLM server did not become ready; inspect logs/vllm_server.log")
+else:
+    raise SystemExit("vLLM readiness timed out; inspect logs/vllm_server.log")
 PY
-
-declare -A DATASET_START
+# Fail early if worker instrumentation is unreachable, rather than running a misleading client-only benchmark.
+python - "$PORT" <<'PY'
+import sys
+from benchmark.monitor import rpc
+snapshots = rpc(f"http://127.0.0.1:{sys.argv[1]}", "benchmark_snapshot", ["false"])
+if not snapshots or any(s.get("peak_allocated_bytes") is None for s in snapshots):
+    raise SystemExit("worker memory RPC unavailable; inspect installed vLLM interface")
+print("Worker instrumentation ready")
+PY
 for DATASET in omnidocbench midv500 midv-lait; do
-  DATASET_START[$DATASET]=$(date +%s)
-  python -m evaluation_pipeline.e2e_img2md \
-    --input-jsonl "$MANIFEST_DIR/$DATASET.jsonl" \
-    --output_dir "$RESULT_ROOT/predictions/$DATASET" \
-    --model_path "$MODEL_PATH" \
-    --served_model_name "$MODEL_NAME" \
-    --task document \
-    --gpu_devices "$GPU_ID" \
-    --port "$PORT" \
-    --workers 8 \
-    --max_tokens "$MAX_TOKENS" \
-    --request_timeout "$REQUEST_TIMEOUT" \
-    --presence_penalty 0.0 \
-    --repetition_penalty 1.0 \
-    --retry-repetitive \
-    --log_dir "$LOG_DIR/$DATASET"
+  RUN_ARGS=()
+  [[ -z "${MAX_TOKENS:-}" ]] || RUN_ARGS+=(--max-tokens "$MAX_TOKENS")
+  [[ "${TRUST_REMOTE_CODE:-0}" != 1 ]] || RUN_ARGS+=(--trust-remote-code)
+  [[ "${RETRY_REPETITIVE:-1}" != 1 ]] || RUN_ARGS+=(--retry-repetitive)
+  [[ -z "${MODULE_MAP:-}" ]] || RUN_ARGS+=(--module-map "$MODULE_MAP")
+  [[ -z "${DCGM_URL:-}" ]] || RUN_ARGS+=(--dcgm-url "$DCGM_URL")
+  [[ -z "${GPU_COST_PER_HOUR:-}" ]] || RUN_ARGS+=(--gpu-cost-per-hour "$GPU_COST_PER_HOUR")
+  case "$DATASET" in
+    omnidocbench) QUALITY_COMMAND=${OMNIDOC_QUALITY_COMMAND:-} ;;
+    midv500) QUALITY_COMMAND=${MIDV500_QUALITY_COMMAND:-} ;;
+    midv-lait) QUALITY_COMMAND=${MIDV_LAIT_QUALITY_COMMAND:-} ;;
+  esac
+  [[ -z "$QUALITY_COMMAND" ]] || RUN_ARGS+=(--quality-command "$QUALITY_COMMAND")
+  python -m benchmark.run_benchmark --manifest "$RESULT_ROOT/manifests/$DATASET.jsonl" \
+    --output "$RESULT_ROOT/$DATASET" --model "$MODEL_PATH" --served-model-name "$MODEL_NAME" \
+    --base-url "http://127.0.0.1:$PORT" --workers 8 --gpu "$GPU_ID" --server-pid "$VLLM_PID" \
+    --request-timeout "$REQUEST_TIMEOUT" --max-model-len "$MAX_MODEL_LEN" \
+    --warmup "$WARMUP" --representatives "$REPRESENTATIVES" --profiler-dir "$RESULT_ROOT/profiler_raw" \
+    --profile-max-iterations "$PROFILE_MAX_ITERATIONS" \
+    "${RUN_ARGS[@]}" 2>&1 | tee "$LOG_DIR/$DATASET.log"
 done
-
-for DATASET in omnidocbench midv500 midv-lait; do
-  printf '%s\n' "$(( $(date +%s) - DATASET_START[$DATASET] ))" > "$RESULT_ROOT/$DATASET.elapsed_s"
-done
-
-python "$ROOT_DIR/benchmark/collect_results.py" \
-  --result-root "$RESULT_ROOT" \
-  --model "$MODEL_NAME" \
-  --gpu "$GPU_ID" \
-  --concurrency 8 \
-  --batch-size 16
+python - "$RESULT_ROOT" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+reports = {name: json.loads((root/name/"acceptance_report.json").read_text())
+           for name in ("omnidocbench", "midv500", "midv-lait")}
+(root/"acceptance_report.json").write_text(json.dumps(reports, indent=2) + "\n")
+for name, report in reports.items():
+    missing = [r["id"] for r in report["criteria"] if r["status"] != "pass"]
+    print(name, "PASS" if not missing else "INCOMPLETE: " + ", ".join(missing))
+PY

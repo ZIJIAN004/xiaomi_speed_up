@@ -1,0 +1,4 @@
+# Keep benchmark entrypoints executable by Linux shells after Windows checkouts.
+benchmark/*.sh text eol=lf
+benchmark/*.py text eol=lf
+tests/test_benchmark.py text eol=lf
