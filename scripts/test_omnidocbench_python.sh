@@ -31,9 +31,9 @@ import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
-for module in ("dataset", "task", "metrics", "metrics.cdm_metric"):
+for module in ("dataset", "task", "metrics", "metrics.cdm_metric", "skimage.measure"):
     importlib.import_module(module)
-print("OK: evaluator Python imports")
+print("OK: evaluator Python imports, including skimage.measure.ransac")
 PY
 
 for tool in xelatex magick gs node; do
