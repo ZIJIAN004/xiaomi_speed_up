@@ -77,3 +77,11 @@
 - 抽出benchmark.readiness，分别记录health/models结果，实时显示进度，失败原因和每轮证据落盘。401/403及health成功后的models 404快速失败；连接拒绝保留原始异常类别与原因，按真实单调时钟deadline重试。
 - 未将任何特定环境根因当作已确认。公开vLLM鉴权实现区分/health和/v1路径，支持将二者分开检查；这不证明当前机器发生了鉴权失败。
 - 本地55项定向测试通过，新增health/API双条件、HTTP401/403/404、网络失败deadline、已记录PID退出分支；没有实际远程HTTP/GPU验证。
+
+## 完整服务启动现场取证（2026-11-18）
+
+- 增加startup-only入口：保留原服务配置完成模型/API启动，跳过manifest、离线processor audit和所有推理请求。
+- 诊断专用import hook跟踪Uvicorn Server及vLLM NoSignalServer/serve_http实际异步函数的进入、返回和异常。记录真实socket监听状态，不将startup日志文字当作监听成功。
+- Linux/proc证据限制在launcher记录PID及其子进程；最终网络快照在cleanup之前。缺/proc或ss会明确记录不可用。
+- 加入20秒线程/异步栈与应用startup完成后30秒诊断grace。基线默认行为不启用HTTP取证或额外grace。
+- 本地60项定向测试通过，新增真实本地socket监听状态转换、原异常透传、proc归属解析、取消与异常区分、grace与关闭前取证测试。没有运行远程模型，不能声称连接拒绝已修复。

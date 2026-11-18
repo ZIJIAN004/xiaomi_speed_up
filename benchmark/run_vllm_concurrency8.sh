@@ -39,8 +39,10 @@ PREP_ARGS=()
 [[ -z "${OMNIDOC_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--omnidocbench-annotations "$OMNIDOC_ANNOTATIONS")
 [[ -z "${MIDV500_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--midv500-annotations "$MIDV500_ANNOTATIONS")
 [[ -z "${MIDV_LAIT_ANNOTATIONS:-}" ]] || PREP_ARGS+=(--midv-lait-annotations "$MIDV_LAIT_ANNOTATIONS")
-python -m benchmark.prepare_datasets --output-dir "$RESULT_ROOT/manifests" \
+if [[ "${BENCHMARK_STARTUP_ONLY:-0}" != 1 ]]; then
+  python -m benchmark.prepare_datasets --output-dir "$RESULT_ROOT/manifests" \
   --omnidocbench "$OMNIDOC_ROOT" --midv500 "$MIDV500_ROOT" --midv-lait "$MIDV_LAIT_ROOT" "${PREP_ARGS[@]}"
+fi
 
 echo "Checking vLLM version..."
 vllm --version > "$LOG_DIR/vllm_version.txt" 2>&1
@@ -95,8 +97,16 @@ with socket.socket() as sock:
     except OSError as exc:
         raise SystemExit(f"Benchmark port is unavailable; refusing to attach to an unrelated server: {exc}")
 PY
+STARTUP_PROBE_DIR=""
+READINESS_ARGS=()
+if [[ "${BENCHMARK_CAPTURE_STARTUP:-0}" == 1 ]]; then
+  STARTUP_PROBE_DIR="$RESULT_ROOT/startup_evidence"
+  mkdir -p "$STARTUP_PROBE_DIR"
+  READINESS_ARGS+=(--diagnostic-dir "$STARTUP_PROBE_DIR" --server-log "$LOG_DIR/vllm_server.log" --application-ready-grace 30)
+fi
 echo "Starting vLLM; server log: $LOG_DIR/vllm_server.log"
 SERVER_START=$(python -c 'import time; print(time.time())')
+VLLM_BENCHMARK_STARTUP_DIR="$STARTUP_PROBE_DIR" \
 VLLM_BENCHMARK_PROCESSOR_DIR="$RESULT_ROOT/processor_raw" \
 PYTHONPATH="$ROOT_DIR/benchmark/server_bootstrap:$PYTHONPATH" \
 vllm serve "$MODEL_PATH" --served-model-name "$MODEL_NAME" --host 127.0.0.1 \
@@ -113,7 +123,11 @@ cleanup() {
 trap cleanup EXIT
 python -m benchmark.readiness --base-url "http://127.0.0.1:$PORT" --pid "$VLLM_PID" \
   --launched-at "$SERVER_START" --output "$RESULT_ROOT/server_startup.json" \
-  --timeout "${READINESS_TIMEOUT:-1200}"
+  --timeout "${READINESS_TIMEOUT:-1200}" "${READINESS_ARGS[@]}"
+if [[ "${BENCHMARK_STARTUP_ONLY:-0}" == 1 ]]; then
+  echo "Startup-only check completed: no warmup, inference, processor audit or profiling requests sent."
+  exit 0
+fi
 # Fail early if worker instrumentation is unreachable, rather than running a misleading client-only benchmark.
 python - "$PORT" <<'PY'
 import sys

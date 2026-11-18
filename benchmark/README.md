@@ -32,6 +32,27 @@ WARMUP=5 REPRESENTATIVES=5 PROFILE_MAX_ITERATIONS=64 RETRY_REPETITIVE=1 \
 
 原有实现吞掉全部HTTP探测异常，只在最后显示readiness timed out，这会掩盖API已启动但客户端检查失败的真实原因。该诊断盲点已修复；具体机器上的根因仍须由新探测结果确认，不能把它预设为显存不足、初始化太慢或鉴权问题。
 
+## 完整服务启动取证（不发送推理请求）
+
+在最小HTTP测试成功、但完整`vllm serve`仍连接拒绝时，执行一次启动取证：
+
+```bash
+GPU_ID=1 bash scripts/capture_vllm_startup.sh /data/models/Xiaomi-OCR-0
+```
+
+该命令会加载模型并执行vLLM内部初始化/编译/Graph准备，但不创建数据集manifest、不运行processor audit、不发送预热/推理/profile请求。保留此前worker extension、profiler配置和processor启动注入以复现原启动方式；额外HTTP跟踪只在本诊断模式启用，不进入正式性能统计。
+
+默认结果为`scripts/startup_check_时间戳/`，自动汇总为`startup_report.json`。原始证据位于`results/startup_evidence/`：
+
+- `http_startup_PID.jsonl`：实际Uvicorn/vLLM HTTP方法enter/return/exception，真实传入socket的fd、地址、SO_ACCEPTCONN，started、peer-load模式及网络namespace。
+- `network_*.json`：启动进程及其子进程的socket inode/归属、监听端口、namespace和可用时的ss结果；不按名称匹配其他用户进程。
+- `network_final.json`：在脚本关闭服务**之前**抓取的最终状态，避免停止后再查不到现场。
+- `thread_stacks_PID.txt`、JSONL中的async_task_stack：HTTP启动跟踪开始20秒后的一次线程/异步任务栈。即使任务异常没有显示在原服务日志里，也尽量保留异常调用栈。
+
+检测到`Application startup complete.`后，再允许30秒HTTP就绪；仍失败则保存证据并退出，不继续等待完整20分钟。未走到应用startup complete时仍受READINESS_TIMEOUT约束。正常基线不启用这个额外30秒限制。
+
+汇总报告不把取消/清理异常当作根因，也不因缺少某项证据就猜测原因。此处增加的是定位证据，不代表已修复某台机器的连接拒绝。没有真实Linux/vLLM环境时只能验证收集逻辑，不能宣布现场问题已解决。
+
 ## 采集顺序与计时边界
 
 1. 生成唯一 sample_id manifest，保留相对路径和显式注解；同名文件不覆盖。

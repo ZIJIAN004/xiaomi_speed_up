@@ -107,6 +107,10 @@ def wrap_method(cls, name, kind):
 
 
 def instrument_module(module):
+    if os.environ.get("VLLM_BENCHMARK_STARTUP_DIR"):
+        from benchmark.http_startup_probe import MODULES, instrument
+        if module.__name__ in MODULES:
+            instrument(module)
     for value in list(vars(module).values()):
         if not inspect.isclass(value) or value.__module__ != module.__name__:
             continue
@@ -139,7 +143,9 @@ class _Loader(importlib.abc.Loader):
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if not (fullname == "vllm.v1.engine.input_processor" or fullname == "vllm.multimodal.processing" or
+        startup_target = os.environ.get("VLLM_BENCHMARK_STARTUP_DIR") and fullname in (
+            "uvicorn.server", "vllm.entrypoints.launchers.launcher", "vllm.entrypoints.launcher")
+        if not (startup_target or fullname == "vllm.v1.engine.input_processor" or fullname == "vllm.multimodal.processing" or
                 fullname.startswith("vllm.multimodal.processing.") or
                 fullname.startswith("vllm.model_executor.models.")):
             return None
@@ -153,6 +159,6 @@ def install():
     if not any(isinstance(finder, _Finder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _Finder())
         for name, module in list(sys.modules.items()):
-            if module and (name == "vllm.v1.engine.input_processor" or name.startswith("vllm.multimodal.processing") or name.startswith("vllm.model_executor.models.")):
+            if module and (name in ("uvicorn.server", "vllm.entrypoints.launchers.launcher", "vllm.entrypoints.launcher") or name == "vllm.v1.engine.input_processor" or name.startswith("vllm.multimodal.processing") or name.startswith("vllm.model_executor.models.")):
                 instrument_module(module)
         emit(dict(event="bootstrap", clock="time.perf_counter", scope="actual server process; no CUDA synchronization"))

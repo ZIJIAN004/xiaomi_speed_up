@@ -690,6 +690,81 @@ class RequestIntegrationTests(unittest.TestCase):
             self.assertTrue((args.output / "bottleneck_report.md").is_file())
 
 
+class StartupEvidenceTests(unittest.TestCase):
+    def test_async_startup_logs_actual_socket_listen_transition(self):
+        import asyncio
+        import os
+        import socket
+        from benchmark.http_startup_probe import wrap_async
+        class Server:
+            started = False
+            async def startup(self, sockets):
+                sockets[0].listen(2)
+                self.started = True
+                return "preserved"
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_STARTUP_DIR": folder}),              patch("benchmark.http_startup_probe.arm_stacks"), socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            wrap_async(Server, "startup")
+            value = asyncio.run(Server().startup([sock]))
+            self.assertEqual(value, "preserved")
+            events = [json.loads(line) for path in Path(folder).glob("*.jsonl") for line in path.read_text().splitlines()]
+            before = next(e for e in events if e["event"] == "enter")
+            after = next(e for e in events if e["event"] == "return")
+            self.assertFalse(before["state"]["passed_sockets"][0]["accepting"])
+            self.assertTrue(after["state"]["passed_sockets"][0]["accepting"])
+            self.assertTrue(after["state"]["started"])
+
+    def test_async_startup_exception_is_logged_and_reraised(self):
+        import asyncio
+        import os
+        from benchmark.http_startup_probe import wrap_async
+        class Server:
+            async def startup(self, sockets=None):
+                raise ValueError("startup test failure")
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_STARTUP_DIR": folder}),              patch("benchmark.http_startup_probe.arm_stacks"):
+            wrap_async(Server, "startup")
+            with self.assertRaisesRegex(ValueError, "startup test failure"):
+                asyncio.run(Server().startup())
+            rows = [json.loads(line) for path in Path(folder).glob("*.jsonl") for line in path.read_text().splitlines()]
+            error = next(r for r in rows if r["event"] == "exception")
+            self.assertIn("ValueError", error["traceback"])
+
+    def test_proc_tree_excludes_unrelated_processes_and_parses_tcp(self):
+        from benchmark.network_evidence import process_tree, tcp_entries
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for pid, parent in ((10, 1), (11, 10), (12, 11), (99, 1)):
+                directory = root / str(pid)
+                directory.mkdir()
+                (directory / "stat").write_text(f"{pid} (test process) S {parent} 0 0")
+            self.assertEqual(process_tree(10, root), [10, 11, 12])
+            tcp = root / "tcp"
+            tcp.write_text(chr(10).join(["header", "0: 0100007F:6590 00000000:0000 0A 0:0 0:0 0 0 0 12345", ""]))
+            row = tcp_entries(tcp)["entries"][0]
+            self.assertEqual(row["port"], 26000)
+            self.assertTrue(row["listening"])
+            self.assertEqual(row["inode"], "12345")
+
+    def test_evidence_summary_does_not_treat_cancellation_as_startup_error(self):
+        from scripts.summarize_startup_evidence import summarize
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            evidence = root / "startup_evidence"
+            evidence.mkdir()
+            dump_json(root / "server_startup.json", {"status": "failed"})
+            dump_json(evidence / "network_final.json", {"client_net_namespace": "net:[1]",
+                "processes": [{"pid": 1, "net_namespace": "net:[1]"}, {"pid": 2, "net_namespace": "net:[2]"}],
+                "client_namespace_target_entries": [{"port": 26000, "listening": True}]})
+            rows = [{"event": "hook_installed"}, {"event": "exception", "error_type": "CancelledError"},
+                    {"event": "exception", "error_type": "ValueError"}]
+            (evidence / "http_startup_1.jsonl").write_text(chr(10).join(json.dumps(r) for r in rows))
+            report = summarize(root)
+            self.assertTrue(report["http_hooks_observed"])
+            self.assertEqual(report["different_network_namespace_pids"], [2])
+            self.assertEqual(len(report["http_task_exceptions"]), 1)
+            self.assertEqual(len(report["client_namespace_target_listeners"]), 1)
+
+
 class ReadinessTests(unittest.TestCase):
     def test_health_then_models_required_for_readiness(self):
         from benchmark.readiness import wait_for_server
@@ -751,6 +826,26 @@ class ReadinessTests(unittest.TestCase):
             self.assertEqual(data["last_probe"]["health"]["error"], "URLError")
             self.assertIn("connection refused", data["last_probe"]["health"]["detail"])
             self.assertEqual(len(output.with_name("readiness_checks.jsonl").read_text().splitlines()), 2)
+
+    def test_application_ready_failure_captures_network_before_cleanup(self):
+        import urllib.error
+        from benchmark.readiness import wait_for_server
+        clock = [0]
+        def open_url(url, **kwargs):
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            log = root / "server.log"
+            log.write_text("Application startup complete.")
+            with patch("benchmark.network_evidence.snapshot", return_value={"target_port": 26000}) as capture:
+                with self.assertRaisesRegex(RuntimeError, "diagnostic grace"):
+                    wait_for_server("http://127.0.0.1:26000", 1, 0, root / "startup.json", timeout=100,
+                        interval=1, opener=SimpleNamespace(open=open_url), clock=lambda: clock[0],
+                        sleep=lambda duration: clock.__setitem__(0, clock[0] + duration), alive=lambda: None,
+                        diagnostic_dir=root / "evidence", server_log=log, application_ready_grace=3)
+                self.assertEqual(clock[0], 3)
+                self.assertTrue((root / "evidence/network_final.json").is_file())
+                self.assertGreaterEqual(capture.call_count, 2)
 
     def test_recorded_server_exit_is_not_a_readiness_timeout(self):
         from benchmark.readiness import wait_for_server

@@ -13,7 +13,7 @@ if _spec and _spec.loader:
     _module = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_module)
 
-if os.environ.get("VLLM_BENCHMARK_PROCESSOR_DIR"):
+if os.environ.get("VLLM_BENCHMARK_PROCESSOR_DIR") or os.environ.get("VLLM_BENCHMARK_STARTUP_DIR"):
     try:
         from benchmark.server_processor import install
         install()
