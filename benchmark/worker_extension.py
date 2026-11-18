@@ -120,20 +120,43 @@ class BenchmarkWorkerExtension:
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             record_shapes=True, profile_memory=True, with_stack=True, with_flops=True,
             schedule=torch.profiler.schedule(wait=0, warmup=0, active=steps, repeat=1), on_trace_ready=save)
-        # Some vLLM workers export again on stop. Kineto permits one export;
-        # subsequent calls copy the already saved bounded trace instead.
+        # Kineto permits one export. If vLLM requests another name on stop,
+        # relocate/re-encode the canonical payload rather than keeping copies.
         export_original = self.profiler.export_chrome_trace
         def export_once(path):
+            nonlocal trace_path
             if not self._benchmark_trace_exported:
                 export_original(str(trace_path))
                 self._benchmark_trace_exported = True
-            if Path(path).resolve() != trace_path.resolve():
-                if str(path).endswith(".gz"):
+            requested = Path(path)
+            if requested.resolve() != trace_path.resolve():
+                requested.parent.mkdir(parents=True, exist_ok=True)
+                if requested.exists():
+                    raise FileExistsError("refusing to overwrite another profiler artifact: " + str(requested))
+                source_gz = str(trace_path).endswith(".gz")
+                target_gz = str(requested).endswith(".gz")
+                if source_gz != target_gz:
                     import gzip
-                    with trace_path.open("rb") as source, gzip.open(path, "wb") as target:
-                        shutil.copyfileobj(source, target)
+                    # Keep the source until conversion succeeds; only our newly
+                    # generated source is removed, never historical run data.
+                    with requested.open("xb") as raw_target:
+                        try:
+                            opener = gzip.open if source_gz else open
+                            with opener(trace_path, "rb") as source:
+                                if target_gz:
+                                    with gzip.GzipFile(fileobj=raw_target, mode="wb") as target:
+                                        shutil.copyfileobj(source, target)
+                                else:
+                                    shutil.copyfileobj(source, raw_target)
+                        except BaseException:
+                            raw_target.close()
+                            requested.unlink()
+                            raise
+                    trace_path.unlink()
                 else:
-                    shutil.copy2(trace_path, path)
+                    trace_path.rename(requested)
+                trace_path = requested
+            return str(trace_path)
         self.profiler.export_chrome_trace = export_once
         self._benchmark_legacy_profiler_step = True
         return {"bounded": True, "max_steps": steps, "source": "actual_torch_profiler_schedule_stepped_after_execute_model"}

@@ -209,6 +209,8 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
         sample_results = []
         for file in record.get("trace_files", []):
             path = Path(file)
+            if not path.is_absolute():
+                path = run_dir / path
             if not (path.name.endswith(".json") or path.name.endswith(".json.gz")):
                 continue
             try:
@@ -219,7 +221,7 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
                         kernel_durations[event["name"]].append(event["dur"])
                 if not data["kernel_count"] and not operators:
                     continue
-                data.update(sample_id=record["sample_id"], trace_file=str(path), phase="profile",
+                data.update(sample_id=record["sample_id"], trace_file=str(file), phase="profile",
                             trace_covers_full_request=record.get("trace_covers_full_request", False),
                             profile_trace_window=record.get("profile_trace_window"))
                 results.append(data)
@@ -227,7 +229,7 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
                 for row in operators:
                     all_operators[row["operator_name"]].append(row)
                 if representative is None and data["kernel_count"]:
-                    representative = events
+                    representative = str(file)
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 results.append({"sample_id": record["sample_id"], "trace_file": str(path), "error": str(exc)})
         record["trace_analysis"] = sample_results
@@ -253,6 +255,8 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
                               "cuda_memcpy_async_host_time_ms", "cpu_gpu_overlap_ratio", "aten_to_count", "aten_cpu_count", "aten_item_count", "aten_copy_count", "transfers", "error")})
     write_csv(run_dir / "cpu_gpu_transfer.csv", transfer_rows)
     if representative is not None:
-        # This is a real exported worker trace, not a synthetic merge of unrelated clocks.
-        (run_dir / "trace_representative.json").write_text(json.dumps({"traceEvents": representative}), encoding="utf-8")
+        # Reference the original trace; never serialize another full payload.
+        (run_dir / "trace_representative.ref.json").write_text(json.dumps({
+            "trace_file": representative, "relative_to": "dataset run directory",
+            "format": "chrome_trace", "storage": "original worker trace, not a copy"}, indent=2), encoding="utf-8")
     return results

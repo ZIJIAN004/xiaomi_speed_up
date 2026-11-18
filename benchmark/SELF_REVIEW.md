@@ -98,3 +98,12 @@
 - 自审测试发现并修复argparse带连字符位置参数的属性名错误；补三个数据集只初始化一次引擎的回归测试。
 - 60项原benchmark测试和13项离线测试通过。新增测试覆盖真实ID/DELTA、合并输出、终止事件、原生模板/特殊token、失败abort、单loop并发、非HTTP RPC/profiler/metrics、预测写盘、无worker输出时分类、三数据集共享引擎和完整离线报告生成。
 - 本机未安装torch/vLLM，无GPU实测环境；没有安装依赖/创建环境。真实Qwen3.5模型的离线接口、图像处理、GPU阶段覆盖和profiler导出仍须由目标机器冒烟结果确认，不能由mock测试宣布通过。
+
+
+## Trace 单副本存储自审（2026-11-18）
+
+- profile采集只引用profiler_raw原文件，不再复制到每个代表样本目录；使用相对数据集目录的路径以支持完整结果目录跨主机搬迁。
+- 汇总不再将代表traceEvents重序列化为大JSON，只写trace_representative.ref.json；原文件元数据与gzip格式不变。旧绝对路径仍支持读取。
+- legacy exporter只执行一次Kineto导出；再次请求文件名时迁移同一payload，gzip格式转换成功后删除本次源文件。模拟磁盘转换失败验证原文件保留、半成品清理，不覆盖其他已有artifact。没有删除用户现有诊断数据。
+- 测试验证profile目录没有trace复制件、gzip完整运行目录搬迁后仍能分析并保留字节内容、代表引用不生成第二份payload、旧绝对路径兼容及legacy单副本导出恢复。
+- 62项benchmark和13项offline定向测试通过；本地没有torch/vLLM/GPU，真实worker导出流程未实测。本轮不修改监控采样、不缩短64/16步窗口、不增加磁盘容量上限，因此不能据此保证永不写满磁盘。

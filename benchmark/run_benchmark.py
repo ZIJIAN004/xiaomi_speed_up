@@ -493,11 +493,12 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
             if args.profiler_dir:
                 for path in sorted(set(args.profiler_dir.rglob("*")) - before):
                     if path.is_file():
-                        relative = path.relative_to(args.profiler_dir)
-                        target = destination / relative
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(path, target)
-                        traces.append(str(target.resolve()))
+                        # Keep one payload in profiler_raw; relative paths survive
+                        # moving the complete run directory to another machine.
+                        traces.append(os.path.relpath(path.resolve(), output.resolve()))
+            dump_json(destination / "trace_reference.json", {
+                "trace_files": traces, "relative_to": "dataset run directory",
+                "storage": "single canonical payload in profiler_raw; no per-sample copy"})
             record["cache_resets"] = cache_resets
             record["profile_cache_scope"] = "cache-reset diagnostic rerun, not steady-state cache behavior"
             record["trace_files"] = traces

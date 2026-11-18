@@ -253,8 +253,9 @@ prediction_mapping.json / predictions/
 metrics_before.prom / metrics_after.prom / vllm_metrics.csv
 monitor/system_samples.jsonl / monitor/metrics_*.prom
 worker_telemetry.json / profile_ranges.json / profile_metrics.json
-profiles/<sample_id>/*.pt.trace.json[.gz] / cuda_events.json
-trace_representative.json                         # 仅在有真实 worker trace 时存在
+profiles/<sample_id>/trace_reference.json / cuda_events.json / worker_telemetry.json
+trace_representative.ref.json                     # 小型路径引用，不再复制完整trace
+../profiler_raw/*.pt.trace.json[.gz]               # 唯一原始trace，与各数据集目录共享父目录
 summary.json / stage_latency.csv / token_statistics.csv
 padding_statistics.csv / throughput_statistics.csv / memory_statistics.csv
 cpu_gpu_transfer.csv / operator_top50.csv / kernel_top50.csv / kernel_statistics.csv
@@ -294,3 +295,14 @@ bash -n benchmark/run_vllm_concurrency8.sh
 - https://github.com/vllm-project/vllm/blob/v0.11.0/vllm/envs.py
 
 以上接口核对不等于对用户实际安装版本的运行验证。
+
+
+## Trace 存储与采集窗口
+
+原始trace只保留在结果根目录的profiler_raw。profile_metrics.json中的trace_files使用相对于数据集目录的路径；profiles下仅保留小型引用与CUDA Event/telemetry，不复制trace。trace_representative.ref.json指向同一原始文件，不再将大trace重新序列化一份。引用文件不能作为Chrome trace打开，应按其中路径打开原始json/json.gz。下载或归档时保留整个结果根目录（含profiler_raw与数据集子目录），不要只拷贝某个数据集目录。旧绝对路径仍可读取，但不会自动迁移或清理历史诊断目录。
+
+旧版worker profiler的重复export请求改为转移原始文件位置；如需改变gzip格式，成功转换后才删除本次生成的源文件，转换失败保留源文件。转换期间可能同时存在源文件和压缩输出，不等于磁盘配额保护。此改动只去掉重复payload，没有新增容量预算或改变采集指标。
+
+monitor/system_samples.jsonl记录CPU/RSS、GPU利用率/显存/功耗/温度/频率的时间序列，monitor/metrics_*.prom保留对应时刻引擎原生指标，便于对齐队列、KV缓存和资源变化。默认约每秒一轮，实际周期含采样开销；不是每秒重跑一次推理，也不是详细kernel trace。本轮不改变监控频率与存储方式。
+
+PROFILE_MAX_ITERATIONS正式默认64，冒烟设置16。它限制每个代表请求的profiler引擎/模型迭代采集窗口，不限制请求生成长度，不是64/16个请求或kernel，也不是字节上限。一次迭代可包含多个请求、多个token的prefill和许多算子。16步开销一般更低但更易漏掉后半程Decode；64步覆盖更长仍不保证长输出全覆盖，大小也不保证正好4倍。实际覆盖以profile_trace_window和trace_covers_full_request为准。

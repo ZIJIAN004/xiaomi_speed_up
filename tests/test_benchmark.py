@@ -17,7 +17,7 @@ from benchmark.prepare_datasets import write_manifest
 from benchmark.quality import evaluate_baseline, field_quality, edit_distance
 from benchmark.run_benchmark import (consume_sse, main as benchmark_main, profile_samples, reconcile_worker_records, request_one,
                                      select_representatives, system_tokens_from_chatml, validate_manifest)
-from benchmark.trace_analysis import analyze_events
+from benchmark.trace_analysis import analyze_events, collect_traces
 from benchmark.worker_extension import BenchmarkWorkerExtension
 
 
@@ -332,6 +332,47 @@ class ServerProcessorTests(unittest.TestCase):
             self.assertIsNone(status["summaries"][0]["total_wall_time_ms"])
 
 
+class TraceStorageTests(unittest.TestCase):
+    def test_relative_trace_survives_moving_complete_run_without_copy(self):
+        import gzip
+        import os
+        import shutil
+        with tempfile.TemporaryDirectory() as folder:
+            original = Path(folder) / "original"
+            raw = original / "profiler_raw"
+            raw.mkdir(parents=True)
+            run = original / "dataset"
+            run.mkdir()
+            events = [{"ph": "X", "cat": "kernel", "name": "actual_kernel", "ts": 1, "dur": 10}]
+            trace = raw / "worker.json.gz"
+            with gzip.open(trace, "wt", encoding="utf-8") as stream:
+                json.dump({"traceEvents": events, "other_metadata": "retained"}, stream)
+            relative = os.path.relpath(trace, run)
+            before = trace.read_bytes()
+            moved = Path(folder) / "downloaded"
+            shutil.move(str(original), moved)
+            run = moved / "dataset"
+            profiles = [{"sample_id": "a", "trace_files": [relative]}]
+            result = collect_traces(run, profiles)
+            self.assertEqual(result[0]["kernel_count"], 1)
+            self.assertEqual((moved / "profiler_raw/worker.json.gz").read_bytes(), before)
+            reference = json.loads((run / "trace_representative.ref.json").read_text())
+            self.assertEqual(reference["trace_file"], relative)
+            self.assertTrue((run / reference["trace_file"]).is_file())
+            self.assertFalse((run / "trace_representative.json").exists())
+            self.assertEqual(len(list((moved / "profiler_raw").iterdir())), 1)
+            self.assertEqual(result[0]["trace_file"], relative)
+
+    def test_old_absolute_trace_paths_remain_readable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            path = run / "old.json"
+            dump_json(path, {"traceEvents": [{"ph": "X", "cat": "kernel", "name": "k", "ts": 0, "dur": 2}]})
+            result = collect_traces(run, [{"sample_id": "old", "trace_files": [str(path.resolve())]}])
+            self.assertEqual(result[0]["kernel_count"], 1)
+            self.assertFalse((run / "trace_representative.json").exists())
+
+
 class WorkerTests(unittest.TestCase):
     def test_runtime_inspection_uses_loaded_objects_without_torch(self):
         class Model:
@@ -384,11 +425,24 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(schedules[0], dict(wait=0, warmup=0, active=8, repeat=1))
             bounded.options["on_trace_ready"](bounded)
             bounded.export_chrome_trace(str(Path(folder) / "second.json"))
+            self.assertEqual(len(list(Path(folder).glob("*.json"))), 1)
+            import gzip
+            compressed = Path(folder) / "final.json.gz"
+            with patch("gzip.GzipFile", side_effect=OSError("simulated disk failure")):
+                with self.assertRaisesRegex(OSError, "disk failure"):
+                    bounded.export_chrome_trace(str(compressed))
+            self.assertTrue((Path(folder) / "second.json").is_file())
+            self.assertFalse(compressed.exists())
+            bounded.export_chrome_trace(str(compressed))
+            self.assertFalse((Path(folder) / "second.json").exists())
+            with gzip.open(compressed, "rt") as stream:
+                self.assertEqual(json.load(stream), {"traceEvents": []})
+            self.assertEqual(len(list(Path(folder).iterdir())), 1)
             worker.benchmark_profile_limit("8", folder, "true")
             self.assertIs(worker.profiler, original)
             self.assertEqual(len(exports), 1)
             self.assertFalse(worker._benchmark_legacy_profiler_step)
-            self.assertTrue((Path(folder) / "second.json").is_file())
+            self.assertTrue(compressed.is_file())
 
     def test_cuda_event_collection_has_one_final_sync_not_per_token(self):
         import sys
@@ -629,6 +683,10 @@ class RequestIntegrationTests(unittest.TestCase):
             self.assertEqual(profiles[0]["tpot_ms"], .25)
             self.assertLess(calls.index("stop_profile"), calls.index("benchmark_event_timing:false"))
             self.assertTrue((root / "profiles/a/cuda_events.json").is_file())
+            self.assertEqual(profiles[0]["trace_files"], [str(Path("raw") / "worker.pt.trace.json")])
+            self.assertFalse((root / "profiles/a/worker.pt.trace.json").exists())
+            reference = json.loads((root / "profiles/a/trace_reference.json").read_text())
+            self.assertEqual(reference["trace_files"], profiles[0]["trace_files"])
 
     def test_empty_response_preserves_finish_and_usage(self):
         from PIL import Image
