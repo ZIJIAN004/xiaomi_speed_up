@@ -31,7 +31,7 @@ for tool in ('xelatex','magick','gs','node'):
     if shutil.which(tool) is None:
         raise RuntimeError('missing CDM tool: '+tool)
 root = pathlib.Path('result/cdm_preflight')
-formula = r'rac{x+1}{y+2}=z'
+formula = r'\frac{x+1}{y+2}=z'
 score = CDM(output_root=str(root)).evaluate(formula,formula,'runtime_smoke')
 if score.get('F1_score',0) < .99 or not list(root.rglob('*.png')):
     raise RuntimeError('real identical-formula CDM/render self-test failed: '+str(score))
