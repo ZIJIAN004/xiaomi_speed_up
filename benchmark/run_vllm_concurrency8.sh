@@ -165,7 +165,7 @@ for DATASET in "${DATASETS[@]}"; do
     midv-lait) QUALITY_COMMAND=${MIDV_LAIT_QUALITY_COMMAND:-} ;;
   esac
   [[ -z "$QUALITY_COMMAND" ]] || RUN_ARGS+=(--quality-command "$QUALITY_COMMAND")
-  python -m benchmark.run_benchmark --manifest "$RESULT_ROOT/manifests/$DATASET.jsonl" \
+  python -m benchmark.run_benchmark --backend http --manifest "$RESULT_ROOT/manifests/$DATASET.jsonl" \
     --output "$RESULT_ROOT/$DATASET" --model "$MODEL_PATH" --served-model-name "$MODEL_NAME" \
     --base-url "http://127.0.0.1:$PORT" --workers 8 --gpu "$GPU_ID" --server-pid "$VLLM_PID" \
     --request-timeout "$REQUEST_TIMEOUT" --max-model-len "$MAX_MODEL_LEN" \

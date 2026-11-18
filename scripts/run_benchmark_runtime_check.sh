@@ -11,7 +11,7 @@ OUTPUT_DIR=${3:-$ROOT_DIR/scripts/runtime_check_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$OUTPUT_DIR/input"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 cd "$ROOT_DIR"
-echo "Runtime diagnostic: GPU=${GPU_ID:-1}, model will load; 8 copies of one image, max_tokens=32. Not a quality/performance baseline."
+echo "Offline runtime diagnostic: GPU=${GPU_ID:-1}, model will load; 8 copies of one image, max_tokens=32. Not a quality/performance baseline."
 python scripts/check_benchmark_interfaces.py --deep --model-path "$MODEL_PATH" --output "$OUTPUT_DIR/interfaces_deep.json"
 python - "$IMAGE_PATH" "$OUTPUT_DIR/input" <<'PY'
 from pathlib import Path
@@ -22,7 +22,7 @@ for index in range(8):
 PY
 status=0
 OMNIDOC_QUALITY_COMMAND= BENCHMARK_RUNTIME_SMOKE=1 MAX_TOKENS=32 WARMUP=3 REPRESENTATIVES=3 RETRY_REPETITIVE=0 PROFILE_MAX_ITERATIONS=16 \
-  bash benchmark/run_vllm_concurrency8.sh "$OUTPUT_DIR/input" "$OUTPUT_DIR/input" "$OUTPUT_DIR/input" \
+  bash benchmark/run_offline_concurrency8.sh "$OUTPUT_DIR/input" "$OUTPUT_DIR/input" "$OUTPUT_DIR/input" \
   "$MODEL_PATH" "$OUTPUT_DIR/results" || status=$?
 python scripts/summarize_benchmark_runtime.py --run-root "$OUTPUT_DIR/results" --output "$OUTPUT_DIR/runtime_verification.json" || status=$?
 echo "Runtime diagnostic saved under: $OUTPUT_DIR"

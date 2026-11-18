@@ -25,6 +25,9 @@ from benchmark.processor_audit import PROMPT, ProcessorAudit, prepare_image
 
 
 def post_json(url, payload=None, timeout=600):
+    if url.startswith("offline://single/"):
+        from benchmark.offline_backend import active
+        return active().control(url.split("offline://single/", 1)[1])
     data = json.dumps(payload or {}).encode()
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -111,14 +114,14 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
     record.update({k: sample.get(k) for k in ("document_id", "document_type", "has_table", "has_formula", "difficulty", "relative_path")})
     record.update(sample_id=sample["sample_id"], dataset=sample.get("dataset"), phase=phase,
                   attempt=attempt, image_path=sample["images"][0], num_images=1, num_pages=1,
-                  model=args.served_model_name, inference_framework="vllm", client_workers=args.workers,
+                  model=args.served_model_name, inference_framework="vllm", backend=getattr(args, "backend", "http"), client_workers=args.workers,
                   request_batch_size=1, actual_scheduler_batch_size=None,
                   requested_max_tokens=args.max_tokens, effective_max_tokens=None,
                   request_start_s=start, error=None, error_type=None, finish_reason=None,
                   success=False, output_path=None, peak_allocated_memory_gb=None,
                   peak_reserved_memory_gb=None, memory_scope="unavailable_per_request_under_concurrency",
                   stop_reason_is_eos=None, server_processor_time_ms=None,
-                  gpu_ttft_ms=None, host_ttft_origin="HTTP request submission after image serialization")
+                  gpu_ttft_ms=None, host_ttft_origin=("offline engine submission before input processing" if getattr(args, "backend", "http") == "offline" else "HTTP request submission after image serialization"))
     if audit:
         record.update(audit)
         # Audit timings are separate observations, not client or server stage times.
@@ -128,47 +131,74 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
         image, image_metrics = prepare_image(sample["images"][0])
         record.update(image_metrics)
         if image_metrics["source_frame_count"] != 1:
+            image.close()
             raise ValueError("multipage/animated image must be split into page images before benchmarking")
-        serial_start = time.perf_counter()
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        image.close()
-        b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-        payload = {"model": args.served_model_name,
-                   "messages": [{"role": "user", "content": [{"type": "text", "text": PROMPT},
-                       {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}],
-                   "temperature": 0, "top_p": 0.8, "presence_penalty": 0.0,
-                   "repetition_penalty": 1.0, "stream": True,
-                   "stream_options": {"include_usage": True},
-                   "chat_template_kwargs": {"enable_thinking": False},
-                   "logprobs": not args.no_logprobs}
-        if args.max_tokens is not None:
-            payload["max_tokens"] = args.max_tokens
-        if attempt:
-            payload["presence_penalty"] = args.retry_presence_penalty
-        body = json.dumps(payload).encode()
-        record["serialization_time_ms"] = (time.perf_counter() - serial_start) * 1000
-        http_start = time.perf_counter()
-        request = urllib.request.Request(args.base_url + "/v1/chat/completions", data=body,
-                                         headers={"Content-Type": "application/json",
-                                                  "X-Request-Id": f"benchmark-{phase}-{sample['sample_id']}-{attempt}"})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=args.request_timeout) as response:
-            streamed = consume_sse(response)
-        http_end = time.perf_counter()
+        offline = getattr(args, "backend", "http") == "offline"
+        if offline:
+            from benchmark.offline_backend import active
+            request_id = f"benchmark-{phase}-{sample['sample_id']}-{attempt}"
+            try:
+                streamed = active().infer(image, args, request_id, attempt)
+            finally:
+                image.close()
+            http_start = streamed["engine_submit_s"]
+            http_end = time.perf_counter()
+            record.update(backend="offline", host_ttft_origin="offline engine submission before input processing",
+                          serialization_time_ms=None, chat_template_time_ms=streamed["chat_template_time_ms"],
+                          http_metrics_unavailable_reason="no HTTP, Base64, JSON or SSE transport in offline mode",
+                          effective_max_tokens=streamed["effective_max_tokens"],
+                          effective_max_tokens_source="actual offline SamplingParams and expanded input length",
+                          offline_generated_token_ids=streamed["generated_token_ids"],
+                          offline_prompt_token_ids=streamed["prompt_token_ids"])
+        else:
+            serial_start = time.perf_counter()
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            image.close()
+            b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+            payload = {"model": args.served_model_name,
+                       "messages": [{"role": "user", "content": [{"type": "text", "text": PROMPT},
+                           {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}],
+                       "temperature": 0, "top_p": 0.8, "presence_penalty": 0.0,
+                       "repetition_penalty": 1.0, "stream": True,
+                       "stream_options": {"include_usage": True},
+                       "chat_template_kwargs": {"enable_thinking": False},
+                       "logprobs": not args.no_logprobs}
+            if args.max_tokens is not None:
+                payload["max_tokens"] = args.max_tokens
+            if attempt:
+                payload["presence_penalty"] = args.retry_presence_penalty
+            body = json.dumps(payload).encode()
+            record["serialization_time_ms"] = (time.perf_counter() - serial_start) * 1000
+            http_start = time.perf_counter()
+            request = urllib.request.Request(args.base_url + "/v1/chat/completions", data=body,
+                                             headers={"Content-Type": "application/json",
+                                                      "X-Request-Id": f"benchmark-{phase}-{sample['sample_id']}-{attempt}"})
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=args.request_timeout) as response:
+                streamed = consume_sse(response)
+            http_end = time.perf_counter()
         record.update(http_start_s=http_start, http_end_s=http_end,
                       request_latency_ms=(http_end - http_start) * 1000,
                       finish_reason=streamed["finish_reason"], server_request_id=streamed["server_request_id"],
                       streaming_event_count=len(streamed["events"]), chunk_interval_ms=streamed["chunk_interval_ms"],
                       itl_ms=streamed["itl_ms"], itl_source=streamed["itl_source"],
                       itl_unavailable_reason=streamed["itl_unavailable_reason"])
+        if offline:
+            record["engine_submit_s"] = record.pop("http_start_s")
+            record["engine_end_s"] = record.pop("http_end_s")
+            record["offline_output_event_count"] = record.pop("streaming_event_count")
+            record["host_output_interval_ms"] = record.pop("chunk_interval_ms")
         if record["finish_reason"] is not None and record["finish_reason"] != "stop":
             record["stop_reason_is_eos"] = False
         first, last = streamed["first_content_time_s"], streamed["last_content_time_s"]
         record["first_output_event_host_s"] = first
         record["last_output_event_host_s"] = last
         record["stream_logprob_token_count"] = sum(e["token_count"] for e in streamed["events"]) if all(e["token_count"] is not None for e in streamed["events"]) else None
-        record["itl_population"] = "observed one-token SSE events; terminal EOS may not be streamed"
+        if offline:
+            record["offline_stream_token_count"] = record.pop("stream_logprob_token_count")
+        record["itl_population"] = ("actual offline delta token IDs, including terminal IDs when exposed" if offline else
+                                    "observed one-token SSE events; terminal EOS may not be streamed")
         record["ttft_ms"] = (first - http_start) * 1000 if first is not None else None
         record["ttft_e2e_ms"] = (first - start) * 1000 if first is not None else None
         record["host_decode_span_ms"] = (last - first) * 1000 if first is not None else None
@@ -281,6 +311,13 @@ def reconcile_worker_records(records, telemetry, tokenizer=None):
             final_text = Path(r["output_path"]).read_text(encoding="utf-8")
             r["useful_output_tokens"] = len(tokenizer.encode(final_text, add_special_tokens=False))
             r["useful_output_tokens_source"] = "actual tokenizer on accepted postprocessed output, not raw generated token IDs"
+        output_ids = r.get("offline_generated_token_ids")
+        if tokenizer is not None and output_ids and len(output_ids) == r.get("generated_tokens"):
+            special = set(tokenizer.all_special_ids)
+            r["generated_special_tokens"] = sum(t in special for t in output_ids)
+            r["generated_visible_tokens"] = len(output_ids) - r["generated_special_tokens"]
+            r["generated_token_classification_source"] = "actual_offline_delta_token_ids"
+            r["stop_reason_is_eos"] = (True if output_ids[-1] == tokenizer.eos_token_id else None) if r.get("finish_reason") == "stop" else False
         server_id = r.get("server_request_id")
         candidates = [(rid, value) for rid, value in requests.items()
                       if server_id and (rid == server_id or rid.startswith(server_id + "-"))]
@@ -495,12 +532,15 @@ def environment():
     return result
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name", default="Xiaomi-OCR-0")
+    parser.add_argument("--backend", choices=("offline", "http"), default="offline")
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--base-url", default="http://127.0.0.1:26000")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=5)
@@ -524,7 +564,7 @@ def parse_args():
     parser.add_argument("--retry-repetitive", action="store_true")
     parser.add_argument("--retry-presence-penalty", type=float, default=1.5)
     parser.add_argument("--quality-command", help="JSON argv list with {manifest}, {predictions}, {output} placeholders")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 5 or args.monitor_interval <= 0:
         parser.error("workers>=1, warmup>=3, representatives=3..5 and monitor-interval>0 required")
     if args.profile_max_iterations < 1:
@@ -533,21 +573,46 @@ def parse_args():
         parser.error("max-tokens must be positive or omitted")
     if args.output.exists():
         parser.error("output must be a new directory; refusing to reuse historical predictions")
-    if not args.base_url.startswith(("http://127.0.0.1:", "http://localhost:")):
+    if args.backend == "http" and not args.base_url.startswith(("http://127.0.0.1:", "http://localhost:")):
         parser.error("benchmark server and worker RPC must be bound to localhost")
     if args.dcgm_url and not args.dcgm_url.startswith(("http://127.0.0.1:", "http://localhost:")):
         parser.error("DCGM telemetry must use a localhost endpoint")
     if args.long_document_pages < 1 or (args.gpu_cost_per_hour is not None and args.gpu_cost_per_hour < 0):
         parser.error("long-document-pages must be positive and price cannot be negative")
+    if not 0 < args.gpu_memory_utilization <= 1 or args.max_model_len < 1:
+        parser.error("GPU memory utilization must be in (0,1] and max-model-len positive")
+    if args.backend == "offline" and not args.gpu.isdecimal():
+        parser.error("offline mode requires one numeric GPU index")
+    if args.backend == "offline":
+        args.base_url = "offline://single"
     return args
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    args = args or parse_args()
     samples = load_jsonl(args.manifest)
     validate_manifest(samples)
     if not samples:
         raise ValueError("empty benchmark manifest")
+    if getattr(args, "backend", "http") == "offline":
+        from benchmark.offline_backend import _ACTIVE, OfflineBackend
+        if _ACTIVE is None:
+            if not args.gpu.isdecimal():
+                raise ValueError("offline backend requires one GPU index")
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            bootstrap = str(Path(__file__).resolve().parent / "server_bootstrap")
+            os.environ["PYTHONPATH"] = bootstrap + os.pathsep + str(Path(__file__).resolve().parent.parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
+            if args.profiler_dir is None:
+                args.profiler_dir = args.output.resolve().parent / (args.output.name + "_profiler_raw")
+            args.profiler_dir.mkdir(parents=True, exist_ok=True)
+            if args.server_processor_dir is None:
+                args.server_processor_dir = args.output.resolve().parent / (args.output.name + "_processor_raw")
+            args.server_processor_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["VLLM_BENCHMARK_PROCESSOR_DIR"] = str(args.server_processor_dir.resolve())
+            args.server_pid = os.getpid()
+            with OfflineBackend(args):
+                return main(args)
     output = args.output.resolve()
     output.mkdir(parents=True)
     shutil.copy2(args.manifest, output / "manifest.jsonl")
@@ -558,6 +623,13 @@ def main():
                   max_tokens_policy="omitted by default; server generation-config=vllm",
                   profiler_results_excluded_from_steady_state=True,
                   client_timing_scope="file read through result write; queue wait before worker start excluded")
+    if getattr(args, "backend", "http") == "offline":
+        from benchmark.offline_backend import active
+        config.update(http_client=None, transport="direct AsyncLLM Python API", tensor_parallel_size=1,
+                      pipeline_parallel_size=1, data_parallel_size=1,
+                      max_tokens_policy="explicit cap or remaining context via installed InputProcessor",
+                      client_timing_scope="file read through result write; TTFT from offline engine submission",
+                      offline_engine=active().metadata)
     config["environment"] = environment()
     (output / "environment.txt").write_text(json.dumps(config["environment"], indent=2) + "\n", encoding="utf-8")
     config["worker_initial"] = safe_rpc(args, "benchmark_snapshot", "false")
@@ -567,8 +639,23 @@ def main():
         except Exception as exc:
             config[endpoint.split("?")[0]] = {"status": "unavailable", "reason": str(exc)}
     dump_json(output / "config.json", config)
+    if getattr(args, "backend", "http") == "offline":
+        dump_json(output / "metric_migration.json", {
+            "backend": "offline", "http_required": False,
+            "retained": ["latency", "TTFT", "actual token IDs/counts", "throughput", "processor calls",
+                         "worker scheduler telemetry", "CUDA Events", "bounded profiler", "memory", "quality"],
+            "changed_scope": {"ttft_ms": "offline engine submission to first output token ID, not HTTP TTFT",
+                              "itl_ms": "only when every nonempty delta contains one actual token ID",
+                              "cold_start_latency_s": "offline engine initialization, not HTTP readiness",
+                              "cpu_memory": "client/engine frontend share one PID; do not add their RSS/CPU figures",
+                              "vllm_metrics": "native in-process Prometheus registry, no HTTP exporter"},
+            "not_applicable": ["HTTP status", "HTTP transport latency", "Base64/JSON serialization", "SSE chunk intervals"],
+            "validation": "runtime evidence in metric_coverage.csv; retained instrumentation is not proof of observed GPU measurements"})
     audit = {}
     tokenizer = None
+    if getattr(args, "backend", "http") == "offline":
+        from benchmark.offline_backend import active
+        tokenizer = active().processor.tokenizer
     if not args.skip_processor_audit:
         try:
             inspector = ProcessorAudit(args.model, args.trust_remote_code)
@@ -674,9 +761,11 @@ def main():
     limits = {}
     for r in records:
         n = r.get("total_input_tokens")
-        if n is not None and n not in limits:
+        if n is not None and n not in limits and getattr(args, "backend", "http") != "offline":
             limits[n] = safe_rpc(args, "benchmark_effective_limit", str(n), json.dumps(args.max_tokens))
     for r in records:
+        if getattr(args, "backend", "http") == "offline":
+            continue
         found = limits.get(r.get("total_input_tokens"), {})
         values = found.get("results", [])
         if values and all(v.get("effective_max_tokens") == values[0].get("effective_max_tokens") for v in values):

@@ -8,3 +8,4 @@ scripts/run_benchmark_runtime_check.sh text eol=lf
 scripts/summarize_benchmark_runtime.py text eol=lf
 scripts/capture_vllm_startup.sh text eol=lf
 scripts/summarize_startup_evidence.py text eol=lf
+tests/test_offline_benchmark.py text eol=lf

@@ -85,3 +85,16 @@
 - Linux/proc证据限制在launcher记录PID及其子进程；最终网络快照在cleanup之前。缺/proc或ss会明确记录不可用。
 - 加入20秒线程/异步栈与应用startup完成后30秒诊断grace。基线默认行为不启用HTTP取证或额外grace。
 - 本地60项定向测试通过，新增真实本地socket监听状态转换、原异常透传、proc归属解析、取消与异常区分、grace与关闭前取证测试。没有运行远程模型，不能声称连接拒绝已修复。
+
+## 单卡离线迁移自审（2026-11-18）
+
+- 默认入口改为run_offline_concurrency8.sh；一个AsyncLLM实例跨三个数据集复用。TP/PP/DP显式为1，并核对实际parallel_config。8个在途请求由原线程池持续补充，不按8请求整批等待，不改max_num_seqs/compile/cache等原调度默认值。
+- 生成改为原生异步DELTA流，通过唯一request_id关联worker。真实prompt/output IDs用于token计数和输出分类；不依赖文本字符、logprobs或未同步的worker输出推断。合并delta不伪造逐token ITL。
+- 保留原生模板及enable_thinking=False；tokenize=False后交给引擎并显式add_special_tokens=False，避免重复模板特殊token。独立processor audit与真实worker输入长度仍逐样本对比，记录padding_side；max_model_len保持16384。
+- SamplingParams显式max_tokens=None，不落入默认16-token上限。已核对vLLM v0.32.0 InputProcessor源码：None会按实际prompt_len计算剩余上下文。正式不加输出cap；冒烟仍为32。
+- worker collective_rpc、cache reset、start/stop profile均走Python API。保留有界trace、CUDA Event、scheduler telemetry、真实storage显存、系统采样、正式质量和原13条验收逻辑。启动检查要求恰好一个可观测GPU worker。
+- Prometheus使用与上游相同的进程内registry/多进程registry逻辑，不启动HTTP exporter。CPU/RSS注明客户端和引擎frontend共用PID，不将重叠口径相加。
+- HTTP/SSE/Base64/JSON专属指标不发生，不填0；TTFT、冷启动与输出间隔更换明确口径，并输出metric_migration.json。旧HTTP入口显式backend=http，保留但不再作为默认冒烟路径。
+- 自审测试发现并修复argparse带连字符位置参数的属性名错误；补三个数据集只初始化一次引擎的回归测试。
+- 60项原benchmark测试和13项离线测试通过。新增测试覆盖真实ID/DELTA、合并输出、终止事件、原生模板/特殊token、失败abort、单loop并发、非HTTP RPC/profiler/metrics、预测写盘、无worker输出时分类、三数据集共享引擎和完整离线报告生成。
+- 本机未安装torch/vLLM，无GPU实测环境；没有安装依赖/创建环境。真实Qwen3.5模型的离线接口、图像处理、GPU阶段覆盖和profiler导出仍须由目标机器冒烟结果确认，不能由mock测试宣布通过。

@@ -15,6 +15,9 @@ from pathlib import Path
 
 
 def get_url(url, timeout=10):
+    if url.startswith("offline://single/"):
+        from benchmark.offline_backend import active
+        return active().get(url.split("offline://single/", 1)[1])
     # Local inference traffic must not be sent to an environment HTTP proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(url, timeout=timeout) as response:
@@ -22,6 +25,9 @@ def get_url(url, timeout=10):
 
 
 def rpc(base_url, method, args=(), timeout=60):
+    if base_url == "offline://single":
+        from benchmark.offline_backend import active
+        return active().rpc(method, args, timeout)
     payload = json.dumps({"method": method, "args": list(args)}).encode()
     request = urllib.request.Request(base_url + "/collective_rpc", data=payload,
                                      headers={"Content-Type": "application/json"})

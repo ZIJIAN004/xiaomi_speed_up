@@ -1,28 +1,50 @@
 # vLLM 文档/证件 OCR 瓶颈采集
 
-本目录按《文档解析与证件识别_推理瓶颈分析方案_基线.md》组织采集。客户端固定默认 **workers=8**，每个请求一张图像/一页。客户端 worker 数、请求图像数、vLLM 实际调度 batch 是三个不同概念，不再输出虚构的 `batch_size=16`。
+本目录按《文档解析与证件识别_推理瓶颈分析方案_基线.md》组织采集。默认使用**单卡离线 AsyncLLM**，固定默认 **workers=8**，最多8个在途请求，每个请求一张图像/一页。一个引擎跨三个数据集复用，不是8个模型副本，也不是每批8个一起等待完成。8个在途由客户端线程池限制，不修改引擎max_num_seqs等原有调度默认值。客户端 worker 数、请求图像数、vLLM 实际调度 batch 是三个不同概念，不再输出虚构的 `batch_size=16`。
 
 ## 运行
 
 在已有 GPU/vLLM 环境中，从任何目录执行以下脚本。不会安装依赖，不下载数据，不修改集群配置。结果路径必须不存在。
 
 ```bash
-bash benchmark/run_vllm_concurrency8.sh \
+bash benchmark/run_offline_concurrency8.sh \
   /data/OmniDocBench/images /data/MIDV-500/images /data/MIDV-LAIT/images \
   /data/models/Xiaomi-OCR-0 /data/results/xiaomi-profile-new
 ```
 
-默认 GPU=1、上下文=16384；显存比例按设计文档示例为 **0.90**，可用 `GPU_MEM_UTIL` 显式覆盖。`DTYPE=auto` 保留模型自身精度选择，并记录 worker 实际 dtype；也可显式固定 `DTYPE=bfloat16`。不传 `--enforce-eager`，不改变 attention/compile/chunked-prefill/prefix-cache 默认值。`--generation-config vllm` 排除模型 generation_config 中隐藏的小输出上限。默认不传请求 `max_tokens`，由服务端按真实输入和上下文边界确定；仅显式设置 `MAX_TOKENS` 才增加输出上限。
+默认 GPU=1、上下文=16384；显存比例按设计文档示例为 **0.90**，可用 `GPU_MEM_UTIL` 显式覆盖。`DTYPE=auto` 保留模型自身精度选择，并记录 worker 实际 dtype；也可显式固定 `DTYPE=bfloat16`。不传 `--enforce-eager`，不改变 attention/compile/chunked-prefill/prefix-cache 默认值。`--generation-config vllm` 排除模型 generation_config 中隐藏的小输出上限。离线显式设置 `SamplingParams(max_tokens=None)`，由已核对的vLLM 0.32.0 InputProcessor按真实展开输入和上下文边界确定，避免SamplingParams默认16-token上限；仅显式设置 `MAX_TOKENS` 才增加输出上限。
 
 ```bash
-GPU_ID=1 PORT=26000 GPU_MEM_UTIL=0.90 DTYPE=auto \
+GPU_ID=1 GPU_MEM_UTIL=0.90 DTYPE=auto \
 WARMUP=5 REPRESENTATIVES=5 PROFILE_MAX_ITERATIONS=64 RETRY_REPETITIVE=1 \
-  bash benchmark/run_vllm_concurrency8.sh ...
+  bash benchmark/run_offline_concurrency8.sh ...
 ```
 
 `TRUST_REMOTE_CODE=1` 是显式选择，默认不开启。不要对不可信模型启用。
 
-脚本检查安装版本的 `--worker-extension-cls`，保存版本与完整 help，按版本能力选择 JSON profiler-config 或 legacy profiler 环境变量。所有服务绑定 127.0.0.1。worker RPC/profiler 属于开发接口，**不可暴露到公网或生产服务**。启动前检查端口，退出只结束本脚本记录的服务 PID。
+默认入口直接调用vLLM 0.32.0的AsyncLLM，TP/PP/DP均为1，CUDA_VISIBLE_DEVICES仅允许一个GPU索引；不启动FastAPI/Uvicorn，不需要HTTP就绪探测。worker collective_rpc、reset cache、start/stop profiler均通过引擎Python API调用；原生Prometheus registry直接采集，nvidia-smi及进程采样不变。引擎自身仍可能使用进程间IPC，这不等于HTTP服务。
+
+正式数据集仍要求OmniDocBench **1.5**。一次引擎初始化跨三个数据集使用；stdout/stderr保存到结果目录旁的`结果目录.log`。每个数据集另有`metric_migration.json`记录指标口径变化。默认不安装或下载任何依赖。
+
+### 离线冒烟检查
+
+```bash
+GPU_ID=1 bash scripts/run_benchmark_runtime_check.sh /data/models/Xiaomi-OCR-0
+```
+
+仍使用仓库receipt.jpg的8份副本，3次预热、8次稳态、最多3个profile请求，输出上限32、trace窗口16步。只验证兼容性，不是正式数据集、质量或性能基线。结果在`scripts/runtime_check_时间戳/`，检查`runtime_verification.json`和`results.log`。本地mock测试不证明真实GPU指标可采到。
+
+### 指标迁移
+
+- 保留端到端/请求耗时、TTFT、吞吐、真实输入/输出token数、停止原因、图像处理、后处理、写盘、实际Processor apply/HF调用、scheduler batch、内存、CUDA Events、算子/kernel/传输及质量评估。
+- 离线TTFT从引擎提交到首个实际token ID事件；TTFT E2E从样本读取前开始。不是原HTTP TTFT，跨后端不可直接混比。
+- 输出使用DELTA模式并累加实际token IDs，不依赖logprobs猜token数。仅当每个非空输出事件恰有1个token时提供host ITL；合并输出只记host_output_interval_ms，不插值伪造组内时间。
+- PNG/Base64/JSON序列化、HTTP状态与传输耗时、SSE分块不再发生，保留null或不适用，不填0或换其他计时冒充。chat_template_time_ms单独记录实际模板耗时。
+- 原有HTTP worker异步输出IDs不可见时，离线生成器提供的真实IDs仍可用于输出分类；视觉span与scheduler信息继续来自worker真实观测。
+- 主进程同时承担客户端与引擎frontend职责，CPU/RSS两个口径有重叠，不能相加。
+- Processor独立audit仍在稳态前执行，不能替代真实引擎Processor计时。使用模型原生AutoProcessor模板、enable_thinking=False；tokenize=False后交给引擎，显式add_special_tokens=False避免重复模板特殊token。padding_side、max_model_len、实际worker输入长度及audit对齐结果均保留，不假定padding为0。
+
+旧HTTP入口`benchmark/run_vllm_concurrency8.sh`仍保留用于对照与启动现场取证，并显式传入`--backend http`；以下HTTP启动诊断两节仅适用于旧入口，不是离线运行步骤。
 
 ## 服务启动与就绪探测诊断
 
@@ -56,11 +78,11 @@ GPU_ID=1 bash scripts/capture_vllm_startup.sh /data/models/Xiaomi-OCR-0
 ## 采集顺序与计时边界
 
 1. 生成唯一 sample_id manifest，保留相对路径和显式注解；同名文件不覆盖。
-2. 启动一次 vLLM，记录启动到 HTTP readiness 的冷启动时间。该时间包括加载/初始化/compile/graph capture，不冒称纯模型加载时间。
+2. 初始化一次离线vLLM，记录引擎构造到初始化完成的冷启动时间（旧HTTP入口记录到HTTP readiness）。该时间包括加载/初始化/compile/graph capture，不冒称纯模型加载时间。
 3. 独立运行 processor 检查。记录 tokenizer、padding_side、输入 ID 长度、视觉网格/patch、tensor shape、预处理画布等。该检查不计入服务稳态阶段耗时。
 4. 每个数据集预热默认 5 次，预热失败则停止，避免把失败流量当成基线。
-5. workers=8 全量 streaming 请求；每样本日志包含成功与失败。分别测文件读取、图像解码、客户端 resize、PNG/base64/JSON 序列化、HTTP 请求、后处理和写盘。E2E 起点为线程开始处理样本，终点为结果写出，**不含线程池排队**；整个任务吞吐的 wall time 包含队列处理和客户端开销。
-6. 同时采集原始 `/metrics`、nvidia-smi、服务端进程树与客户端进程 CPU/RSS。实际 worker 采集 host 已就绪的输入/输出 token ID、视觉 placeholder span、真实 scheduler batch 直方图。不会为了观测异步输出调用 `.cpu()`、`.item()` 或同步 GPU。
+5. workers=8 全量 streaming 请求；每样本日志包含成功与失败。分别测文件读取、图像解码、客户端 resize、原生模板构建、离线引擎请求、后处理和写盘；旧HTTP入口额外记录PNG/base64/JSON序列化。E2E 起点为线程开始处理样本，终点为结果写出，**不含线程池排队**；整个任务吞吐的 wall time 包含队列处理和客户端开销。
+6. 同时采集原生Prometheus registry（旧HTTP入口使用`/metrics`）、nvidia-smi、服务端进程树与客户端进程 CPU/RSS。实际 worker 采集 host 已就绪的输入/输出 token ID、视觉 placeholder span、真实 scheduler batch 直方图。不会为了观测异步输出调用 `.cpu()`、`.item()` 或同步 GPU。
 7. 稳态后单独重试重复输出；保留首轮、重试和最终采用版。稳态吞吐不包含重试，业务耗时单独记录。
 8. 按图像面积、输出长度、视觉长度、表格/公式/类型/困难标签的可用覆盖贪心选择 3–5 个代表样本，**独立启停 worker profiler**。每个代表样本前尝试 reset prefix/mm/encoder cache，记录各 endpoint 的响应，避免复用视觉缓存导致 Vision Encoder 消失。它们是冷缓存诊断重跑，不冒称正常稳态 cache 行为。
 9. 正式质量 evaluator（或显式字段注解适配器）与性能数据一并汇总。
@@ -70,10 +92,10 @@ GPU_ID=1 bash scripts/capture_vllm_startup.sh /data/models/Xiaomi-OCR-0
 
 ### Token、停止原因与 padding
 
-- 输入/生成/总处理 token 来自服务端 usage，不再按空白或字符估计。
+- 输入/生成/总处理 token 来自离线实际prompt/output IDs长度（HTTP入口来自服务端usage），不再按空白或字符估计。
 - processor 独立记录 patch 数，不把 patch 无条件当作 LLM visual token。
-- worker 请求 ID 与 SSE server_request_id 唯一匹配后，使用实际多模态 placeholder spans 计 visual token，并对比 worker input IDs 长度与 usage。文本/特殊 token 可由同模型 tokenizer 分类；找不到对应证据则保留 null。
-- 输出可见/特殊 token 仅在 worker 已返回真实 Python token IDs 且长度与 usage 一致时分类。异步 worker 输出不为采集强制同步，缺失会明确记录。
+- worker 请求 ID 与离线request_id或SSE server_request_id唯一匹配后，使用实际多模态 placeholder spans 计 visual token，并对比 worker input IDs 长度与 usage。文本/特殊 token 可由同模型 tokenizer 分类；找不到对应证据则保留 null。
+- 输出可见/特殊token由离线生成器实际IDs分类，或在HTTP worker已返回真实Python token IDs且长度与usage一致时分类。异步 worker 输出不为采集强制同步，缺失会明确记录。
 - `stop` 不自动等于 EOS。只有真实最后一个 token 与 tokenizer EOS 相符且序列完整才有 EOS 证据。
 - 有 finish_reason 的请求作为停止原因/截断率的完成分母，HTTP/处理失败保留在请求错误率分母。
 - useful-output token 是**同模型 tokenizer 对接受版后处理文本的计数**，与 raw generated token 数分开。
@@ -81,11 +103,11 @@ GPU_ID=1 bash scripts/capture_vllm_startup.sh /data/models/Xiaomi-OCR-0
 
 ### TTFT、ITL、TPOT
 
-- `ttft_ms`：HTTP 提交到第一个可观测输出事件。`ttft_e2e_ms`：文件读取阶段起点到同一事件。纯 role/空 delta 不算首 token。
-- 保存所有 chunk 间隔。只有每个输出 SSE 事件均有且仅有一个 logprob token 时，才把相邻事件间隔报告为 host-observed ITL。
+- `ttft_ms`：离线引擎提交到第一个实际token ID事件；旧HTTP入口是HTTP提交到第一个可观测输出事件。`ttft_e2e_ms`：文件读取阶段起点到同一事件。纯 role/空 delta 不算首 token。
+- 离线保存host_output_interval_ms，每个非空delta恰有1个真实token ID时才提供ITL。HTTP保存所有chunk间隔，只有每个输出SSE事件均有且仅有一个logprob token时，才把相邻事件间隔报告为 host-observed ITL。
 - 多 token 合并 flush、无 logprobs 的文本块不伪造 ITL；只报告 chunk interval。即使 logprob 每块一条，这仍是 host 观测，不是 GPU token 完成时间。
 - `host_tpot_after_first_ms=(末次输出事件−首次输出事件)/(generated_tokens−1)`，明确不是精确 GPU Decode 时间。
-- 模型 TPOT 需要实际模型 Decode 证据，缺失则 null。`time_per_generated_token_ms` 使用 HTTP 请求时延/实际生成数，名称与模型 TPOT 分开。
+- 模型 TPOT 需要实际模型 Decode 证据，缺失则 null。`time_per_generated_token_ms` 使用当前后端请求时延/实际生成数，名称与模型 TPOT 分开。
 - 所有延迟统计输出 count、mean、总体标准差、min、P50/P90/P95/P99、max。
 
 ### 模型阶段、算子、kernel 与传输
@@ -95,7 +117,7 @@ GPU_ID=1 bash scripts/capture_vllm_startup.sh /data/models/Xiaomi-OCR-0
 
 ```bash
 MODULE_MAP='{"vision_encoder":"visual","projector":"visual.merger"}' \
-  bash benchmark/run_vllm_concurrency8.sh ...
+  bash benchmark/run_offline_concurrency8.sh ...
 ```
 
 - V1 Prefill/Decode 使用 scheduler 的 prompt 长度与 computed position 分类，不用“调度一个 token 就是 Decode”的猜测。混合或未知 step 单独标记。V0 有明确 attention metadata 时使用相应字段。

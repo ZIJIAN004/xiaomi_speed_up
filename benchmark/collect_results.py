@@ -200,7 +200,7 @@ def coverage_inventory(records, summary, profiles, traces, quality):
     for field in ("end_to_end_latency_ms", "request_latency_ms", "ttft_ms", "ttft_e2e_ms", "tpot_ms", "gpu_ttft_ms"):
         add(field, "8,17", [r.get(field) for r in records + profiles], "host request/stream timestamps or representative-only CUDA Event evidence, phase-separated",
             "no direct measurement; host intervals do not replace GPU phase times", "stage_latency.csv")
-    add("itl_ms", "8,17", [r.get("itl_ms") for r in records], "one logprob token per SSE event only",
+    add("itl_ms", "8,17", [r.get("itl_ms") for r in records], "one actual token ID per offline delta, or one logprob token per SSE event",
         "coalesced/unverified text chunks do not yield token ITL", "summary.json")
     for field, value in summary["throughput"].items():
         if field.endswith("per_second") or field == "model_only_throughput":

@@ -116,6 +116,8 @@ def main():
     except Exception as exc:
         report["torch_import_error"] = str(exc)
     targets = [
+        ("vllm.v1.engine.async_llm", "AsyncLLM", ("from_engine_args", "generate", "collective_rpc", "start_profile", "stop_profile", "reset_mm_cache", "reset_prefix_cache", "reset_encoder_cache", "shutdown")),
+        ("vllm.engine.arg_utils", "AsyncEngineArgs", ()),
         ("vllm.multimodal.processing", "BaseMultiModalProcessor", ("apply", "_call_hf_processor", "_cached_apply_hf_processor")),
         ("vllm.multimodal.processing.processor", "BaseMultiModalProcessor", ("apply", "_call_hf_processor", "_cached_apply_hf_processor")),
         ("vllm.v1.engine.input_processor", "InputProcessor", ("process_inputs",)),

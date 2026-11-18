@@ -59,7 +59,7 @@ def verify(root):
     check("input_ids_correlated_to_usage", len(records) == 8 and all(r.get("worker_input_length_verified") for r in records),
           {"verified": sum(bool(r.get("worker_input_length_verified")) for r in records), "total": len(records)})
     check("output_ids_materialized_and_match_usage", bool(records) and all(
-        r.get("generated_token_classification_source") == "actual_worker_sampled_ids_matched_to_server_usage" for r in records),
+        r.get("generated_token_classification_source") in ("actual_worker_sampled_ids_matched_to_server_usage", "actual_offline_delta_token_ids") for r in records),
         {"output_types": [w.get("steps", {}).get("output_type_step_counts") for w in workers],
          "classified_requests": sum(r.get("generated_visible_tokens") is not None for r in records),
          "note": "async output absence is not synchronized away; missing evidence needs an adapter"})
