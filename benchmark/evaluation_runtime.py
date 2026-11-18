@@ -29,6 +29,11 @@ sys.path.insert(0, os.environ['OMNIDOC_PROJECT_ROOT'])
 import benchmark.skimage_compat
 import dataset, task, metrics
 from metrics.cdm_metric import CDM
+from skimage.measure import ransac
+import numpy as np
+from skimage.transform import SimilarityTransform
+_probe = np.array([[0., 0.], [1., 1.], [2., 2.], [3., 3.]])
+ransac((_probe, _probe), SimilarityTransform, min_samples=2, residual_threshold=1, max_trials=5, random_state=42)
 for tool in ('xelatex','magick','gs','node'):
     if shutil.which(tool) is None:
         raise RuntimeError('missing CDM tool: '+tool)

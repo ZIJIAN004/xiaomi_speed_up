@@ -8,14 +8,12 @@ not alter the scoring implementation.
 from __future__ import annotations
 
 from functools import wraps
+import sys
 
 
-def install() -> None:
-    import skimage.measure as measure
-
-    current = measure.ransac
+def _wrap(current):
     if getattr(current, "_omnidocbench_random_state_compat", False):
-        return
+        return current
 
     @wraps(current)
     def ransac_compat(*args, random_state=None, **kwargs):
@@ -26,7 +24,22 @@ def install() -> None:
         return current(*args, **kwargs)
 
     ransac_compat._omnidocbench_random_state_compat = True
-    measure.ransac = ransac_compat
+    return ransac_compat
+
+
+def install() -> None:
+    import skimage.measure as measure
+    import skimage.measure._fit as fit
+
+    wrapped = _wrap(fit.ransac)
+    fit.ransac = wrapped
+    measure.ransac = wrapped
+
+    # visual_matcher.py imports ransac by value, so patch that binding too when
+    # the official evaluator has already imported the module.
+    visual_matcher = sys.modules.get("metrics.cdm.modules.visual_matcher")
+    if visual_matcher is not None and hasattr(visual_matcher, "ransac"):
+        visual_matcher.ransac = wrapped
 
 
 install()
