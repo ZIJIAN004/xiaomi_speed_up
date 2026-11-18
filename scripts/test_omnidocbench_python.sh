@@ -47,8 +47,9 @@ for file in upgreek.sty xeCJK.sty geometry.sty amsmath.sty amssymb.sty xcolor.st
 done
 
 if command -v fc-match >/dev/null 2>&1; then
-    FONT_MATCH=$(fc-match "Source Han Sans SC" 2>/dev/null || true)
-    [[ -n "$FONT_MATCH" ]] || fail "Source Han Sans SC is unavailable"
+    FONT_MATCH=$(fc-match --format='%{family}\n' "Source Han Sans SC" 2>/dev/null || true)
+    printf '%s\n' "$FONT_MATCH" | grep -Fqi "Source Han Sans SC" \
+        || fail "Source Han Sans SC is unavailable (fontconfig fallback: ${FONT_MATCH:-none})"
     ok "Source Han Sans SC: $FONT_MATCH"
 else
     fail "fc-match is unavailable; cannot verify CDM CJK font"
