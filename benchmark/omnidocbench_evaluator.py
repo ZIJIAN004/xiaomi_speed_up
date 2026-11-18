@@ -33,8 +33,13 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     config_path = output/'evaluator_config.json'
     dump_json(config_path, config)  # JSON is valid YAML for the upstream YAML loader.
     env = dict(os.environ)
-    env['PYTHONPATH'] = str(root)+os.pathsep+env.get('PYTHONPATH','')
-    command = [python, str(root/'pdf_validation.py'), '--config', str(config_path)]
+    project_root = Path(__file__).resolve().parent.parent
+    env['PYTHONPATH'] = os.pathsep.join((str(project_root), str(root), env.get('PYTHONPATH', '')))
+    command = [python, '-c',
+               'import runpy, sys; import benchmark.skimage_compat; '
+               'sys.argv=[sys.argv[0], "--config", sys.argv[1]]; '
+               'runpy.run_path(sys.argv[0], run_name="__main__")',
+               str(root/'pdf_validation.py'), str(config_path)]
     if docker:
         command = docker_command(root,work/'result',runtime['image_id'],
             [(gt,'/evaluation/gt.json'),(predictions,'/evaluation/predictions'),

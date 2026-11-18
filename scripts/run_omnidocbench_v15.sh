@@ -19,6 +19,7 @@ RESULT_ROOT="${RESULT_ROOT:-$ROOT_DIR/benchmark/results/omnidocbench_v15_$(date 
 export GPU_ID CUDA_VISIBLE_DEVICES="$GPU_ID" TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONPATH="$ROOT_DIR/benchmark/server_bootstrap:$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export OMNIDOCBENCH_PYTHON_COMPAT="$ROOT_DIR/benchmark/skimage_compat.py"
 mkdir -p "$(dirname "$RESULT_ROOT")"
 ARGS=(--dataset "$OMNIDOC_ROOT" --model "$MODEL_PATH" --output "$RESULT_ROOT" --gpu "$GPU_ID"
       --evaluator-root "$OMNIDOC_EVALUATOR_ROOT" --eval-python "$OMNIDOC_EVAL_PYTHON"

@@ -24,7 +24,9 @@ def docker_command(root, result, image, extra_mounts=()):
 
 
 SMOKE = r'''
-import json, pathlib, shutil
+import json, os, pathlib, shutil, sys
+sys.path.insert(0, os.environ['OMNIDOC_PROJECT_ROOT'])
+import benchmark.skimage_compat
 import dataset, task, metrics
 from metrics.cdm_metric import CDM
 for tool in ('xelatex','magick','gs','node'):
@@ -64,7 +66,8 @@ def preflight(root, backend='docker', python='python', image=DEFAULT_IMAGE):
                     (work/asset.name).symlink_to(asset,target_is_directory=asset.is_dir())
             (work/'result').mkdir()
             command,cwd = [python,'-c',SMOKE],work
-        env = dict(os.environ,PYTHONPATH=str(root)+os.pathsep+os.environ.get('PYTHONPATH',''))
+        env = dict(os.environ, PYTHONPATH=str(root)+os.pathsep+os.environ.get('PYTHONPATH',''))
+        env['OMNIDOC_PROJECT_ROOT'] = str(Path(__file__).resolve().parent.parent)
         try:
             run = subprocess.run(command,cwd=cwd,env=env,capture_output=True,text=True,check=True,timeout=180)
         except subprocess.CalledProcessError as exc:
