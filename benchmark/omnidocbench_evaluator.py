@@ -37,8 +37,9 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     env['PYTHONPATH'] = os.pathsep.join((str(project_root), str(root), env.get('PYTHONPATH', '')))
     command = [python, '-c',
                'import runpy, sys; import benchmark.skimage_compat; '
-               'sys.argv=[sys.argv[0], "--config", sys.argv[1]]; '
-               'runpy.run_path(sys.argv[0], run_name="__main__")',
+               'script, config = sys.argv[1:3]; '
+               'sys.argv=[script, "--config", config]; '
+               'runpy.run_path(script, run_name="__main__")',
                str(root/'pdf_validation.py'), str(config_path)]
     if docker:
         command = docker_command(root,work/'result',runtime['image_id'],
