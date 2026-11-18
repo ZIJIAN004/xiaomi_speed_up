@@ -24,6 +24,14 @@ WARMUP=5 REPRESENTATIVES=5 PROFILE_MAX_ITERATIONS=64 RETRY_REPETITIVE=1 \
 
 脚本检查安装版本的 `--worker-extension-cls`，保存版本与完整 help，按版本能力选择 JSON profiler-config 或 legacy profiler 环境变量。所有服务绑定 127.0.0.1。worker RPC/profiler 属于开发接口，**不可暴露到公网或生产服务**。启动前检查端口，退出只结束本脚本记录的服务 PID。
 
+## 服务启动与就绪探测诊断
+
+启动脚本会明确显示版本检查、help检查、服务启动与HTTP探测阶段。就绪条件是本机`/health`与`/v1/models`均返回HTTP 200；模型打印初始化完成或列出API路由不能代替客户端连通性验证。
+
+每轮探测的HTTP状态、连接/超时异常和耗时实时打印，并保存到结果根目录`readiness_checks.jsonl`。`server_startup.json`保存ready/failed及最终探测结果。401/403访问拒绝和health已就绪后的models 404立即报告，不再一直等待；连接失败、超时和服务暂未就绪在明确deadline内重试。默认`READINESS_TIMEOUT=1200`秒，可显式调整。HTTP环境代理仍禁用；不记录响应正文、API密钥或Authorization。
+
+原有实现吞掉全部HTTP探测异常，只在最后显示readiness timed out，这会掩盖API已启动但客户端检查失败的真实原因。该诊断盲点已修复；具体机器上的根因仍须由新探测结果确认，不能把它预设为显存不足、初始化太慢或鉴权问题。
+
 ## 采集顺序与计时边界
 
 1. 生成唯一 sample_id manifest，保留相对路径和显式注解；同名文件不覆盖。

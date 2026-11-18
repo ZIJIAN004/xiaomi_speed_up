@@ -42,7 +42,9 @@ PREP_ARGS=()
 python -m benchmark.prepare_datasets --output-dir "$RESULT_ROOT/manifests" \
   --omnidocbench "$OMNIDOC_ROOT" --midv500 "$MIDV500_ROOT" --midv-lait "$MIDV_LAIT_ROOT" "${PREP_ARGS[@]}"
 
+echo "Checking vLLM version..."
 vllm --version > "$LOG_DIR/vllm_version.txt" 2>&1
+echo "Checking vLLM serve options..."
 if ! vllm serve --help=all > "$LOG_DIR/vllm_serve_help.txt" 2>&1; then
   vllm serve --help > "$LOG_DIR/vllm_serve_help.txt" 2>&1
 fi
@@ -93,6 +95,7 @@ with socket.socket() as sock:
     except OSError as exc:
         raise SystemExit(f"Benchmark port is unavailable; refusing to attach to an unrelated server: {exc}")
 PY
+echo "Starting vLLM; server log: $LOG_DIR/vllm_server.log"
 SERVER_START=$(python -c 'import time; print(time.time())')
 VLLM_BENCHMARK_PROCESSOR_DIR="$RESULT_ROOT/processor_raw" \
 PYTHONPATH="$ROOT_DIR/benchmark/server_bootstrap:$PYTHONPATH" \
@@ -108,30 +111,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-python - "$PORT" "$VLLM_PID" "$SERVER_START" "$RESULT_ROOT/server_startup.json" <<'PY'
-import json, os, sys, time, urllib.request
-port, pid, start, output = sys.argv[1:]
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-for _ in range(240):
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        raise SystemExit("vLLM exited during startup; inspect logs/vllm_server.log")
-    try:
-        with opener.open(f"http://127.0.0.1:{port}/v1/models", timeout=5) as response:
-            if response.status == 200:
-                ready = time.time()
-                with open(output, "w") as f:
-                    json.dump({"server_start_wall_s": float(start), "server_ready_wall_s": ready,
-                               "cold_start_latency_s": ready - float(start), "server_pid": int(pid),
-                               "cold_start_scope": "launch through HTTP readiness, includes load/compile/graph capture",
-                               "model_load_time_s": None, "cuda_initialization_time_s": None}, f, indent=2)
-                break
-    except Exception:
-        time.sleep(5)
-else:
-    raise SystemExit("vLLM readiness timed out; inspect logs/vllm_server.log")
-PY
+python -m benchmark.readiness --base-url "http://127.0.0.1:$PORT" --pid "$VLLM_PID" \
+  --launched-at "$SERVER_START" --output "$RESULT_ROOT/server_startup.json" \
+  --timeout "${READINESS_TIMEOUT:-1200}"
 # Fail early if worker instrumentation is unreachable, rather than running a misleading client-only benchmark.
 python - "$PORT" <<'PY'
 import sys

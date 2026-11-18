@@ -690,6 +690,79 @@ class RequestIntegrationTests(unittest.TestCase):
             self.assertTrue((args.output / "bottleneck_report.md").is_file())
 
 
+class ReadinessTests(unittest.TestCase):
+    def test_health_then_models_required_for_readiness(self):
+        from benchmark.readiness import wait_for_server
+        calls = []
+        class Response:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        opener = SimpleNamespace(open=lambda url, **kwargs: (calls.append(url) or Response()))
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "startup.json"
+            result = wait_for_server("http://127.0.0.1:26000", 1, 0, output, opener=opener, alive=lambda: None)
+            self.assertEqual(result["status"], "ready")
+            self.assertTrue(calls[0].endswith("/health"))
+            self.assertTrue(calls[1].endswith("/v1/models"))
+            self.assertTrue(output.with_name("readiness_checks.jsonl").is_file())
+
+    def test_http_denial_fails_immediately_with_status(self):
+        import urllib.error
+        from benchmark.readiness import wait_for_server
+        class Response:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        for code in (401, 403, 404):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as folder:
+                def open_url(url, **kwargs):
+                    if url.endswith("/health"):
+                        return Response()
+                    raise urllib.error.HTTPError(url, code, "denied", {}, None)
+                output = Path(folder) / "startup.json"
+                with self.assertRaises(RuntimeError):
+                    wait_for_server("http://127.0.0.1:26000", 1, 0, output,
+                        opener=SimpleNamespace(open=open_url), alive=lambda: None,
+                        sleep=lambda _: self.fail("must not wait after HTTP denial"))
+                report = json.loads(output.read_text())
+                self.assertEqual(report["last_probe"]["models"]["status"], code)
+                self.assertEqual(report["status"], "failed")
+                self.assertIsNone(report["cold_start_latency_s"])
+
+    def test_transport_failure_is_preserved_until_deadline(self):
+        import urllib.error
+        from benchmark.readiness import wait_for_server
+        clock = [0]
+        def open_url(url, **kwargs):
+            raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+        def sleep(seconds):
+            clock[0] += seconds
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "startup.json"
+            with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
+                wait_for_server("http://localhost:26000", 1, 0, output, timeout=2, interval=1,
+                    opener=SimpleNamespace(open=open_url), clock=lambda: clock[0], sleep=sleep, alive=lambda: None)
+            data = json.loads(output.read_text())
+            self.assertEqual(data["last_probe"]["health"]["error"], "URLError")
+            self.assertIn("connection refused", data["last_probe"]["health"]["detail"])
+            self.assertEqual(len(output.with_name("readiness_checks.jsonl").read_text().splitlines()), 2)
+
+    def test_recorded_server_exit_is_not_a_readiness_timeout(self):
+        from benchmark.readiness import wait_for_server
+        def exited():
+            raise ProcessLookupError()
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "startup.json"
+            with self.assertRaisesRegex(RuntimeError, "PID exited"):
+                wait_for_server("http://localhost:26000", 1, 0, output, alive=exited)
+            self.assertEqual(json.loads(output.read_text())["last_probe"], {})
+
+
 class RuntimeVerificationTests(unittest.TestCase):
     def test_missing_runtime_files_cannot_verify_anything(self):
         from scripts.summarize_benchmark_runtime import verify
