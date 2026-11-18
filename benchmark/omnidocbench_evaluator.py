@@ -38,7 +38,11 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     env['PYTHONPATH'] = os.pathsep.join((str(project_root), str(root), env.get('PYTHONPATH', '')))
     if not docker:
         evaluator_bin = str(Path(python).resolve().parent)
-        env['PATH'] = evaluator_bin + os.pathsep + env.get('PATH', '')
+        tex_root = env.get('TEXLIVE_ROOT', '/home/mr_jiang/tools/texlive')
+        tex_bin = str(Path(tex_root) / 'bin' / 'x86_64-linux')
+        env['PATH'] = os.pathsep.join((evaluator_bin, tex_bin, env.get('PATH', '')))
+        env['TEXMFROOT'] = tex_root
+        env['TEXMFCNF'] = str(Path(tex_root) / 'texmf-dist' / 'web2c')
     command = [python, '-c',
                'import runpy, sys; import benchmark.skimage_compat; '
                'script, config = sys.argv[1:3]; '

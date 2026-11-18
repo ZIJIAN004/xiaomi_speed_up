@@ -74,7 +74,11 @@ def preflight(root, backend='docker', python='python', image=DEFAULT_IMAGE):
         env = dict(os.environ, PYTHONPATH=str(root)+os.pathsep+os.environ.get('PYTHONPATH',''))
         if backend == 'python':
             evaluator_bin = str(Path(python).resolve().parent)
-            env['PATH'] = evaluator_bin + os.pathsep + env.get('PATH', '')
+            tex_root = env.get('TEXLIVE_ROOT', '/home/mr_jiang/tools/texlive')
+            tex_bin = str(Path(tex_root) / 'bin' / 'x86_64-linux')
+            env['PATH'] = os.pathsep.join((evaluator_bin, tex_bin, env.get('PATH', '')))
+            env['TEXMFROOT'] = tex_root
+            env['TEXMFCNF'] = str(Path(tex_root) / 'texmf-dist' / 'web2c')
         env['OMNIDOC_PROJECT_ROOT'] = str(Path(__file__).resolve().parent.parent)
         try:
             run = subprocess.run(command,cwd=cwd,env=env,capture_output=True,text=True,check=True,timeout=180)

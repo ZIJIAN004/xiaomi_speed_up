@@ -9,7 +9,11 @@ DATA_ROOT="${OMNIDOC_ROOT:-$ROOT_DIR/benchmark/data}"
 EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-python}"
 TEX_ROOT="${TEXLIVE_ROOT:-}"
 EVAL_BIN=$(dirname "$(command -v "$EVAL_PYTHON" 2>/dev/null || printf '%s' "$EVAL_PYTHON")")
-export PATH="$EVAL_BIN:$PATH"
+TEX_ROOT="${TEXLIVE_ROOT:-/home/mr_jiang/tools/texlive}"
+TEX_BIN="$TEX_ROOT/bin/x86_64-linux"
+export PATH="$EVAL_BIN:$TEX_BIN:$PATH"
+export TEXMFROOT="$TEX_ROOT"
+export TEXMFCNF="$TEX_ROOT/texmf-dist/web2c"
 export PYTHONPATH="$ROOT_DIR:$EVALUATOR_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 2; }
