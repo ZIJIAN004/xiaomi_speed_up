@@ -8,7 +8,7 @@ EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$ROOT_DIR/evaluation_pipeline/OmniDocB
 DATA_ROOT="${OMNIDOC_ROOT:-$ROOT_DIR/benchmark/data}"
 EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-python}"
 TEX_ROOT="${TEXLIVE_ROOT:-}"
-export PYTHONPATH="$EVALUATOR_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT_DIR:$EVALUATOR_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 2; }
 ok() { printf 'OK: %s\n' "$*"; }
@@ -90,6 +90,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import benchmark.skimage_compat
 from metrics.cdm_metric import CDM
 
 root = pathlib.Path(sys.argv[1]).resolve()
