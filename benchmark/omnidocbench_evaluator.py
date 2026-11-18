@@ -14,10 +14,11 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     root, predictions, output = Path(root).resolve(), Path(predictions).resolve(), Path(output).resolve()
     work = output/'evaluator_work'
     work.mkdir()
+    # OmniDocBench writes its relative result files under work/result for both
+    # Python and Docker evaluator backends.
+    (work/'result').mkdir()
     runtime = runtime or {'backend':'python','python':python}
     docker = runtime['backend'] == 'docker'
-    if docker:
-        (work/'result').mkdir()
     # Isolate newly generated results while allowing relative evaluator resource reads.
     for asset in root.iterdir():
         if not docker and asset.name not in ('.git', 'result', '__pycache__'):
