@@ -201,6 +201,119 @@ class TraceTests(unittest.TestCase):
         self.assertIsNone(result["gpu_active_time_ms"])
 
 
+class ServerProcessorTests(unittest.TestCase):
+    def test_nested_real_methods_preserve_results_and_skip_super_double_count(self):
+        import os
+        from benchmark.server_processor import wrap_method
+        class Base:
+            def apply(self, image, cached=False):
+                return image if cached else self._call_hf_processor(image)
+            def _call_hf_processor(self, image):
+                return image + 1
+        class Child(Base):
+            def apply(self, *args, **kwargs):
+                return super().apply(*args, **kwargs)
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_PROCESSOR_DIR": folder}):
+            wrap_method(Base, "apply", "multimodal_apply")
+            wrap_method(Base, "_call_hf_processor", "hf_processor")
+            wrap_method(Child, "apply", "multimodal_apply")
+            self.assertEqual(Child().apply(2), 3)
+            self.assertEqual(Child().apply(2, cached=True), 2)
+            rows = [json.loads(line) for p in Path(folder).glob("*.jsonl") for line in p.read_text().splitlines()]
+            calls = [r for r in rows if r["event"] == "call"]
+            self.assertEqual(len(calls), 3)
+            hf = next(r for r in calls if r["kind"] == "hf_processor")
+            self.assertIn(hf["parent_apply_call_id"], [r["call_id"] for r in calls if r["kind"] == "multimodal_apply"])
+            self.assertTrue(all(r["wall_time_ms"] >= 0 and r["thread_cpu_time_ms"] >= 0 for r in calls))
+            self.assertTrue(all(r["request_id"] is None for r in calls))
+
+    def test_eight_threads_have_independent_processor_context(self):
+        import os
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from benchmark.server_processor import wrap_method
+        barrier = threading.Barrier(8)
+        class Processor:
+            def apply(self, value):
+                barrier.wait(timeout=10)
+                return self._call_hf_processor(value)
+            def _call_hf_processor(self, value):
+                return value * 2
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_PROCESSOR_DIR": folder}):
+            wrap_method(Processor, "apply", "multimodal_apply")
+            wrap_method(Processor, "_call_hf_processor", "hf_processor")
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self.assertEqual(list(pool.map(Processor().apply, range(8))), [i*2 for i in range(8)])
+            rows = [json.loads(line) for p in Path(folder).glob("*.jsonl") for line in p.read_text().splitlines()]
+            calls = [r for r in rows if r["event"] == "call"]
+            self.assertEqual(len(calls), 16)
+            parents = [r["parent_apply_call_id"] for r in calls if r["kind"] == "hf_processor"]
+            self.assertEqual(len(set(parents)), 8)
+
+    def test_processor_exception_propagates_and_context_resets(self):
+        import os
+        from benchmark.server_processor import wrap_method
+        class Broken:
+            def apply(self):
+                raise ValueError("private input must not appear in telemetry")
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_PROCESSOR_DIR": folder}):
+            wrap_method(Broken, "apply", "multimodal_apply")
+            for _ in range(2):
+                with self.assertRaises(ValueError):
+                    Broken().apply()
+            text = next(Path(folder).glob("*.jsonl")).read_text()
+            self.assertNotIn("private input", text)
+            calls = [json.loads(line) for line in text.splitlines() if json.loads(line)["event"] == "call"]
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(not r["success"] and r["error_type"] == "ValueError" for r in calls))
+
+    def test_bootstrap_in_new_interpreter_hooks_import_and_chains_existing_sitecustomize(self):
+        import os
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            package = root / "vllm" / "multimodal"
+            package.mkdir(parents=True)
+            (root / "vllm" / "__init__.py").write_text("")
+            (package / "__init__.py").write_text("")
+            (package / "processing.py").write_text("class BaseMultiModalProcessor:\n    def apply(self, value):\n        return value + 1\n")
+            (root / "sitecustomize.py").write_text("import os\nos.environ['BENCHMARK_CHAIN_TEST'] = 'ok'\n")
+            logs = root / "logs"
+            logs.mkdir()
+            repo = Path(__file__).resolve().parents[1]
+            env = dict(os.environ, VLLM_BENCHMARK_PROCESSOR_DIR=str(logs),
+                PYTHONPATH=os.pathsep.join(map(str, [repo / "benchmark/server_bootstrap", repo, root])))
+            code = "import os; from vllm.multimodal.processing import BaseMultiModalProcessor; assert BaseMultiModalProcessor().apply(2)==3; assert os.environ['BENCHMARK_CHAIN_TEST']=='ok'"
+            result = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for p in logs.glob("*.jsonl") for line in p.read_text().splitlines()]
+            self.assertTrue(any(r["event"] == "call" for r in calls), result.stderr)
+
+    def test_call_aggregation_is_phase_separated_and_missing_is_not_zero(self):
+        from benchmark.processor_results import collect_processor_calls
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            raw = root / "raw"
+            raw.mkdir()
+            def call(start, end, kind):
+                return dict(event="call", start_s=start, end_s=end, kind=kind, success=True,
+                            wall_time_ms=(end-start)*1000, thread_cpu_time_ms=1)
+            events = [call(1, 2, "multimodal_apply"), call(11, 12, "multimodal_apply"),
+                      call(11.1, 11.5, "hf_processor"), call(21, 22, "multimodal_apply")]
+            (raw / "processor_1.jsonl").write_text("\n".join(json.dumps(r) for r in events))
+            config = dict(steady_start_s=10, steady_end_s=20, server_processor_dir=str(raw))
+            status = collect_processor_calls(root, config, [], [dict(request_start_s=0, request_end_s=3)])
+            self.assertEqual(status["status"], "measured")
+            steady = [r for r in status["summaries"] if r["phase"] == "steady"]
+            self.assertEqual([r["call_count"] for r in steady], [1, 1])
+            self.assertEqual(len((root / "server_processor_calls.jsonl").read_text().splitlines()), 3)
+            config.pop("server_processor_dir")
+            status = collect_processor_calls(root, config, [])
+            self.assertEqual(status["status"], "unavailable")
+            self.assertIsNone(status["summaries"][0]["total_wall_time_ms"])
+
+
 class WorkerTests(unittest.TestCase):
     def test_native_profiler_bound_and_unsupported_interface(self):
         import sys
@@ -610,7 +723,8 @@ class CollectorIntegrationTests(unittest.TestCase):
             self.assertIsNone(summary["tokens"]["generated_tokens"]["mean"])
             for name in ("summary.json", "stage_latency.csv", "token_statistics.csv", "padding_statistics.csv",
                          "throughput_statistics.csv", "memory_statistics.csv", "cpu_gpu_transfer.csv", "operator_top50.csv",
-                         "kernel_statistics.csv", "bucket_by_image_area.csv", "bucket_by_visual_tokens.csv",
+                         "kernel_statistics.csv", "server_processor_statistics.csv", "server_processor_calls.jsonl",
+                         "server_processor_status.json", "bucket_by_image_area.csv", "bucket_by_visual_tokens.csv",
                          "bucket_by_output_tokens.csv", "metric_coverage.csv", "acceptance_report.json"):
                 self.assertTrue((root / name).is_file(), name)
             acceptance = json.loads((root / "acceptance_report.json").read_text())

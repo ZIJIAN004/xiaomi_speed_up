@@ -50,3 +50,14 @@
 服务器端processor/tokenizer耗时、视觉内部padding、activation/input显存归因、精确碎片、纯CUDA初始化时间和SM/Tensor Core计数器具有明确采集条件，不能保证任意vLLM/模型都能暴露。相关字段与缺失原因已经纳入覆盖表，而不是填0。
 
 因此，代码已提供逐项采集、汇总和证据验收路径，但当前没有真实运行结果能证明所有最低标准已经满足。实际运行后必须检查各数据集`acceptance_report.json`、`metric_coverage.csv`与原始trace；存在missing_evidence时不可宣称设计全部验收通过。正式质量还需要GT、官方evaluator和同口径的基线阈值。
+
+## 服务端 Processor 增补自审（2026-11-18）
+
+- 增加实际multimodal apply与内部HF Processor两层计时，不将两者相加，不假设入口之外的chat template或HTTP解析已覆盖。
+- 采用服务端专用import hook，覆盖标准路径Base类与模型子类，保留环境sitecustomize。已用新解释器和模拟vLLM包验证自动注入，不等于真实vLLM兼容性验证。
+- 记录调用wall/线程CPU、成功/异常、实际类、签名和父子调用ID。返回值和异常保持原样；不记录任何请求内容。
+- HTTP请求ID传播尚无验证，所以仅做调用级/阶段级统计。HF未调用不能断言缓存命中；未知接口或无观测为unavailable，不当0。
+- 补scripts/check_benchmark_interfaces.py用于目标环境的只读版本、接口、模型配置元数据检查。无下载、安装或服务启动。
+- 测试增补包括嵌套去重、异常恢复、子进程启动、已有sitecustomize保留、阶段分离和无证据非零。
+
+本轮最终验证：46项benchmark定向测试通过（含8线程隔离）；16个Python文件AST通过；shell语法、CLI help、诊断脚本缺vLLM时的报告路径及git diff检查通过。实际GPU/vLLM运行仍未验证。

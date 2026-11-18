@@ -172,6 +172,12 @@ def coverage_inventory(records, summary, profiles, traces, quality):
     for field in ("requested_max_tokens", "effective_max_tokens", "actual_generated_tokens", "finish_reason"):
         add(field, "2,3", [r.get(field) for r in records], "request payload, installed server limit helper, actual response",
             "omitted request max_tokens is intentionally null; missing effective helper is not replaced by a guessed cap", "per_sample_metrics.jsonl")
+    for kind in ("multimodal_apply", "hf_processor"):
+        measurements = [r["wall_time_ms"]["mean"] for r in summary["server_processor"]["summaries"]
+                        if r["phase"] == "steady" and r["kind"] == kind]
+        add("server_" + kind + "_time_ms", "5,8", measurements, "actual server processor method calls",
+            summary["server_processor"]["unavailable_reason"] or "actual HF call not observed; no cache inference",
+            "server_processor_statistics.csv")
     for field in ("eos_stop_rate", "length_stop_rate", "truncation_rate", "empty_output_rate", "error_rate"):
         add(field, "3", [summary["stop_statistics"].get(field)], "completed/attempted request populations explicitly separated",
             "terminal token evidence or completed population unavailable", "summary.json")
@@ -287,6 +293,8 @@ def collect_run(run_dir, small_kernel_us=10):
     warmup_path, profile_path = run_dir / "warmup.json", run_dir / "profile_metrics.json"
     warmups = json.loads(warmup_path.read_text(encoding="utf-8")) if warmup_path.exists() else []
     profiles = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else []
+    from benchmark.processor_results import collect_processor_calls
+    processor_status = collect_processor_calls(run_dir, config, records, warmups, profiles)
     traces = collect_traces(run_dir, profiles, small_kernel_us)
     dump_json(run_dir / "profile_metrics.json", profiles)
     monitor_path = run_dir / "monitor" / "system_samples.jsonl"
@@ -396,7 +404,7 @@ def collect_run(run_dir, small_kernel_us=10):
                "high_resolution_threshold_mp": 8, "high_resolution_sample_rate": ratio(sum((r.get("image_megapixels") or 0) > 8 for r in records), len(records)),
                "long_document_threshold_pages": None, "long_document_rate": None,
                "long_document_unavailable_reason": "document page groups and a declared long-document threshold are required",
-               "quality": quality, "profile_summary": traces,
+               "quality": quality, "server_processor": processor_status, "profile_summary": traces,
                "profile_stage_latency_ms": {stage: stats([r.get(stage + "_time_ms") for r in profiles]) for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")},
                "profile_model_only_generated_tokens_per_second": stats([r.get("model_only_generated_tokens_per_second") for r in profiles]),
                "profile_gpu_ttft_ms": stats([r.get("gpu_ttft_ms") for r in profiles]),
@@ -475,6 +483,10 @@ def collect_run(run_dir, small_kernel_us=10):
         latency_rows.append({"metric": direction + "_transfer_time_ms", "phase": "profile",
                              "scope": "GPU memcpy event duration sum per trace",
                              **stats([t.get("transfers", {}).get(direction, {}).get("time_ms") for t in traces])})
+    for row in processor_status["summaries"]:
+        latency_rows.append({"metric": "server_" + row["kind"] + "_time_ms", "phase": row["phase"],
+                             "scope": "actual server call; nested scopes not additive; no per-request attribution",
+                             **row["wall_time_ms"]})
     write_csv(run_dir / "stage_latency.csv", latency_rows)
     write_csv(run_dir / "token_statistics.csv", [{"metric": f, **v} for f, v in summary["tokens"].items()])
     write_csv(run_dir / "padding_statistics.csv", [{"sample_id": r["sample_id"], **{f: r.get(f) for f in PADDING_FIELDS},

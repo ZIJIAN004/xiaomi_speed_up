@@ -514,6 +514,7 @@ def parse_args():
     parser.add_argument("--dcgm-url", help="localhost DCGM exporter /metrics URL; optional hardware counters")
     parser.add_argument("--gpu-cost-per-hour", type=float, help="optional reserved-GPU price in a declared currency/hour")
     parser.add_argument("--long-document-pages", type=int, default=10)
+    parser.add_argument("--server-processor-dir", type=Path, help="actual server processor JSONL directory from launcher")
     parser.add_argument("--profiler-dir", type=Path)
     parser.add_argument("--profile-max-iterations", type=int, default=64)
     parser.add_argument("--module-map", default="{}")
@@ -705,7 +706,9 @@ def main():
         except Exception as exc:
             dump_json(output / "quality.json", {"status": "failed", "reason": str(exc), "metrics": {}})
     from benchmark.collect_results import collect_run
-    collect_run(output)
+    summary = collect_run(output)
+    if config.get("server_processor_dir") and summary["server_processor"]["status"] != "measured":
+        print("WARNING: SERVER PROCESSOR COST UNAVAILABLE: " + summary["server_processor"]["unavailable_reason"], file=sys.stderr)
     print(f"Results: {output}; inspect acceptance_report.json before claiming bottleneck coverage", flush=True)
 
 

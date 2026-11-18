@@ -28,6 +28,11 @@ def write_report(path, summary, records, traces, acceptance):
     for name in ("latency_ms", "request_latency_ms", "ttft_ms", "itl_ms"):
         s = summary[name]
         lines.append(f"| {name} | {s['count']} | {s['mean']} | {s['p50']} | {s['p95']} | {s['p99']} |")
+    processor = summary.get("server_processor", {})
+    lines.append("服务端 Processor 采集状态：" + processor.get("status", "unavailable") + "。实际调用成本见 server_processor_statistics.csv。")
+    if processor.get("unavailable_reason"):
+        lines.append(processor["unavailable_reason"])
+    lines.append("multimodal_apply 与内部 hf_processor 是嵌套口径，不相加；调用wall时间在8并发下可能重叠，不直接作为任务耗时占比。")
     lines.extend(["", "客户端文件读取、图像解码、resize、序列化、后处理和写盘分布见 stage_latency.csv。CPU thread time 与 wall time 分开。", "",
                   "## 模型阶段与 GPU work", ""])
     groups = defaultdict(dict)

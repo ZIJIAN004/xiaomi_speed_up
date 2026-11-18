@@ -97,6 +97,32 @@ MODULE_MAP='{"vision_encoder":"visual","projector":"visual.merger"}' \
 - 若已有本机 DCGM exporter，可设置 `DCGM_URL=http://127.0.0.1:9400/metrics`，采集匹配物理 GPU 标签的 `DCGM_FI_PROF_SM_ACTIVE` 和 `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`。不自动安装或改变 GPU profiling 配置。没有 DCGM 不伪造 SM/Tensor Core 指标。
 - WSL 下若能调用 `powershell.exe`，每10秒通过 Windows CIM 采集主机总/空闲/已用内存，并记录真实观测时间；失败显式记错。不用 Linux RSS 代替 Windows 主机内存，没有主机遥测时明确不可用。Nsight Systems/Compute 仍按设计在 trace 发现空洞、传输/同步异常后补充，不默认录整个数据集。
 
+## 服务端 Processor 实际成本
+
+launcher 只向服务端进程及其子进程注入 opt-in `sitecustomize`，保留环境已有的同名启动模块。不修改已安装 vLLM/Transformers 源文件，也不在 benchmark 客户端启用该钩子。标准 import 路径下，按实际导入的 `BaseMultiModalProcessor` 及其子类包装同步方法；未知/异步接口记录不支持，需按诊断结果适配。
+
+- `multimodal_apply`：真实 vLLM 多模态处理入口，含缓存检查、输入/placeholder 整理等；不称为纯 Normalize 时间，也不覆盖入口之外的HTTP解析、图像获取或chat template操作。
+- `hf_processor`：真实 `_call_hf_processor` 调用，可能同时处理图片与文本；嵌套在 apply 中，**两者不得相加**。不另外执行 processor，不改变返回值、异常或缓存行为。
+- 每次调用记录 wall time、当前线程CPU time、实际processor类、成功/失败、PID、调用ID。父apply调用ID用于关联内部HF调用；`super()`不重复计数。不记录图片、prompt、输出文本或token IDs。
+- 这些API没有已验证的HTTP请求ID上下文，所以目前是**实际调用级/数据集阶段级统计，不是逐样本归因**。不按完成顺序或时间邻近猜测对应请求。
+- 多次调用保留多条明细。没有HF调用不等于确定缓存命中；完全没有调用时为unavailable而不是0，运行日志会给出警告。
+- 采用同主机跨进程`perf_counter`时间窗分离warmup/steady/retry/profile；跨阶段边界和区间外调用不计入本阶段。8并发时wall时间累加可能重叠，不等于工作负载耗时占比。线程CPU时间不含其他线程CPU工作。
+- 日志写出在计时区间外，但仍有观测开销；正式比较须保持双方同样的观测配置。尚未在真实vLLM环境验证。
+
+新增输出：`server_processor_calls.jsonl`、`server_processor_statistics.csv`、`server_processor_status.json`，并写入`summary.json`与`stage_latency.csv`。状态文件记录实际安装钩子的类、模块和签名；原始多进程日志在结果根目录`processor_raw/`。离线`processor_audit_time_ms`仍单独保留，不代替真实服务端成本。
+
+### 环境与接口诊断
+
+在**实际运行vLLM的现有环境**中执行，不需要先启动模型：
+
+```bash
+python scripts/check_benchmark_interfaces.py --output /tmp/benchmark_interfaces.json
+# 可选：只读取本地模型JSON配置，不下载、不执行模型自定义代码
+python scripts/check_benchmark_interfaces.py --model-path /data/models/Xiaomi-OCR-0 --output /tmp/benchmark_interfaces_model.json
+```
+
+脚本报告Python、vLLM、torch、Transformers、tokenizers等版本、CUDA构建版本、GPU/驱动，以及Processor、输入处理、worker/profile接口的实际签名、来源文件和ProfilerConfig字段。缺包/接口变动保留错误详情；不安装依赖、不启动服务、不加载模型权重，不采集环境变量或密钥。报告只写本地，不自动上传。输出路径必须是新文件。
+
 ## 数据标签与质量评价
 
 图像根目录必须是正确的页面/帧集合。多帧 TIFF/GIF 等输入会拒绝静默只评第一页，应先显式拆页。ID 与输出文件的对应关系保存在 `prediction_mapping.json`，外部 evaluator 必须使用这个映射，不能假定原 stem 与输出名一致。

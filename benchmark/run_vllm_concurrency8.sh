@@ -26,7 +26,7 @@ fi
 mkdir -p "$RESULT_ROOT"
 RESULT_ROOT=$(cd "$RESULT_ROOT" && pwd)
 LOG_DIR="$RESULT_ROOT/logs"
-mkdir -p "$LOG_DIR" "$RESULT_ROOT/profiler_raw"
+mkdir -p "$LOG_DIR" "$RESULT_ROOT/profiler_raw" "$RESULT_ROOT/processor_raw"
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -94,6 +94,8 @@ with socket.socket() as sock:
         raise SystemExit(f"Benchmark port is unavailable; refusing to attach to an unrelated server: {exc}")
 PY
 SERVER_START=$(python -c 'import time; print(time.time())')
+VLLM_BENCHMARK_PROCESSOR_DIR="$RESULT_ROOT/processor_raw" \
+PYTHONPATH="$ROOT_DIR/benchmark/server_bootstrap:$PYTHONPATH" \
 vllm serve "$MODEL_PATH" --served-model-name "$MODEL_NAME" --host 127.0.0.1 \
   --port "$PORT" --gpu-memory-utilization "$GPU_MEM_UTIL" --max-model-len "$MAX_MODEL_LEN" \
   --dtype "$DTYPE" "${EXTRA_ARGS[@]}" > "$LOG_DIR/vllm_server.log" 2>&1 &
@@ -158,6 +160,7 @@ for DATASET in omnidocbench midv500 midv-lait; do
     --base-url "http://127.0.0.1:$PORT" --workers 8 --gpu "$GPU_ID" --server-pid "$VLLM_PID" \
     --request-timeout "$REQUEST_TIMEOUT" --max-model-len "$MAX_MODEL_LEN" \
     --warmup "$WARMUP" --representatives "$REPRESENTATIVES" --profiler-dir "$RESULT_ROOT/profiler_raw" \
+    --server-processor-dir "$RESULT_ROOT/processor_raw" \
     --profile-max-iterations "$PROFILE_MAX_ITERATIONS" \
     "${RUN_ARGS[@]}" 2>&1 | tee "$LOG_DIR/$DATASET.log"
 done
