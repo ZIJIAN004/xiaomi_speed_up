@@ -107,3 +107,47 @@
 - legacy exporter只执行一次Kineto导出；再次请求文件名时迁移同一payload，gzip格式转换成功后删除本次源文件。模拟磁盘转换失败验证原文件保留、半成品清理，不覆盖其他已有artifact。没有删除用户现有诊断数据。
 - 测试验证profile目录没有trace复制件、gzip完整运行目录搬迁后仍能分析并保留字节内容、代表引用不生成第二份payload、旧绝对路径兼容及legacy单副本导出恢复。
 - 62项benchmark和13项offline定向测试通过；本地没有torch/vLLM/GPU，真实worker导出流程未实测。本轮不修改监控采样、不缩短64/16步窗口、不增加磁盘容量上限，因此不能据此保证永不写满磁盘。
+
+## 监控低写盘与标量保留自审（2026-11-18）
+
+- 默认1秒绝对deadline采样，采样耗时不再额外叠加到周期。慢轮次跳过错过的时隙，不补采突发；保留实际开始/结束和耗时。阶段epoch检测跨阶段及离开后返回，正式统计仍按完整steady窗口过滤。
+- 资源、系统内存、原生Prometheus和可选DCGM数值用float64列存RAM，缺测NaN，新增series回填缺测；不保留每轮详细进程树字典。Welford在线统计按阶段分开，缺测计数由该阶段总数减有效数，全部缺测列仍可见。
+- 首轮及之后每60秒原子覆盖一个在线汇总；每种实际观测阶段保存首轮完整快照和最后一次完整快照，不再逐轮创建JSONL/Prometheus/DCGM文件。短阶段不保证被观测，不伪造边界快照。
+- 正常结束一次性写不压缩标量ZIP，各列含标签、阶段、字节序元数据，保留精确采样分位数及可重算证据；按列读取统计，避免把全部列展开为Python字典。不在推理热路径压缩或排序。硬崩溃只能保留最近在线汇总，不能恢复丢失数组的精确分位数。
+- 原before/after计数器reset判定、直方图差值、逐请求JSONL、预测文件、Processor调用、profiler 64/16窗口、模型/模板/tokenization/padding/max_length均不改。旧JSONL和逐轮Prometheus结果仍支持汇总。没有引入任何GPU同步。
+- 本地429列×3600次追加微测平均0.557ms/次，单次汇总4.47ms，最终11.83MiB归档41.97ms。这只测存储，不含进程扫描/nvidia-smi/真实推理，不是远程吞吐回归证明。
+- 回归测试发现旧stream.write残留，已修正。测试覆盖精确P99、动态列缺测、Welford统计、阶段窗口/epoch、计数器reset/直方图均值、旧格式兼容、少量文件、正常退出、慢采样deadline、可选DCGM与空采样归档。75项原benchmark/offline测试和11项监控测试通过。
+- 本地没有torch/vLLM/GPU，真实目标机吞吐影响未验证；没有安装依赖或环境，没有修改/清理benchmark/dia及ANALYSIS_FLOW.md。本改动不保证profiler、预测和Processor日志永不写满磁盘。
+
+## 预测去重与评价后文本筛选自审（2026-11-18）
+
+- 原始输出改为一个加锁追加的raw_outputs.jsonl，不再每次创建.raw.txt；记录sample_id/phase/attempt键及共享存储格式。已收到文本先存储，再做后处理，异常文本也有证据。后处理Markdown只写一次，最终采用版本移动到predictions，不再copy2；采用重试后重写retry_metrics的路径。
+- 保持完整数据集批量评价，正式吞吐窗口不包含评价/筛选。collect_run先验证评价状态/覆盖/必需指标/版本并完成token和trace汇总，再按留存策略清理新运行目录内显式记录的文件。未评价/失败/不完整/版本错误不清理；质量低于阈值不豁免清理规则。
+- 默认固定种子随机10条、最多低分10条，加所有异常和选定代表样本并集，保留这些样本各phase/attempt的文本。低分使用明确方向的实际逐样本指标，缺少时标记不可用。内置字段评价新增真实逐样本Precision/Recall/F1/CER/WER/字段准确率，不改变总体微平均公式。
+- 筛选只删除未选全文，不丢分数或指标行。活动路径清空，历史路径和清理状态显式记录；output_retention.json及summary说明删除数量、原因和重新评价限制。重新collect_run沿用quality.json并保留留存状态，不重新读已删除预测。
+- 自审发现collect_run会给profile_metrics添加trace_analysis，不能用清理前内存对象覆盖；已改为读取分析后的profile_metrics再更新留存元数据。评分/监控/profiler标量证据均保留。
+- 新增11项输出存储测试：200条8线程Unicode/多行JSONL、采用重试移动不复制、7种保留全量条件、低分方向、固定种子、失败/截断/重复/代表保留、指标和quality字节不变、越界路径拒绝、坏JSON不删除Markdown、已清理映射明确报错、profile分析保留，以及20请求端到端评分→清理→重新汇总。
+- 定向测试合计97项通过（原benchmark/offline 75项、监控11项、输出存储11项），两个launcher通过bash语法检查，git diff --check无空白错误。20请求端到端测试采用mock离线引擎和真实字段评价，清理后保留3个代表样本的正式预测，20条逐样本分数及请求指标仍完整。
+- 没有修改模型、模板、tokenization、padding_side、max_length、采样超参、8并发或profiler 64/16窗口。没有torch/vLLM/GPU实测，真实目标机吞吐未验证。未清理历史dia目录或改ANALYSIS_FLOW.md；评价前仍需全量暂存，临时筛选文件短暂占额外空间，无磁盘配额保证。
+
+## OmniDocBench v1.5 两阶段启动入口自审（2026-11-18）
+
+- 读取ANALYSIS_FLOW.md并核对Xiaomi公开evaluation_pipeline/README；确认官方当前使用v1.6，不能把原整页offline入口冒充两阶段。本轮新增scripts/run_omnidocbench_v15.sh和专用编排，数据地址留空，模型默认/home/mr_jiang/models/xiaomi-ocr-0/model，GPU 1，layout batch8/threshold.25，VLM offline workers8。
+- 版本依据为opendatalab/OmniDocBench的实际v1_5分支pdf_validation.py、task/end2end_run_eval.py、metrics/cal_metric.py和README。脚本只调用用户已有的干净v1_5评价器，核对HEAD/ref并记录commit；不安装、下载或切换评价器，不使用v1.6配置。v1_5默认CDM worker数与新版README不同，不冒称强制16。
+- GT驱动检查1355条页面、GT重复名、图片缺失/多余、stem唯一性；Python定量报告计数/覆盖率。PaddleX在独立子进程结束后再加载VLM，单卡可见性映射为物理1→逻辑0。版本字段写根目录config/environment/quality。
+- 区域crop复用官方helper，在原分辨率页上裁剪后限长边2048，不写裁剪文件；text/table/formula prompt逐区域传入原生模板、Processor audit与实际离线请求，避免沿用整页prompt。enable_thinking=False、tokenize=False、引擎add_special_tokens=False不变；padding_side仍实际记录；MAX_MODEL_LEN16384不改，MAX_TOKENS为空仍用剩余上下文，不自动设16k输出cap。
+- 区域输出仅strip，页面阶段复用官方OTSL转换和merge_page_to_markdown，按原图片stem命名，不把哈希region ID交给页面评价器。保留实际request IDs、usage/token IDs、TTFT、有限profiler、实际Processor、scheduler、显存、资源采样和新标量/留存逻辑。
+- request_unit=region，num_pages=null，区域请求吞吐不再标成pages/s，桶内serial pages/s也不伪报；单独增加区域数量分桶、crop时间、主区域全部成功页面的共享稳态完成率和页面合并/span统计。整条pipeline elapsed明确包含启动/warmup/profile，不冒充稳态时间。
+- 实际调用CDM而非CDM_plain，解析官方all层及0–1指标，Overall按v1.5定义换算0–100。自审测试发现并修正all嵌套遗漏。评价覆盖来自官方per-page Edit输出并集，不能由预测文件数推断；缺指标/覆盖不足/失败保留全文并非零退出。
+- 全部分数和组件级metric证据保留。页面选中集合传播到region留存，使用明确parent-page覆盖口径，不伪称region有独立质量分数。仅sampled且完整评价后去掉评价器GT/pred文本副本和本次CDM渲染件；评分不完整和all模式不清理。
+- 新增11项定向测试覆盖数据计数、覆盖失败、默认1355校验、官方裁剪/prompt、layout精确路径、页面合并/失败区域、真实分数schema与单位、评分覆盖证据、v1_5固定/脏仓库拒绝、本地评价命令和真实CDM配置、评价器渲染/文本清理，以及6页完整编排。外部layout/evaluator和GPU全部mock，不执行下载代码或真实模型。
+- 75项原benchmark/offline、22项监控/留存及11项两阶段测试共108项通过；新入口和两个既有launcher通过bash语法检查。没有安装环境、没有访问远程主机、没有修改ANALYSIS_FLOW.md或历史dia。实际PaddleX/vLLM/TeX/CDM兼容性、真实模型质量和吞吐仍未验证。
+
+
+## 2026-11-18 端到端路线调整
+
+本节取代此前两阶段专用入口描述。按用户确认，run_omnidocbench_v15与对应shell入口改为完整页面推理，不执行PaddleX或区域生成，移除LAYOUT_MODEL_DIR选项。此前区域辅助函数保留但新入口不导入、不调用。
+
+自审核对：一页一个主请求、8在途、一次离线引擎、原图片stem命名且移动不复制、采用重试路径同步到全部指标人口、评分前保留全量文本、v1_5评分commit记录、真实官方结果覆盖、失败或不完整评分非零退出并保留全部输出。质量报告接入inference/collect_run，瓶颈报告不再错误显示未评分；根目录保留原始官方归一化质量报告。冷启动/稳态/重试/profile/评分计时分离。
+
+新增整页流程mock回归：完整40×20图像不裁剪、整页prompt、6页官方命名与页面吞吐、只构建一次引擎、评分后留存，以及评分器异常时6页全保留并返回错误。既有测试仍检查缺CDM、真实覆盖、错版本和外部评价命令。未执行真实vLLM、GPU、PaddleX或TeX，不声称运行环境已验证。用户的ANALYSIS_FLOW.md和dia/未修改。

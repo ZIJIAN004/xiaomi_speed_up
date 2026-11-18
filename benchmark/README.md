@@ -250,8 +250,9 @@ config.json / environment.txt / manifest.jsonl
 processor_config.json / processor_audit.json
 per_sample_metrics.jsonl / warmup.json / retry_metrics.json
 prediction_mapping.json / predictions/
+raw_outputs.jsonl / output_retention.json
 metrics_before.prom / metrics_after.prom / vllm_metrics.csv
-monitor/system_samples.jsonl / monitor/metrics_*.prom
+monitor/scalars.zip / monitor/monitor_summary.json / monitor/phase_*.json[.prom]
 worker_telemetry.json / profile_ranges.json / profile_metrics.json
 profiles/<sample_id>/trace_reference.json / cuda_events.json / worker_telemetry.json
 trace_representative.ref.json                     # 小型路径引用，不再复制完整trace
@@ -303,6 +304,90 @@ bash -n benchmark/run_vllm_concurrency8.sh
 
 旧版worker profiler的重复export请求改为转移原始文件位置；如需改变gzip格式，成功转换后才删除本次生成的源文件，转换失败保留源文件。转换期间可能同时存在源文件和压缩输出，不等于磁盘配额保护。此改动只去掉重复payload，没有新增容量预算或改变采集指标。
 
-monitor/system_samples.jsonl记录CPU/RSS、GPU利用率/显存/功耗/温度/频率的时间序列，monitor/metrics_*.prom保留对应时刻引擎原生指标，便于对齐队列、KV缓存和资源变化。默认约每秒一轮，实际周期含采样开销；不是每秒重跑一次推理，也不是详细kernel trace。本轮不改变监控频率与存储方式。
+监控默认固定1秒周期采样，采用绝对时间deadline；慢采样跳过错过的时隙，不补发密集采样。每轮保留实际开始/结束时间和采集耗时，只有整个采样都位于steady窗口的数据进入正式统计，跨阶段样本剔除。阶段切换即使短暂离开后返回也会被识别。采样不是连续时间观测，P95/P99是采样点分位数，不是时间加权分位数，也不保证捕捉瞬时峰值。
+
+采样标量用float64数组保留在RAM，在线Welford更新分阶段count/mean/std/min/max/峰值时间。首轮及之后每60秒原子覆盖monitor_summary.json，不在采样循环排序求分位数。完整JSON/Prometheus/DCGM快照只保留每种被观测阶段的首轮及最后一轮；很短的阶段可能没有快照。不再逐轮写system_samples.jsonl或metrics_000001.prom。详细进程树只在少量完整快照中保留，CPU/RSS聚合标量仍逐轮保留。
+
+正常结束时一次性写monitor/scalars.zip，内部是不压缩的二进制float64列和列名/标签/阶段/字节序元数据，不是逐轮JSON。这样完整标量可离线重算精确P95/P99，避免压缩占用CPU；文件大小随采样数增长，但监控目录文件数量不随运行时间增长。汇总按列读取，不把全部指标展开为Python字典。累计计数器、直方图仍用steady前后差值及reset判定，不将累计读数平均当成吞吐。旧监控目录仍兼容。
+
+硬崩溃或强制kill会丢失尚未归档的内存样本，只有最近一次monitor_summary.json中的在线统计保留，无法从它恢复精确分位数。归档失败记录在config.json的monitor_errors中。逐请求JSONL、预测文件、Processor调用记录及profiler不受本轮改动影响；这不是整个benchmark的磁盘配额保护。
 
 PROFILE_MAX_ITERATIONS正式默认64，冒烟设置16。它限制每个代表请求的profiler引擎/模型迭代采集窗口，不限制请求生成长度，不是64/16个请求或kernel，也不是字节上限。一次迭代可包含多个请求、多个token的prefill和许多算子。16步开销一般更低但更易漏掉后半程Decode；64步覆盖更长仍不保证长输出全覆盖，大小也不保证正好4倍。实际覆盖以profile_trace_window和trace_covers_full_request为准。
+
+## 预测文本存储与评价后留存
+
+原始文本统一追加到数据集目录的raw_outputs.jsonl，行键为sample_id/phase/attempt；8线程写入加锁，换行和Unicode按JSON转义，不再逐请求创建.raw.txt。记录中的raw_output_format=shared_jsonl、raw_output_key用于定位原始文本，不应把整个JSONL当作某一条预测读取。即使后处理失败，已经收到的原始文本也会保存。
+
+每次成功请求只写一份后处理Markdown。正式请求和必要重试全部结束后，把最终采用文件移动到predictions/<id>.md，不复制payload；未采用的尝试仍区分phase/attempt。移动完成后更新指标与映射中的路径，评价程序仍按原接口读取完整predictions目录。评分、token统计和trace分析全部结束后才执行留存筛选，不改评价算法，也不改变稳态吞吐计时边界。
+
+默认OUTPUT_RETENTION=sampled：保留RETAIN_SAMPLES=10个固定种子抽样、最多RETAIN_WORST=10个低分样本，以及所有失败/截断/可疑重复样本和3–5个选定代表样本。RETENTION_SEED默认42。集合取并集，保留样本的warmup/retry/profile文本也保留，所以最终数量不是固定20条。低分选择使用评价器提供的per_sample列表及明确方向的指标；内置字段评价会保存逐样本分数。外部评价器缺少可识别逐样本分数时明确记录不可用，不推断分数。
+
+仅当quality.json经汇总验证为complete、评价样本数覆盖完整、必需指标齐全且版本正确时清理。没有评分、评分失败或不完整时保留所有文本，支持后续补评。质量未达基线阈值不等于评价没完成，仍按同一留存规则处理，不掩盖失败结果。
+
+完整质量结果、评价器提供的逐样本分数和全部请求指标保留不变。清理后，仅保留选中样本的Markdown和JSONL原始文本记录；已删除输出的活动路径设为null，旧路径存于*_before_retention并附text_retention/prediction_retained状态。output_retention.json记录保留原因、删除文件/字节数和逐样本低分选择可用性；summary.json同步引用。重新汇总使用已保存quality.json，无需已删除预测；重新进行全量质量评价则需要重新生成被删除的预测。
+
+通过启动脚本可配置：
+
+```bash
+# 默认抽样留存；也可显式调整数量
+OUTPUT_RETENTION=sampled RETAIN_SAMPLES=10 RETAIN_WORST=10 RETENTION_SEED=42 \
+  bash benchmark/run_offline_concurrency8.sh ODB15_IMAGES MIDV500_IMAGES MIDV_LAIT_IMAGES MODEL NEW_RESULT_ROOT
+
+# 保留所有文本，供反复重新评价
+OUTPUT_RETENTION=all \
+  bash benchmark/run_offline_concurrency8.sh ODB15_IMAGES MIDV500_IMAGES MIDV_LAIT_IMAGES MODEL NEW_RESULT_ROOT
+```
+
+直接运行run_benchmark时，对应--output-retention sampled|all、--retain-samples、--retain-worst和--retention-seed。旧HTTP启动脚本也传递同样参数。只影响新运行目录，不清理历史诊断数据。此策略减少最终留存量和文件数，不取消评价前的全量暂存；筛选JSONL时短暂存在原文件和过滤后的临时文件，也不是磁盘容量硬上限。
+
+## OmniDocBench v1.5 端到端入口
+
+运行 scripts/run_omnidocbench_v15.sh。完整页面直接进入 Xiaomi-OCR-0，不调用 PaddleX、版面检测、区域裁剪或区域合并，不需要 PP-DocLayoutV3 权重。一个主请求对应一页，单个离线 AsyncLLM、TP/PP/DP=1，最多8个页面请求在途。不是固定GPU batch=8，也不启动HTTP服务。
+
+默认数据为仓库下 benchmark/data（远程对应 /home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/data），包含 OmniDocBench.json 与 images/。保留现有v1.5数据，程序从GT生成页面清单，定量核对1355条GT、图片覆盖、缺失/额外/重复文件。输入文件不修改、不重新下载、不把GT文本送给模型。
+
+默认模型 /home/mr_jiang/models/xiaomi-ocr-0/model；默认物理GPU 1。评价器默认 evaluation_pipeline/OmniDocBench，这是单独准备的v1_5代码仓库，不是当前项目已包含的依赖。入口验证 pdf_validation.py 存在、HEAD与本地v1_5或origin/v1_5一致且tracked文件干净，并保存commit。缺评价器会在模型加载前退出，不自动clone、安装或切分支。
+
+```bash
+# 已准备好v1_5评分代码与依赖、以及支持模型的vLLM环境后执行
+bash scripts/run_omnidocbench_v15.sh
+
+# 如评分使用独立环境，指定其中的Python
+OMNIDOC_EVAL_PYTHON=/absolute/path/to/eval-env/bin/python   bash scripts/run_omnidocbench_v15.sh
+```
+
+评分环境需按 OmniDocBench v1_5 的依赖说明准备，包括实际CDM所需的TeX/渲染工具。小米当前文档的v1.6 Docker镜像不作为v1.5环境使用。代码不声称依赖已经安装，也不自动下载任何模型。
+
+流程：定量校验数据 → 整页manifest → 单卡离线加载一次 → warmup → 8页面请求并发steady → 必要重复输出重试 → 代表页面profile → 把采用的Markdown移动为原图片stem命名 → v1_5官方评分 → 汇总瓶颈指标 → 评分完整后选择性留存。
+
+沿用整页官方prompt、长边2048预处理和官方Markdown/OTSL后处理；保留真实vLLM Processor采集。GPU_MEM_UTIL=.90、MAX_MODEL_LEN=16384、DTYPE=auto、temperature=0、top_p=.8、presence=0、repetition=1。MAX_TOKENS未设置时使用已实现的剩余上下文策略，不是上游示例固定16384输出额度；实际额度逐请求记录。WARMUP=5、REPRESENTATIVES=5、PROFILE_MAX_ITERATIONS=64、MONITOR_INTERVAL=1、RETRY_REPETITIVE=1（重试presence=1.5）。沿用RAM标量和少量完整快照。
+
+v1.5评价调用真实CDM而非CDM_plain，输出Text Edit、Formula Edit/CDM、Table TEDS/Edit、Reading Order Edit以及Overall。Overall=100×((1−Text Edit)+Formula CDM+Table TEDS)/3。前三类原始指标按0–1保存，Overall按0–100保存；完整官方组件分数与逐页证据保留。实际覆盖来自官方per-page Edit结果，不凭文件齐全假定评分完整。失败请求生成空的页面预测进入评价人口，推理失败状态不改成成功；评价器若跳过页面，会判为覆盖不完整。
+
+评分失败/缺指标/覆盖不全时入口非零退出，保存所有预测，不重试推理、不删文本。完整评分后按既定规则保留随机10页、最多10个可识别低分页、异常和代表页的并集及其各次尝试。OUTPUT_RETENTION=all保留全部文本。只在完整评分后清理评价器重复全文和本次生成的CDM渲染件，所有分数保留。
+
+结果结构：
+
+```text
+benchmark/results/omnidocbench_v15_TIMESTAMP/
+  config.json / environment.txt / data_validation.json
+  input.jsonl / page_manifest.jsonl
+  server_startup.json / worker_startup.json
+  quality.json / quality_evaluator.log / evaluator_config.json
+  summary.json / bottleneck_report.md / evaluator_retention.json
+  evaluator_work/result/            # 官方组件分数与评分证据
+  inference/
+    predictions/<原图片stem>.md
+    prediction_mapping.json / raw_outputs.jsonl
+    per_sample_metrics.jsonl / warmup.json / retry_metrics.json / profile_metrics.json
+    quality.json / summary.json / output_retention.json
+    acceptance_report.json / bottleneck_report.md
+    monitor/ / profiles/ / 各类指标CSV
+  profiler_raw/ / processor_raw/    # 原始worker证据，trace单副本
+```
+
+inference/的延迟、token、吞吐、资源、分桶、Processor与profiler均为页面口径，pages/s不再指区域。稳态吞吐排除启动/warmup/retry/profile；根目录另报包含这些阶段的推理流水线耗时，以及独立评分耗时。缺失值保持null，真实GPU、Processor、CUDA/profiler和TeX兼容性须在目标环境验证，不能由本地mock测试推断。
+
+参考：
+- 小米整页e2e路线：https://github.com/xiaomi-research/Xiaomi-OCR-0/blob/main/evaluation_pipeline/README_zh.md
+- v1.5评分代码与依赖：https://github.com/opendatalab/OmniDocBench/tree/v1_5

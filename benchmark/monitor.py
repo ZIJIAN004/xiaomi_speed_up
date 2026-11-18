@@ -1,9 +1,10 @@
-"""Lightweight server/process/GPU sampling, with raw Prometheus snapshots retained."""
+"""Fixed-cadence sampling with compact RAM scalars and bounded full snapshots."""
 from __future__ import annotations
 
 import csv
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+
+from benchmark.monitor_storage import ScalarStore
 
 
 def get_url(url, timeout=10):
@@ -100,8 +103,16 @@ class Monitor:
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.base_url, self.gpu, self.server_pid, self.interval = base_url, gpu, server_pid, interval
+        if interval <= 0 or not math.isfinite(interval):
+            raise ValueError("monitor interval must be finite and positive")
         self.stop_event = threading.Event()
-        self.phase = "initialization"
+        self.phase_lock = threading.Lock()
+        self._phase = "initialization"
+        self.phase_epoch = 0
+        self.store = ScalarStore()
+        self.snapshot_phases = set()
+        self.last_checkpoint = time.monotonic()
+        self.last_full = None
         self.previous = None
         self.client_previous = None
         self.dcgm_url = dcgm_url
@@ -110,9 +121,23 @@ class Monitor:
         self.thread = None
         self.errors = []
 
-    def sample(self, index, stream):
+    @property
+    def phase(self):
+        with self.phase_lock:
+            return self._phase
+
+    @phase.setter
+    def phase(self, value):
+        with self.phase_lock:
+            self._phase = value
+            self.phase_epoch += 1
+
+    def sample(self, index):
+        from benchmark.collect_results import read_prometheus
         start = time.monotonic()
-        phase = self.phase
+        with self.phase_lock:
+            phase, epoch = self._phase, self.phase_epoch
+        raw, raw_dcgm = None, None
         record, self.previous = process_snapshot(self.server_pid, self.previous)
         client, self.client_previous = process_snapshot(os.getpid(), self.client_previous)
         record["client_process_cpu_percent"] = client["server_process_cpu_percent"]
@@ -149,7 +174,6 @@ class Monitor:
         if self.dcgm_url:
             try:
                 raw_dcgm = get_url(self.dcgm_url, timeout=5)
-                (self.output / f"dcgm_{index:06d}.prom").write_text(raw_dcgm, encoding="utf-8")
                 for line in raw_dcgm.splitlines():
                     match = re.match(r'(DCGM_FI_PROF_SM_ACTIVE|DCGM_FI_PROF_PIPE_TENSOR_ACTIVE)\{(.*?)\}\s+(\S+)', line)
                     if match and re.search(r'(?:^|,)\s*gpu="' + re.escape(str(self.gpu)) + r'"(?:,|$)', match[2]):
@@ -161,27 +185,62 @@ class Monitor:
                 record["dcgm_error"] = str(exc)
         try:
             raw = get_url(self.base_url + "/metrics", timeout=5)
-            name = f"metrics_{index:06d}.prom"
-            (self.output / name).write_text(raw, encoding="utf-8")
-            record["prometheus_file"] = name
         except Exception as exc:
             record["metrics_error"] = str(exc)
         record["sample_end_monotonic_s"] = time.monotonic()
-        record["phase_end"] = self.phase
+        with self.phase_lock:
+            record["phase_end"] = self._phase if epoch == self.phase_epoch else "transition"
         record["sampling_duration_s"] = record["sample_end_monotonic_s"] - start
-        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        stream.flush()
+        record["metrics_sampling_success"] = int(raw is not None)
+        record["gpu_sampling_success"] = int("gpu_sampling_error" not in record)
+        record["dcgm_sampling_success"] = int(raw_dcgm is not None) if self.dcgm_url else None
+        record["windows_sampling_success"] = (int("windows_host_memory_error" not in record)
+                                               if "windows_host_memory_error" in record or
+                                               "windows_host_observation_wall_s" in record else None)
+        self.store.append(record, read_prometheus(raw) if raw is not None else {},
+                          read_prometheus(raw_dcgm) if raw_dcgm is not None else {})
+        self.last_full = (record, raw, raw_dcgm)
+        if phase not in self.snapshot_phases:
+            self._snapshot("phase_" + str(len(self.snapshot_phases) + 1), self.last_full)
+            self.snapshot_phases.add(phase)
+        if self.store.count == 1 or time.monotonic() - self.last_checkpoint >= 60:
+            self.store.checkpoint(self.output / "monitor_summary.json", self.interval, self.errors)
+            self.last_checkpoint = time.monotonic()
+
+    def _snapshot(self, name, full):
+        record, raw, dcgm = full
+        from benchmark.metrics import dump_json
+        dump_json(self.output / (name + ".json"), record)
+        if raw is not None:
+            (self.output / (name + ".prom")).write_text(raw, encoding="utf-8")
+        if dcgm is not None:
+            (self.output / (name + "_dcgm.prom")).write_text(dcgm, encoding="utf-8")
 
     def _run(self):
-        with (self.output / "system_samples.jsonl").open("w", encoding="utf-8") as stream:
-            index = 0
-            while not self.stop_event.is_set():
-                try:
-                    self.sample(index, stream)
-                except Exception as exc:
+        # Absolute deadlines: collection time does not add to the nominal period.
+        # Slow rounds skip missed slots instead of generating catch-up bursts.
+        deadline = time.monotonic()
+        index = 0
+        while not self.stop_event.is_set():
+            try:
+                self.sample(index)
+            except Exception as exc:
+                if len(self.errors) < 100:
                     self.errors.append(str(exc))
-                index += 1
-                self.stop_event.wait(self.interval)
+            index += 1
+            deadline += self.interval
+            now = time.monotonic()
+            if deadline < now:
+                deadline += (math.floor((now - deadline) / self.interval) + 1) * self.interval
+            self.stop_event.wait(max(0., deadline - time.monotonic()))
+        # No per-round disk records; preserve all scalar values once at shutdown.
+        try:
+            if self.last_full is not None:
+                self._snapshot("final", self.last_full)
+            self.store.save(self.output / "scalars.zip")
+            self.store.checkpoint(self.output / "monitor_summary.json", self.interval, self.errors, complete=True)
+        except Exception as exc:
+            self.errors.append("monitor finalization failed: " + str(exc))
 
     def __enter__(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -190,6 +249,4 @@ class Monitor:
 
     def __exit__(self, *args):
         self.stop_event.set()
-        self.thread.join(timeout=20)
-        if self.thread.is_alive():
-            self.errors.append("monitor did not stop within 20 seconds")
+        self.thread.join()

@@ -18,3 +18,6 @@ skills/xiaomi-ocr/mcp-config.json
 scripts/benchmark_interfaces*.json
 scripts/runtime_check_*/
 scripts/startup_check_*/
+
+# User-prepared v1_5 evaluator checkout (separate repository)
+/evaluation_pipeline/OmniDocBench/

@@ -152,7 +152,8 @@ with open(sys.argv[2], "w") as f:
 PYCODE
 fi
 for DATASET in "${DATASETS[@]}"; do
-  RUN_ARGS=()
+  RUN_ARGS=(--output-retention "${OUTPUT_RETENTION:-sampled}" --retain-samples "${RETAIN_SAMPLES:-10}"
+            --retain-worst "${RETAIN_WORST:-10}" --retention-seed "${RETENTION_SEED:-42}")
   [[ -z "${MAX_TOKENS:-}" ]] || RUN_ARGS+=(--max-tokens "$MAX_TOKENS")
   [[ "${TRUST_REMOTE_CODE:-0}" != 1 ]] || RUN_ARGS+=(--trust-remote-code)
   [[ "${RETRY_REPETITIVE:-1}" != 1 ]] || RUN_ARGS+=(--retry-repetitive)

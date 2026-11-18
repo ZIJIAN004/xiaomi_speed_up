@@ -15,7 +15,7 @@ PROMPT = (
 )
 
 
-def prepare_image(path):
+def prepare_image(path, bbox_2d=None):
     from PIL import Image
     start = time.perf_counter()
     cpu_start = time.thread_time()
@@ -28,11 +28,21 @@ def prepare_image(path):
         image.load()
     decode_end = time.perf_counter()
     cpu_decode_end = time.thread_time()
+    page_size = image.size
+    crop_start = time.perf_counter()
+    if bbox_2d is not None:
+        from evaluation_pipeline.cropping import crop_region
+        cropped = crop_region(image, bbox_2d)
+        image.close()
+        image = cropped
+    crop_ms = (time.perf_counter() - crop_start) * 1000 if bbox_2d is not None else None
     original = image.size
     if max(image.size) > 2048:
         image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
     prep_end = time.perf_counter()
-    return image, {"original_width": original[0], "original_height": original[1],
+    return image, {"source_page_width": page_size[0], "source_page_height": page_size[1],
+                   "region_crop_time_ms": crop_ms, "region_crop_scope": "nested within preprocess_time_ms",
+                   "original_width": original[0], "original_height": original[1],
                    "original_pixels": original[0] * original[1],
                    "image_megapixels": original[0] * original[1] / 1e6,
                    "client_resized_width": image.width, "client_resized_height": image.height,
@@ -63,9 +73,9 @@ class ProcessorAudit:
                 "chat_template": getattr(self.processor, "chat_template", None),
                 "scope": "separate local processor audit; reconcile input length with server usage"}
 
-    def inspect(self, image):
+    def inspect(self, image, prompt=PROMPT):
         start = time.perf_counter()
-        messages = [{"role": "user", "content": [{"type": "text", "text": PROMPT},
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt},
                                                     {"type": "image", "image": image}]}]
         template = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
@@ -86,7 +96,7 @@ class ProcessorAudit:
                       processor_tensor_shapes={k: list(v.shape) for k, v in inputs.items() if hasattr(v, "shape")},
                       padding_side=self.tokenizer.padding_side, system_tokens=None,
                       system_tokens_unavailable_reason="chat template may inject implicit system text; no guessed decomposition",
-                      user_text_tokens=len(self.tokenizer.encode(PROMPT, add_special_tokens=False)),
+                      user_text_tokens=len(self.tokenizer.encode(prompt, add_special_tokens=False)),
                       processor_serialized_prompt_tokens=len(self.tokenizer.encode(template, add_special_tokens=False)),
                       input_ids_length=len(ids))
         # Count actual expanded image placeholder IDs, never equate raw patches to LLM tokens.

@@ -17,11 +17,13 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import copy
 from pathlib import Path
 
 from benchmark.metrics import PADDING_FIELDS, STAGES, TOKEN_FIELDS, cuda_event_statistics, dump_json, load_jsonl, stats, weighted_stats
 from benchmark.monitor import Monitor, get_url, rpc
 from benchmark.processor_audit import PROMPT, ProcessorAudit, prepare_image
+from benchmark.output_storage import append_raw, finalize_predictions, retain_outputs
 
 
 def post_json(url, payload=None, timeout=600):
@@ -111,9 +113,11 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
     start = time.perf_counter()
     record = {k: None for k in (*TOKEN_FIELDS, *PADDING_FIELDS)}
     record.update({stage + "_time_ms": None for stage in STAGES})
-    record.update({k: sample.get(k) for k in ("document_id", "document_type", "has_table", "has_formula", "difficulty", "relative_path")})
+    record.update({k: sample.get(k) for k in ("document_id", "document_type", "has_table", "has_formula", "difficulty", "relative_path",
+                  "request_unit", "page_sample_id", "region_index", "task_type", "bbox_2d", "regions_per_page", "prompt")})
     record.update(sample_id=sample["sample_id"], dataset=sample.get("dataset"), phase=phase,
-                  attempt=attempt, image_path=sample["images"][0], num_images=1, num_pages=1,
+                  attempt=attempt, image_path=sample["images"][0], num_images=1,
+                  num_pages=None if sample.get("request_unit") == "region" else 1,
                   model=args.served_model_name, inference_framework="vllm", backend=getattr(args, "backend", "http"), client_workers=args.workers,
                   request_batch_size=1, actual_scheduler_batch_size=None,
                   requested_max_tokens=args.max_tokens, effective_max_tokens=None,
@@ -128,7 +132,8 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
         record["processor_audit_time_ms"] = record.pop("processor_time_ms", None)
         record["processor_time_ms"] = None
     try:
-        image, image_metrics = prepare_image(sample["images"][0])
+        image, image_metrics = (prepare_image(sample["images"][0], bbox_2d=sample["bbox_2d"])
+                                if "bbox_2d" in sample else prepare_image(sample["images"][0]))
         record.update(image_metrics)
         if image_metrics["source_frame_count"] != 1:
             image.close()
@@ -138,7 +143,9 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
             from benchmark.offline_backend import active
             request_id = f"benchmark-{phase}-{sample['sample_id']}-{attempt}"
             try:
-                streamed = active().infer(image, args, request_id, attempt)
+                inference_args = copy(args)
+                inference_args.request_prompt = sample.get("prompt", PROMPT)
+                streamed = active().infer(image, inference_args, request_id, attempt)
             finally:
                 image.close()
             http_start = streamed["engine_submit_s"]
@@ -157,7 +164,7 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
             image.close()
             b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
             payload = {"model": args.served_model_name,
-                       "messages": [{"role": "user", "content": [{"type": "text", "text": PROMPT},
+                       "messages": [{"role": "user", "content": [{"type": "text", "text": sample.get("prompt", PROMPT)},
                            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}],
                        "temperature": 0, "top_p": 0.8, "presence_penalty": 0.0,
                        "repetition_penalty": 1.0, "stream": True,
@@ -227,6 +234,10 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
         record["itl_first_ms"] = intervals[0] if intervals else None
         record["itl_steady_statistics_ms"] = stats(intervals[1:] if intervals else [])
         text = streamed["text"]
+        raw_write_start = time.perf_counter()
+        append_raw(output, record, text)
+        raw_write_ms = (time.perf_counter() - raw_write_start) * 1000
+        record["raw_output_io_time_ms"] = raw_write_ms
         record["empty_output"] = not bool(text.strip())
         if not text.strip():
             raise ValueError("empty_output")
@@ -238,7 +249,8 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
                                       same_character_run=128, min_repeats=8, min_repeated_chars=512,
                                       min_ratio=0.5, max_unit_chars=256)
         record["repetition_analysis"] = analysis
-        processed = postprocess_e2e_markdown(_clean_truncated_repeats(text), convert_otsl=True)
+        processed = (text.strip() if sample.get("request_unit") == "region" else
+                     postprocess_e2e_markdown(_clean_truncated_repeats(text), convert_otsl=True))
         record["postprocess_time_ms"] = (time.perf_counter() - post_start) * 1000
         record["postprocessing_cpu_time_ms"] = (time.thread_time() - post_cpu_start) * 1000
         record["postprocessed_empty_output"] = not bool(processed.strip())
@@ -246,13 +258,12 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
             raise ValueError("postprocessed_empty_output")
         directory = output / phase / f"attempt_{attempt}"
         directory.mkdir(parents=True, exist_ok=True)
-        raw_path = directory / (sample["sample_id"] + ".raw.txt")
         path = directory / (sample["sample_id"] + ".md")
         write_start = time.perf_counter()
-        raw_path.write_text(text, encoding="utf-8")
         path.write_text(processed, encoding="utf-8")
-        record["output_io_time_ms"] = (time.perf_counter() - write_start) * 1000
-        record.update(output_path=str(path.resolve()), raw_output_path=str(raw_path.resolve()), success=True)
+        record["output_io_time_ms"] = raw_write_ms + (time.perf_counter() - write_start) * 1000
+        record["output_io_scope"] = "shared raw JSONL encode/lock/append plus Markdown write; excludes final move and post-evaluation retention"
+        record.update(output_path=str(path.resolve()), success=True)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:8000]
         record.update(error=f"HTTP {exc.code}: {detail}", error_type="http_error", http_status=exc.code)
@@ -357,7 +368,7 @@ def reconcile_worker_records(records, telemetry, tokenizer=None):
                 r["special_input_tokens"] = sum(i not in visual_indices and token in special for i, token in enumerate(ids))
                 r["prompt_text_tokens"] = sum(i not in visual_indices and token not in special for i, token in enumerate(ids))
                 r["prompt_text_tokens_source"] = "actual_worker_input_ids_excluding_visual_spans_and_special_ids"
-                user_ids = tokenizer.encode(PROMPT, add_special_tokens=False)
+                user_ids = tokenizer.encode(r.get("prompt") or PROMPT, add_special_tokens=False)
                 matches = [i for i in range(len(ids) - len(user_ids) + 1) if ids[i:i + len(user_ids)] == user_ids]
                 if len(matches) == 1:
                     r["user_text_tokens"] = len(user_ids)
@@ -381,7 +392,7 @@ def select_representatives(records, samples, count):
     by_id = {s["sample_id"]: s for s in samples}
     valid = sorted((r for r in records if r.get("success")), key=lambda r: r["sample_id"])
     features = {r["sample_id"]: set() for r in valid}
-    for field in ("image_megapixels", "generated_tokens", "visual_tokens"):
+    for field in ("image_megapixels", "generated_tokens", "visual_tokens", "regions_per_page"):
         ordered = sorted((r for r in valid if r.get(field) is not None), key=lambda r: (r[field], r["sample_id"]))
         for i, r in enumerate(ordered):
             fraction = i / max(len(ordered) - 1, 1)
@@ -565,7 +576,13 @@ def parse_args(argv=None):
     parser.add_argument("--retry-repetitive", action="store_true")
     parser.add_argument("--retry-presence-penalty", type=float, default=1.5)
     parser.add_argument("--quality-command", help="JSON argv list with {manifest}, {predictions}, {output} placeholders")
+    parser.add_argument("--output-retention", choices=("sampled", "all"), default="sampled")
+    parser.add_argument("--retain-samples", type=int, default=10)
+    parser.add_argument("--retain-worst", type=int, default=10)
+    parser.add_argument("--retention-seed", type=int, default=42)
     args = parser.parse_args(argv)
+    if args.retain_samples < 0 or args.retain_worst < 0:
+        parser.error("retention sample counts must be nonnegative")
     if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 5 or args.monitor_interval <= 0:
         parser.error("workers>=1, warmup>=3, representatives=3..5 and monitor-interval>0 required")
     if args.profile_max_iterations < 1:
@@ -618,7 +635,8 @@ def main(args=None):
     output.mkdir(parents=True)
     shutil.copy2(args.manifest, output / "manifest.jsonl")
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(diagnostic_only=os.environ.get("BENCHMARK_RUNTIME_SMOKE") == "1", request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
+    config.update(benchmark_version="1.5" if samples[0].get("dataset") == "omnidocbench" else None,
+                  request_unit=samples[0].get("request_unit", "page"), diagnostic_only=os.environ.get("BENCHMARK_RUNTIME_SMOKE") == "1", request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
                   top_p=0.8, repetition_penalty=1.0, dtype_policy="fixed server launch dtype",
                   streaming=True, http_client="stdlib urllib; no hidden retries, one connection per request",
                   max_tokens_policy="omitted by default; server generation-config=vllm",
@@ -632,6 +650,7 @@ def main(args=None):
                       client_timing_scope="file read through result write; TTFT from offline engine submission",
                       offline_engine=active().metadata)
     config["environment"] = environment()
+    config["environment"]["benchmark_version"] = config["benchmark_version"]
     (output / "environment.txt").write_text(json.dumps(config["environment"], indent=2) + "\n", encoding="utf-8")
     config["worker_initial"] = safe_rpc(args, "benchmark_snapshot", "false")
     for endpoint in ("server_info?config_format=json", "version"):
@@ -665,9 +684,11 @@ def main(args=None):
             for sample in samples:
                 sid = sample["sample_id"]
                 try:
-                    image, _ = prepare_image(sample["images"][0])
+                    image, _ = (prepare_image(sample["images"][0], bbox_2d=sample["bbox_2d"])
+                                if "bbox_2d" in sample else prepare_image(sample["images"][0]))
                     try:
-                        audit[sid] = inspector.inspect(image)
+                        audit[sid] = (inspector.inspect(image, prompt=sample["prompt"])
+                                      if "prompt" in sample else inspector.inspect(image))
                     finally:
                         image.close()
                 except Exception as exc:
@@ -735,19 +756,8 @@ def main(args=None):
                         final[r["sample_id"]] = r
                     retries.append(r)
         retry_end = time.perf_counter()
+        mapping = finalize_predictions(output, samples, final)
         dump_json(output / "retry_metrics.json", retries)
-        predictions = output / "predictions"
-        predictions.mkdir()
-        mapping = []
-        for sample in samples:
-            r = final[sample["sample_id"]]
-            item = {"sample_id": sample["sample_id"], "relative_path": sample.get("relative_path"),
-                    "image_path": sample["images"][0], "success": r["success"], "adopted_attempt": r["attempt"]}
-            if r["success"]:
-                target = predictions / (sample["sample_id"] + ".md")
-                shutil.copy2(r["output_path"], target)
-                item["prediction_path"] = str(target)
-            mapping.append(item)
         dump_json(output / "prediction_mapping.json", mapping)
         selected = select_representatives(records, samples, args.representatives)
         dump_json(output / "representative_selection.json", {"samples": selected,
@@ -797,6 +807,21 @@ def main(args=None):
             dump_json(output / "quality.json", {"status": "failed", "reason": str(exc), "metrics": {}})
     from benchmark.collect_results import collect_run
     summary = collect_run(output)
+    try:
+        retention = retain_outputs(output, {
+            "per_sample_metrics.jsonl": records, "warmup.json": warmups,
+            "retry_metrics.json": retries,
+            "profile_metrics.json": json.loads((output / "profile_metrics.json").read_text(encoding="utf-8"))},
+            mapping, summary["quality"],
+            mode=getattr(args, "output_retention", "sampled"),
+            sample_count=getattr(args, "retain_samples", 10),
+            worst_count=getattr(args, "retain_worst", 10), seed=getattr(args, "retention_seed", 42))
+    except Exception as exc:
+        retention = {"status": "failed", "reason": str(exc),
+                     "note": "retention may be partial; quality and scalar metrics are preserved"}
+        dump_json(output / "output_retention.json", retention)
+    summary["output_retention"] = retention
+    dump_json(output / "summary.json", summary)
     if config.get("server_processor_dir") and summary["server_processor"]["status"] != "measured":
         print("WARNING: SERVER PROCESSOR COST UNAVAILABLE: " + summary["server_processor"]["unavailable_reason"], file=sys.stderr)
     print(f"Results: {output}; inspect acceptance_report.json before claiming bottleneck coverage", flush=True)

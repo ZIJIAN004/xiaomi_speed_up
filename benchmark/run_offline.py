@@ -46,7 +46,11 @@ def main():
                                ("MAX_MODEL_LEN", "--max-model-len", "16384"), ("DTYPE", "--dtype", "auto"),
                                ("REQUEST_TIMEOUT", "--request-timeout", "600"), ("WARMUP", "--warmup", "5"),
                                ("REPRESENTATIVES", "--representatives", "5"),
-                               ("PROFILE_MAX_ITERATIONS", "--profile-max-iterations", "64")):
+                               ("PROFILE_MAX_ITERATIONS", "--profile-max-iterations", "64"),
+                               ("OUTPUT_RETENTION", "--output-retention", "sampled"),
+                               ("RETAIN_SAMPLES", "--retain-samples", "10"),
+                               ("RETAIN_WORST", "--retain-worst", "10"),
+                               ("RETENTION_SEED", "--retention-seed", "42")):
         common += [flag, os.environ.get(env, default)]
     for env, flag in (("MAX_TOKENS", "--max-tokens"), ("MODULE_MAP", "--module-map"),
                       ("DCGM_URL", "--dcgm-url"), ("GPU_COST_PER_HOUR", "--gpu-cost-per-hour")):

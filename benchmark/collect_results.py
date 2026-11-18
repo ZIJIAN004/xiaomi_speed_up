@@ -42,14 +42,19 @@ def prometheus_summary(run_dir, samples, start, end):
         if path.is_file():
             for key, value in read_prometheus(path.read_text(encoding="utf-8")).items():
                 series[key].append(value)
+    archive_path = run_dir / "monitor" / "scalars.zip"
+    sampled_statistics = {}
+    if archive_path.exists():
+        from benchmark.monitor_storage import ScalarArchive
+        sampled_statistics = dict(ScalarArchive(archive_path).prometheus_statistics(start, end))
     rows = []
-    for key in sorted(set(before) | set(after) | set(series)):
+    for key in sorted(set(before) | set(after) | set(series) | set(sampled_statistics)):
         name, labels = key
         is_counter = name.endswith(("_total", "_sum", "_count", "_bucket"))
         reset = key in before and key in after and after[key] < before[key] if is_counter else False
         delta = after[key] - before[key] if is_counter and key in before and key in after and not reset else None
         rows.append({"metric": name, "labels": labels, "before": before.get(key), "after": after.get(key),
-                     "delta": delta, "counter_reset": reset, "sample_statistics": stats(series[key])})
+                     "delta": delta, "counter_reset": reset, "sample_statistics": sampled_statistics[key] if key in sampled_statistics else stats(series[key])})
     write_csv(run_dir / "vllm_metrics.csv", rows)
     histograms = {}
     for row in rows:
@@ -80,7 +85,7 @@ def throughput(records, elapsed):
             "completed_generation_requests": len(completed), "completed_requests_per_second": ratio(len(completed), elapsed),
             "requests_per_second": ratio(len(good), elapsed),
             "documents_per_second": ratio(complete_docs, elapsed) if docs_known else None,
-            "pages_per_second": ratio(sum(r.get("num_pages", 0) for r in good), elapsed),
+            "pages_per_second": (None if any(r.get("request_unit") == "region" for r in records) else ratio(sum(r.get("num_pages", 0) for r in good), elapsed)),
             "images_per_second": ratio(sum(r.get("num_images", 0) for r in good), elapsed),
             "prompt_tokens_per_second": ratio(prompt, elapsed), "generated_tokens_per_second": ratio(generated, elapsed),
             "total_tokens_per_second": ratio(total, elapsed),
@@ -125,10 +130,10 @@ def buckets(records, elapsed, field, bucket_fn):
                        "vision_encoder_kernel_work_ms": stats([r.get("vision_encoder_kernel_work_ms") for r in members]),
                        "latency_ms": stats([r.get("end_to_end_latency_ms") for r in members]),
                        "peak_allocated_memory_gb": stats([r.get("peak_allocated_memory_gb") for r in members]),
-                       "pages_per_second": ratio(sum(r.get("num_pages", 0) for r in good), elapsed),
+                       "pages_per_second": (None if any(r.get("request_unit") == "region" for r in members) else ratio(sum(r.get("num_pages", 0) for r in good), elapsed)),
                        "output_tokens_per_second": ratio(exact_sum(members, "generated_tokens"), elapsed),
                        "throughput_scope": "bucket contribution to shared workload wall time, not isolated bucket throughput",
-                       "serial_service_pages_per_second": ratio(len(good), serial_service)})
+                       "serial_service_pages_per_second": None if any(r.get("request_unit") == "region" for r in members) else ratio(len(good), serial_service)})
     return result
 
 
@@ -298,8 +303,15 @@ def collect_run(run_dir, small_kernel_us=10):
     traces = collect_traces(run_dir, profiles, small_kernel_us)
     dump_json(run_dir / "profile_metrics.json", profiles)
     monitor_path = run_dir / "monitor" / "system_samples.jsonl"
-    system_samples = load_jsonl(monitor_path) if monitor_path.exists() else []
+    archive_path = run_dir / "monitor" / "scalars.zip"
     start, end = config["steady_start_s"], config["steady_end_s"]
+    compact_system = None
+    if archive_path.exists():
+        from benchmark.monitor_storage import ScalarArchive
+        compact_system = {key[0]: value for key, value in ScalarArchive(archive_path).statistics("system", start, end)}
+        system_samples = []
+    else:
+        system_samples = load_jsonl(monitor_path) if monitor_path.exists() else []
     steady_system = [r for r in system_samples if r.get("phase") == "steady" and r.get("phase_end", r.get("phase")) == "steady"
                      and start <= r["monotonic_s"] <= r.get("sample_end_monotonic_s", r["monotonic_s"]) <= end]
     prom_rows, histograms = prometheus_summary(run_dir, system_samples, start, end)
@@ -325,6 +337,10 @@ def collect_run(run_dir, small_kernel_us=10):
             quality = {"status": "failed", "reason": str(exc), "metrics": {}}
     dataset = expected[0].get("dataset") if expected else None
     required_quality = ("text_edit", "formula_cdm", "table_teds") if dataset == "omnidocbench" else ("field_accuracy", "precision", "recall", "f1", "cer", "wer")
+    # Preserve stronger requirements declared by an official evaluator adapter.
+    declared_required = quality.get("required_metrics", [])
+    if isinstance(declared_required, list) and all(isinstance(k, str) for k in declared_required):
+        required_quality = tuple(dict.fromkeys((*required_quality, *declared_required)))
     quality["required_metrics"] = list(required_quality)
     import math
     invalid = [k for k, v in quality.get("metrics", {}).items() if isinstance(v, float) and not math.isfinite(v)]
@@ -336,7 +352,8 @@ def collect_run(run_dir, small_kernel_us=10):
                                   or isinstance(quality.get("metrics", {}).get(k), bool)
                                   or not math.isfinite(quality["metrics"][k])]
     quality["expected_samples"] = len(expected)
-    quality["sample_coverage_complete"] = quality.get("evaluated_samples") == len(expected)
+    quality["sample_coverage_complete"] = (quality.get("evaluated_samples") == len(expected)
+                                           and quality.get("sample_coverage_complete") is not False)
     quality["version_matches_design"] = quality.get("benchmark_version") == "1.5" if dataset == "omnidocbench" else None
     if quality.get("status") == "complete" and (quality["missing_metrics"] or not quality["sample_coverage_complete"]
                                                  or (dataset == "omnidocbench" and not quality["version_matches_design"])):
@@ -350,7 +367,9 @@ def collect_run(run_dir, small_kernel_us=10):
     for field in ("allocated_bytes", "reserved_bytes", "peak_allocated_bytes", "peak_reserved_bytes", "model_weight_memory_bytes", "activation_memory_bytes", "kv_cache_memory_bytes", "input_image_memory_bytes", "inactive_split_bytes", "pinned_memory_bytes"):
         vals = [s.get(field) for s in snapshots]
         memory[field] = sum(vals) if vals and all(v is not None for v in vals) else None
-    memory["cpu_rss_peak_bytes"] = stats([r.get("server_process_rss_bytes") for r in steady_system])["max"]
+    memory["cpu_rss_peak_bytes"] = (compact_system.get("server_process_rss_bytes", stats([]))["max"]
+                                    if compact_system is not None else
+                                    stats([r.get("server_process_rss_bytes") for r in steady_system])["max"])
     memory["inactive_split_to_reserved_ratio"] = ratio(memory.get("inactive_split_bytes"), memory.get("reserved_bytes"))
     memory["memory_fragmentation"] = None
     memory["scope"] = "run-wide workers, not per-request; allocated KV capacity is not live token occupancy"
@@ -374,7 +393,7 @@ def collect_run(run_dir, small_kernel_us=10):
                ("dtype", "max_model_len", "cuda_graph_mode", "attention_backend", "compilation_config",
                 "cache_config", "scheduler_config", "model_commit_hash", "tokenizer_revision", "kv_cache_num_gpu_blocks", "kv_cache_block_size")}
     runtime["server_version"] = config.get("version", {}).get("version")
-    summary = {"dataset": dataset, "runtime": runtime, "sample_count": len(records), "successful_samples": len(successful),
+    summary = {"dataset": dataset, "request_unit": config.get("request_unit", "page"), "runtime": runtime, "sample_count": len(records), "successful_samples": len(successful),
                "failed_samples": len(records) - len(successful), "startup": startup,
                "warmup_latency_ms": stats([r.get("end_to_end_latency_ms") for r in warmups]),
                "latency_ms": stats([r.get("end_to_end_latency_ms") for r in records]),
@@ -388,7 +407,8 @@ def collect_run(run_dir, small_kernel_us=10):
                "throughput": throughput(records, elapsed),
                "tokens": {f: stats([r.get(f) for r in records]) for f in TOKEN_FIELDS},
                "length_imbalance": length_imbalance(records), "memory": memory,
-               "system": {f: stats([r.get(f) for r in steady_system]) for f in system_fields},
+               "system": {f: (compact_system.get(f, stats([])) if compact_system is not None else
+                              stats([r.get(f) for r in steady_system])) for f in system_fields},
                "server_histogram_deltas": histograms,
                "stop_statistics": {"finish_reasons": dict(finish), "completed_requests": len(completed),
                    "finish_reason_coverage": ratio(len(completed), len(records)),
@@ -452,7 +472,7 @@ def collect_run(run_dir, small_kernel_us=10):
                                   and isinstance(value, (float, int))}
     summary["quality_derived_note"] = "only higher-is-better scores; lower-is-better CER/WER/Edit are not divided into misleading quality ratios"
     price = config.get("gpu_cost_per_hour")
-    summary["cost_per_page"] = ratio(price * elapsed / 3600, len(successful)) if price is not None else None
+    summary["cost_per_page"] = ratio(price * elapsed / 3600, len(successful)) if price is not None and config.get("request_unit") != "region" else None
     summary["cost_definition"] = "declared single reserved-GPU price/hour times steady wall time / accepted pages; excludes startup and profiler"
     documents = defaultdict(list)
     if records and all(r.get("document_id") is not None for r in records):
@@ -463,9 +483,12 @@ def collect_run(run_dir, small_kernel_us=10):
         summary["long_document_rate"] = sum(len(pages) > threshold for pages in documents.values()) / len(documents)
         summary["long_document_scope"] = "document_id groups present in this manifest; not inferred full original documents"
         summary["throughput"]["documents_per_second"] = ratio(sum(all(p.get("success") for p in pages) for pages in documents.values()), elapsed)
+    retention_path = run_dir / "output_retention.json"
+    if retention_path.is_file():
+        summary["output_retention"] = json.loads(retention_path.read_text(encoding="utf-8"))
     dump_json(run_dir / "summary.json", summary)
     latency_rows = []
-    for field in [s + "_time_ms" for s in STAGES] + ["end_to_end_latency_ms", "request_latency_ms", "ttft_ms", "ttft_e2e_ms", "host_tpot_after_first_ms", "time_per_generated_token_ms", "processor_audit_time_ms", "file_io_cpu_time_ms", "image_decode_cpu_time_ms", "preprocessing_cpu_time_ms", "postprocessing_cpu_time_ms"]:
+    for field in [s + "_time_ms" for s in STAGES] + ["region_crop_time_ms", "end_to_end_latency_ms", "request_latency_ms", "ttft_ms", "ttft_e2e_ms", "host_tpot_after_first_ms", "time_per_generated_token_ms", "processor_audit_time_ms", "file_io_cpu_time_ms", "image_decode_cpu_time_ms", "preprocessing_cpu_time_ms", "postprocessing_cpu_time_ms"]:
         latency_rows.append({"metric": field, "phase": "steady", "scope": "separate_processor_audit" if field == "processor_audit_time_ms" else "request_observation", **stats([r.get(field) for r in records])})
     for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "tokenizer_decode"):
         per_sample_work = []
@@ -508,6 +531,7 @@ def collect_run(run_dir, small_kernel_us=10):
     write_csv(run_dir / "memory_statistics.csv", memory_rows)
     dimensions = [("image_area", "image_megapixels", area_bucket), ("visual_tokens", "visual_tokens", length_bucket),
                   ("text_tokens", "prompt_text_tokens", length_bucket), ("output_tokens", "generated_tokens", output_bucket),
+                  ("region_count", "regions_per_page", lambda v: "unknown" if v is None else "1-8" if v <= 8 else "9-16" if v <= 16 else "17-32" if v <= 32 else "33+"),
                   ("has_table", "has_table", lambda v: str(v) if v is not None else "unknown"),
                   ("has_formula", "has_formula", lambda v: str(v) if v is not None else "unknown"),
                   ("document_type", "document_type", lambda v: str(v) if v is not None else "unknown"),

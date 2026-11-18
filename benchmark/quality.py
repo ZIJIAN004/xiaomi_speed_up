@@ -64,6 +64,8 @@ def field_quality(manifest, mapping, normalization="none"):
             missing_gt += 1
             continue
         result = results.get(sample["sample_id"], {})
+        if result.get("success") and result.get("prediction_retained") is False:
+            raise ValueError("prediction was pruned after evaluation; rerun inference for full reevaluation")
         text = Path(result["prediction_path"]).read_text(encoding="utf-8") if result.get("success") else ""
         fields = None
         # Explicit structured output is preferred. No automatic identity-document schema is guessed.
@@ -95,14 +97,27 @@ def field_quality(manifest, mapping, normalization="none"):
         predicted += len(fields)
         correct += matched
         evaluated += 1
+        sample_char_errors = sample_word_errors = sample_chars = sample_words = 0
         for key, value in gt.items():
             prediction = fields.get(key, "")
-            char_errors += edit_distance(value, prediction)
-            word_errors += edit_distance(value.split(), prediction.split())
-            chars += len(value)
-            words += len(value.split())
+            sample_char_errors += edit_distance(value, prediction)
+            sample_word_errors += edit_distance(value.split(), prediction.split())
+            sample_chars += len(value)
+            sample_words += len(value.split())
+        char_errors += sample_char_errors
+        word_errors += sample_word_errors
+        chars += sample_chars
+        words += sample_words
+        sample_precision = matched / len(fields) if fields else 0.0
+        sample_recall = matched / len(gt)
         per_sample.append({"sample_id": sample["sample_id"], "ground_truth_fields": len(gt),
-                           "predicted_fields": len(fields), "correct_fields": matched})
+                           "predicted_fields": len(fields), "correct_fields": matched,
+                           "metrics": {"field_accuracy": sample_recall, "precision": sample_precision,
+                                       "recall": sample_recall,
+                                       "f1": 2 * sample_precision * sample_recall / (sample_precision + sample_recall)
+                                             if sample_precision + sample_recall else 0.0,
+                                       "cer": ratio(sample_char_errors, sample_chars),
+                                       "wer": ratio(sample_word_errors, sample_words)}})
     precision, recall = ratio(correct, predicted), ratio(correct, gt_count)
     # No predicted fields on an evaluated dataset is a measured zero precision, not missing evidence.
     if evaluated and not predicted:

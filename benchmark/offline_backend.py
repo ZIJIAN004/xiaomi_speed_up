@@ -126,7 +126,7 @@ class OfflineBackend:
         from vllm import SamplingParams
         from vllm.sampling_params import RequestOutputKind
         from benchmark.processor_audit import PROMPT
-        messages = [{"role": "user", "content": [{"type": "text", "text": PROMPT}, {"type": "image", "image": image}]}]
+        messages = [{"role": "user", "content": [{"type": "text", "text": getattr(args, "request_prompt", PROMPT)}, {"type": "image", "image": image}]}]
         begin = time.perf_counter()
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         template_ms = (time.perf_counter()-begin)*1000

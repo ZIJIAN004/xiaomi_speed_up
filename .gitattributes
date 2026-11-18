@@ -9,3 +9,7 @@ scripts/summarize_benchmark_runtime.py text eol=lf
 scripts/capture_vllm_startup.sh text eol=lf
 scripts/summarize_startup_evidence.py text eol=lf
 tests/test_offline_benchmark.py text eol=lf
+tests/test_monitor_storage.py text eol=lf
+tests/test_output_storage.py text eol=lf
+scripts/run_omnidocbench_v15.sh text eol=lf
+tests/test_omnidocbench_v15.py text eol=lf
