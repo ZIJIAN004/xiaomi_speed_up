@@ -62,29 +62,55 @@ PASS: Python evaluator, TeX/CDM runtime, and dataset preflight
 
 ## 正式启动
 
-推荐使用 tmux，避免 SSH 断开导致任务停止：
+正式流程使用两个环境，但只激活推理环境：
+
+```text
+当前 shell 的 speed_up 环境：模型、Transformers、vLLM、GPU 推理
+OMNIDOC_EVAL_PYTHON 指定的 omnidocbench_v15 环境：官方评分器、CDM、TEDS
+TEXLIVE_ROOT 指定的用户 TeX Live：xelatex、kpsewhich、TeX 宏包
+```
+
+不要激活 `omnidocbench_v15` 后直接启动整个脚本，否则模型推理会缺少 `transformers`。推荐使用 tmux，避免 SSH 断开导致任务停止：
 
 ```bash
 tmux new -s omnidocbench_v15
 ```
 
-在 tmux 中执行：
+在 tmux 中执行下面的完整命令：
 
 ```bash
 cd /home/mr_jiang/speed_up/Xiaomi-OCR-0
 
-conda activate omnidocbench_v15
-export PATH=/home/mr_jiang/tools/texlive/bin/x86_64-linux:$PATH
+git pull
+
+conda activate speed_up
 
 export OMNIDOC_ROOT=/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/data
 export OMNIDOC_EVALUATOR_ROOT=/home/mr_jiang/speed_up/Xiaomi-OCR-0/evaluation_pipeline/OmniDocBench
 export OMNIDOC_EVAL_BACKEND=python
 export OMNIDOC_EVAL_PYTHON=/home/mr_jiang/miniforge3/envs/omnidocbench_v15/bin/python
+export TEXLIVE_ROOT=/home/mr_jiang/tools/texlive
 export MODEL_PATH=/home/mr_jiang/models/xiaomi-ocr-0/model
 export GPU_ID=1
 
+# 只做启动前环境/数据/CDM 自检，不加载模型
+bash scripts/test_omnidocbench_python.sh
+
+# 正式端到端评测：整页推理，不使用 PaddleX
 bash scripts/run_omnidocbench_v15.sh
 ```
+
+自检必须先输出：
+
+```text
+PASS: Python evaluator, TeX/CDM runtime, and dataset preflight
+```
+
+自检通过后，正式脚本会再次在模型加载前执行 evaluator v1_5 和 CDM preflight。两个 preflight 都通过后才会加载 Xiaomi-OCR-0。
+
+如果自检失败，不要运行正式评测；先保留错误输出和结果目录，不要删除证据。
+
+正式脚本运行期间不要在同一个 GPU 上启动第二个模型任务。
 
 退出 tmux 但保留任务：
 
@@ -97,6 +123,51 @@ Ctrl-b d
 ```bash
 tmux attach -t omnidocbench_v15
 ```
+
+## 运行后查看结果
+
+正式运行会生成新的时间戳目录：
+
+```bash
+find /home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results \
+  -maxdepth 1 -type d -name 'omnidocbench_v15_*' -print
+```
+
+假设本次目录为：
+
+```bash
+RESULT=/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results/omnidocbench_v15_TIMESTAMP
+```
+
+检查最终质量状态：
+
+```bash
+cat "$RESULT/quality.json"
+```
+
+必须重点确认：
+
+```text
+status=complete
+benchmark_version=1.5
+evaluator_version=1.5
+sample_coverage_complete=true
+prediction_coverage_complete=true
+```
+
+检查 evaluator 实际输出目录：
+
+```bash
+find "$RESULT/evaluator_work/result" -maxdepth 2 -type f -print
+```
+
+日志中出现 Pillow 的：
+
+```text
+Palette images with Transparency expressed as bytes should be converted to RGBA images
+```
+
+只是 warning。只要 `quality.json` 为 `complete`、必需指标存在且覆盖完整，就不影响本次评分结论。
 
 ## 运行模式
 
