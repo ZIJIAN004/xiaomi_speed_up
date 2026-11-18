@@ -72,6 +72,9 @@ def preflight(root, backend='docker', python='python', image=DEFAULT_IMAGE):
             (work/'result').mkdir()
             command,cwd = [python,'-c',SMOKE],work
         env = dict(os.environ, PYTHONPATH=str(root)+os.pathsep+os.environ.get('PYTHONPATH',''))
+        if backend == 'python':
+            evaluator_bin = str(Path(python).resolve().parent)
+            env['PATH'] = evaluator_bin + os.pathsep + env.get('PATH', '')
         env['OMNIDOC_PROJECT_ROOT'] = str(Path(__file__).resolve().parent.parent)
         try:
             run = subprocess.run(command,cwd=cwd,env=env,capture_output=True,text=True,check=True,timeout=180)

@@ -36,6 +36,9 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     env = dict(os.environ)
     project_root = Path(__file__).resolve().parent.parent
     env['PYTHONPATH'] = os.pathsep.join((str(project_root), str(root), env.get('PYTHONPATH', '')))
+    if not docker:
+        evaluator_bin = str(Path(python).resolve().parent)
+        env['PATH'] = evaluator_bin + os.pathsep + env.get('PATH', '')
     command = [python, '-c',
                'import runpy, sys; import benchmark.skimage_compat; '
                'script, config = sys.argv[1:3]; '
