@@ -85,6 +85,9 @@ git pull
 
 conda activate speed_up
 
+# 可选但推荐：显式固定模型推理解释器；评分解释器由 OMNIDOC_EVAL_PYTHON 单独指定
+export SPEED_UP_PYTHON=/home/mr_jiang/miniforge3/envs/speed_up/bin/python
+
 export OMNIDOC_ROOT=/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/data
 export OMNIDOC_EVALUATOR_ROOT=/home/mr_jiang/speed_up/Xiaomi-OCR-0/evaluation_pipeline/OmniDocBench
 export OMNIDOC_EVAL_BACKEND=python

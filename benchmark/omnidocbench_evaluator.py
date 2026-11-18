@@ -3,6 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
+import shutil
 import subprocess
 
 from benchmark.metrics import dump_json
@@ -37,7 +38,8 @@ def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=N
     project_root = Path(__file__).resolve().parent.parent
     env['PYTHONPATH'] = os.pathsep.join((str(project_root), str(root), env.get('PYTHONPATH', '')))
     if not docker:
-        evaluator_bin = str(Path(python).resolve().parent)
+        evaluator_path = shutil.which(python) or python
+        evaluator_bin = str(Path(evaluator_path).resolve().parent)
         tex_root = env.get('TEXLIVE_ROOT', '/home/mr_jiang/tools/texlive')
         tex_bin = str(Path(tex_root) / 'bin' / 'x86_64-linux')
         env['PATH'] = os.pathsep.join((evaluator_bin, tex_bin, env.get('PATH', '')))

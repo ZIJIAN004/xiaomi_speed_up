@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -73,7 +74,8 @@ def preflight(root, backend='docker', python='python', image=DEFAULT_IMAGE):
             command,cwd = [python,'-c',SMOKE],work
         env = dict(os.environ, PYTHONPATH=str(root)+os.pathsep+os.environ.get('PYTHONPATH',''))
         if backend == 'python':
-            evaluator_bin = str(Path(python).resolve().parent)
+            evaluator_path = shutil.which(python) or python
+            evaluator_bin = str(Path(evaluator_path).resolve().parent)
             tex_root = env.get('TEXLIVE_ROOT', '/home/mr_jiang/tools/texlive')
             tex_bin = str(Path(tex_root) / 'bin' / 'x86_64-linux')
             env['PATH'] = os.pathsep.join((evaluator_bin, tex_bin, env.get('PATH', '')))
