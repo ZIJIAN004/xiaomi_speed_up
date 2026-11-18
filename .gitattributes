@@ -4,3 +4,5 @@ benchmark/*.py text eol=lf
 tests/test_benchmark.py text eol=lf
 benchmark/server_bootstrap/*.py text eol=lf
 scripts/check_benchmark_interfaces.py text eol=lf
+scripts/run_benchmark_runtime_check.sh text eol=lf
+scripts/summarize_benchmark_runtime.py text eol=lf

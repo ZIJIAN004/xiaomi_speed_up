@@ -104,7 +104,7 @@ launcher 只向服务端进程及其子进程注入 opt-in `sitecustomize`，保
 - `multimodal_apply`：真实 vLLM 多模态处理入口，含缓存检查、输入/placeholder 整理等；不称为纯 Normalize 时间，也不覆盖入口之外的HTTP解析、图像获取或chat template操作。
 - `hf_processor`：真实 `_call_hf_processor` 调用，可能同时处理图片与文本；嵌套在 apply 中，**两者不得相加**。不另外执行 processor，不改变返回值、异常或缓存行为。
 - 每次调用记录 wall time、当前线程CPU time、实际processor类、成功/失败、PID、调用ID。父apply调用ID用于关联内部HF调用；`super()`不重复计数。不记录图片、prompt、输出文本或token IDs。
-- 这些API没有已验证的HTTP请求ID上下文，所以目前是**实际调用级/数据集阶段级统计，不是逐样本归因**。不按完成顺序或时间邻近猜测对应请求。
+- 当前是**实际调用级/数据集阶段级统计，不是逐样本归因**。新增InputProcessor上下文探测仅在真实调用链包围Processor时附加request_id；不假设该条件必然成立。不按完成顺序或时间邻近猜测对应请求。
 - 多次调用保留多条明细。没有HF调用不等于确定缓存命中；完全没有调用时为unavailable而不是0，运行日志会给出警告。
 - 采用同主机跨进程`perf_counter`时间窗分离warmup/steady/retry/profile；跨阶段边界和区间外调用不计入本阶段。8并发时wall时间累加可能重叠，不等于工作负载耗时占比。线程CPU时间不含其他线程CPU工作。
 - 日志写出在计时区间外，但仍有观测开销；正式比较须保持双方同样的观测配置。尚未在真实vLLM环境验证。
@@ -165,6 +165,32 @@ adapter 调用已安装的正式 evaluator，并写出如下契约。OmniDocBenc
 ```
 
 这里只展示字段格式，不是实测结果。`complete` 表示注解/指标覆盖完整，不代表已达到业务质量阈值。adapter 可在同一 JSON 中提供 `baseline_thresholds`，每个必需指标对应 `{"operator":"<=","value":实际基线阈值}` 或 `{"operator":">=","value":实际基线阈值}`。例如 Text Edit/CER/WER 通常向下，CDM/TEDS/F1 通常向上，但实现不猜具体阈值或量纲。所有必需指标覆盖完整且达到显式阈值，`baseline_evaluation.status` 才为 `pass`，第13项才通过；缺阈值为 `not_evaluated`。没有 GT 和 evaluator 时，代码能采集性能，但不能宣称完成设计文档 §19 第13项。
+
+## 待验证接口的深度检查与GPU冒烟验证
+
+先在真实vLLM环境读取实际安装源码、Processor注册表达式、model runner接口和scheduler/output字段，不加载模型：
+
+```bash
+python scripts/check_benchmark_interfaces.py --deep --model-path /data/models/Xiaomi-OCR-0 --output scripts/benchmark_interfaces_deep.json
+```
+
+深度报告从实际类与注册信息发现Processor，不再将不存在的`Qwen3_5MultiModalProcessor`或旧`InputPreprocessor`当作必需接口。方法源码、调用表达式和字段只是静态证据，不能直接标记钩子已执行。脚本向stderr输出当前检查模块，避免只有结束提示。
+
+需要真实验证时，执行下列独立冒烟流程。**会加载一次模型并占用GPU**，默认GPU=1、沿用基线0.90显存比例与默认CUDA Graph。先确认该GPU可用。不要与正式benchmark同时运行。
+
+```bash
+bash scripts/run_benchmark_runtime_check.sh /data/models/Xiaomi-OCR-0
+# 可显式指定GPU、单页输入图片和新的结果目录
+GPU_ID=1 bash scripts/run_benchmark_runtime_check.sh /data/models/Xiaomi-OCR-0 example_pics/receipt.jpg scripts/runtime_check_manual
+```
+
+默认结果目录为`scripts/runtime_check_时间戳/`，不写/tmp。流程复制仓库收据图片8份来运行8个请求，预热3次，再独立profile最多3个代表请求。**仅本冒烟流程设置max_tokens=32、trace最多16 iterations**，不更改正式基线输出策略。这不是OmniDocBench 1.5数据，虽然复用runner的`omnidocbench/`输出子目录，也不允许作为质量或性能结果。配置中`diagnostic_only=true`；不调用正式质量evaluator。正式数据集仍要求OmniDocBench 1.5。
+
+`scripts/summarize_benchmark_runtime.py`生成`runtime_verification.json`，分别检查：实际loaded runner/model/sampler对象；真实scheduler字段；请求与输入usage关联；host-ready输出IDs；模块钩子安装；各阶段CUDA Event实际出现；真实CUDA trace与算子归因。仅安装钩子不算执行通过，缺证据为not_verified并返回非0状态。失败后保留所有日志与部分结果。
+
+同时试验真实`InputProcessor.process_inputs(request_id, ...)`上下文传播。**只有Processor确实在该调用链内执行才记录request_id**；若处理发生在更早的renderer阶段，报告not_verified，不按完成顺序/时间猜测。即使取得ID，也尚未启用逐样本Processor成本聚合。
+
+首先返回`interfaces_deep.json`可核对静态接口；执行GPU流程后返回`runtime_verification.json`。原始证据位于同目录`results/`。环境报告和默认runtime_check目录已加入gitignore，不自动提交机器信息或推理结果。
 
 ## 每数据集输出
 

@@ -61,3 +61,12 @@
 - 测试增补包括嵌套去重、异常恢复、子进程启动、已有sitecustomize保留、阶段分离和无证据非零。
 
 本轮最终验证：46项benchmark定向测试通过（含8线程隔离）；16个Python文件AST通过；shell语法、CLI help、诊断脚本缺vLLM时的报告路径及git diff检查通过。实际GPU/vLLM运行仍未验证。
+
+## 深度接口与GPU运行验证入口（2026-11-18）
+
+- 环境脚本增加--deep：实际Processor注册、源码调用表达式、model runner方法及scheduler/output字段，不加载权重；移除两个不存在的写死类探测。
+- 增加GPU冒烟脚本与证据汇总。只在显式运行时加载模型，8请求、32输出token、最多16个trace iteration，仅为兼容性验证。正式默认流程仍跑三个数据集且不加人为输出cap。
+- worker增加loaded runner/model/sampler/视觉模块接口RPC，telemetry增加真实输入schema与输出类型分布，不同步异步结果。
+- InputProcessor调用上下文仅在真实嵌套时关联request_id，测试验证离开上下文即恢复null，不将静态签名当作传播已成立。
+- 本地51项定向测试通过，新增上下文、实际对象检查、缺证据不通过、钩子安装与执行证据分离、源码探测测试。
+- 本机缺torch/vLLM/GPU，尚未运行真实模型冒烟检查。因此实际接口、调用链、模块与trace问题仍须以目标环境输出为准，不能将此处测试当作已通过GPU验证。

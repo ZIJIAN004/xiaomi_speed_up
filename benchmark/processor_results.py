@@ -46,12 +46,12 @@ def collect_processor_calls(run_dir, config, records, warmups=(), profiles=()):
                 total_wall_time_ms=sum(r["wall_time_ms"] for r in selected) if selected else None,
                 wall_time_ms=stats([r["wall_time_ms"] for r in selected]),
                 thread_cpu_time_ms=stats([r["thread_cpu_time_ms"] for r in selected])))
-    steady = [r for r in rows if r["phase"] == "steady"]
+    steady = [r for r in rows if r["phase"] == "steady" and r["kind"] in ("multimodal_apply", "hf_processor")]
     status = dict(status="measured" if steady else "unavailable", summaries=summaries,
         hook_metadata=metadata, parse_errors=errors,
         unavailable_reason=None if steady else "No actual steady processor calls observed: inspect bootstrap, interfaces and cache behavior; not zero cost",
         scope="multimodal_apply includes cache lookup/placeholder/input organization; hf_processor is nested actual HF call; never add both",
-        request_attribution="unavailable without verified request-ID propagation; no ordering or timestamp guess",
+        request_attribution="request_id only when real InputProcessor context encloses the call; per-sample aggregation not enabled; no order/time guess",
         cache_scope="HF invocation observed separately; no HF call alone does not prove cache hit",
         concurrency_scope="call wall sums overlap at workers=8; not workload wall share; thread CPU excludes other threads")
     dump_json(run_dir / "server_processor_status.json", status)

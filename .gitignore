@@ -13,3 +13,7 @@ evaluate_report.json
 
 # Machine-specific MCP client configuration
 skills/xiaomi-ocr/mcp-config.json
+
+# Local benchmark environment and GPU smoke-check artifacts
+scripts/benchmark_interfaces*.json
+scripts/runtime_check_*/

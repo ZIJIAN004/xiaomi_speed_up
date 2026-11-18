@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 _active = contextvars.ContextVar("benchmark_processor_active", default={})
+_request_id = contextvars.ContextVar("benchmark_processor_request_id", default=None)
 _lock = threading.Lock()
 _warned = False
 
@@ -26,6 +27,7 @@ def _after_fork():
     global _lock
     _lock = threading.Lock()
     _active.set({})
+    _request_id.set(None)
 
 
 if hasattr(os, "register_at_fork"):
@@ -57,12 +59,20 @@ def wrap_method(cls, name, kind):
         emit(dict(event="unsupported", processor_class=cls.__qualname__, method=name))
         return
 
+    signature = inspect.signature(original)
+
     @functools.wraps(original)
     def measured(self, *args, **kwargs):
         active = _active.get()
         # Subclass -> super() is one invocation, not two independent costs.
         if kind in active:
             return original(self, *args, **kwargs)
+        request_token = None
+        if kind == "input_process":
+            bound = signature.bind(self, *args, **kwargs)
+            candidate = bound.arguments.get("request_id")
+            if isinstance(candidate, str):
+                request_token = _request_id.set(candidate)
         call_id = uuid.uuid4().hex
         token = _active.set(dict(active, **{kind: call_id}))
         cpu_start = time.thread_time()
@@ -79,6 +89,9 @@ def wrap_method(cls, name, kind):
             end = time.perf_counter()
             cpu_end = time.thread_time()
             _active.reset(token)
+            request_id = _request_id.get()
+            if request_token is not None:
+                _request_id.reset(request_token)
             emit(dict(event="call", kind=kind, call_id=call_id,
                       parent_apply_call_id=active.get("multimodal_apply"),
                       processor_class=type(self).__module__ + "." + type(self).__qualname__,
@@ -86,7 +99,7 @@ def wrap_method(cls, name, kind):
                       wall_time_ms=(end - start) * 1000,
                       thread_cpu_time_ms=(cpu_end - cpu_start) * 1000,
                       success=success, error_type=error_type,
-                      request_id=None, request_id_reason="processor API has no verified request-ID context"))
+                      request_id=request_id, request_id_reason=None if request_id is not None else "no observed InputProcessor request context; processor may run earlier or elsewhere"))
     measured._benchmark_processor_wrapped = True
     setattr(cls, name, measured)
     emit(dict(event="hook_installed", module=cls.__module__, processor_class=cls.__qualname__,
@@ -97,6 +110,8 @@ def instrument_module(module):
     for value in list(vars(module).values()):
         if not inspect.isclass(value) or value.__module__ != module.__name__:
             continue
+        if value.__name__ == "InputProcessor" and module.__name__ == "vllm.v1.engine.input_processor":
+            wrap_method(value, "process_inputs", "input_process")
         if not any(base.__name__ == "BaseMultiModalProcessor" for base in value.__mro__):
             continue
         wrap_method(value, "apply", "multimodal_apply")
@@ -124,7 +139,7 @@ class _Loader(importlib.abc.Loader):
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if not (fullname == "vllm.multimodal.processing" or
+        if not (fullname == "vllm.v1.engine.input_processor" or fullname == "vllm.multimodal.processing" or
                 fullname.startswith("vllm.multimodal.processing.") or
                 fullname.startswith("vllm.model_executor.models.")):
             return None
@@ -138,6 +153,6 @@ def install():
     if not any(isinstance(finder, _Finder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _Finder())
         for name, module in list(sys.modules.items()):
-            if module and (name.startswith("vllm.multimodal.processing") or name.startswith("vllm.model_executor.models.")):
+            if module and (name == "vllm.v1.engine.input_processor" or name.startswith("vllm.multimodal.processing") or name.startswith("vllm.model_executor.models.")):
                 instrument_module(module)
         emit(dict(event="bootstrap", clock="time.perf_counter", scope="actual server process; no CUDA synchronization"))

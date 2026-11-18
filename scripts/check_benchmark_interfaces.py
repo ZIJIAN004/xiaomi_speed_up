@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import textwrap
 import dataclasses
 import importlib
 import importlib.metadata
@@ -35,8 +37,65 @@ def inspect_target(module_name, class_name, methods):
     return result
 
 
+def source_evidence(value):
+    """Installed source evidence only; never instantiate a model."""
+    try:
+        source = textwrap.dedent(inspect.getsource(value))
+        tree = ast.parse(source)
+        calls = sorted({ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)})
+        attributes = sorted({node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)})
+        return {"source_file": inspect.getsourcefile(value), "first_line": inspect.getsourcelines(value)[1],
+                "signature": str(inspect.signature(value)), "calls": calls, "attributes": attributes,
+                "source": source[:30000], "source_truncated": len(source) > 30000}
+    except Exception as exc:
+        return {"error_type": type(exc).__name__, "detail": str(exc)}
+
+
+def deep_probe():
+    result = {"scope": "installed source and schema evidence; no runtime invocation proved", "modules": {}}
+    names = (
+        "vllm.model_executor.models.qwen3_5", "vllm.model_executor.models.qwen3_vl",
+        "vllm.multimodal.processing.processor", "vllm.v1.engine.input_processor",
+        "vllm.v1.worker.gpu_model_runner", "vllm.v1.worker.gpu_worker",
+        "vllm.v1.core.sched.output", "vllm.v1.outputs",
+    )
+    for name in names:
+        print("Inspecting: " + name, file=sys.stderr, flush=True)
+        entry = {}
+        try:
+            module = importlib.import_module(name)
+            entry["source_file"] = getattr(module, "__file__", None)
+            classes = {}
+            for alias, cls in vars(module).items():
+                if not inspect.isclass(cls):
+                    continue
+                processor = any(base.__name__ == "BaseMultiModalProcessor" for base in cls.__mro__)
+                own = cls.__module__ == name
+                if not processor and not own:
+                    continue
+                methods = {method: source_evidence(getattr(cls, method)) for method in
+                    ("apply", "_call_hf_processor", "process_inputs", "_process_inputs", "execute_model", "sample_tokens", "profile")
+                    if callable(getattr(cls, method, None))}
+                fields = [f.name for f in dataclasses.fields(cls)] if dataclasses.is_dataclass(cls) else list(getattr(cls, "__annotations__", {}))
+                if methods or fields or processor:
+                    classes[alias] = {"defined_in": cls.__module__, "mro": [c.__name__ for c in cls.__mro__],
+                                      "methods": methods, "fields": fields}
+            entry["classes"] = classes
+            if name.endswith("qwen3_5"):
+                tree = ast.parse(inspect.getsource(module))
+                entry["processor_registrations"] = [ast.unparse(decorator) for node in ast.walk(tree)
+                    if isinstance(node, ast.ClassDef) for decorator in node.decorator_list
+                    if "register_processor" in ast.unparse(decorator)]
+            entry["status"] = "inspected"
+        except Exception as exc:
+            entry.update(status="unavailable", error_type=type(exc).__name__, detail=str(exc))
+        result["modules"][name] = entry
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--deep", action="store_true", help="include installed method source, processor registration and scheduler/output schemas; no model load")
     parser.add_argument("--output", type=Path, help="new JSON report path; otherwise stdout")
     parser.add_argument("--model-path", type=Path, help="existing local model directory; read JSON metadata only")
     args = parser.parse_args()
@@ -59,13 +118,14 @@ def main():
     targets = [
         ("vllm.multimodal.processing", "BaseMultiModalProcessor", ("apply", "_call_hf_processor", "_cached_apply_hf_processor")),
         ("vllm.multimodal.processing.processor", "BaseMultiModalProcessor", ("apply", "_call_hf_processor", "_cached_apply_hf_processor")),
-        ("vllm.model_executor.models.qwen3_5", "Qwen3_5MultiModalProcessor", ("apply", "_call_hf_processor")),
         ("vllm.v1.engine.input_processor", "InputProcessor", ("process_inputs",)),
-        ("vllm.inputs.preprocess", "InputPreprocessor", ("preprocess",)),
         ("vllm.config", "ProfilerConfig", ()),
         ("vllm.v1.worker.gpu_worker", "Worker", ("profile", "execute_model")),
     ]
+    print("Inspecting installed interfaces (no model weights loaded)", file=sys.stderr, flush=True)
     report["interfaces"] = [inspect_target(*target) for target in targets]
+    if args.deep:
+        report["deep_inspection"] = deep_probe()
     if args.model_path:
         report["local_model_metadata"] = {}
         for name in ("config.json", "processor_config.json", "preprocessor_config.json", "tokenizer_config.json"):

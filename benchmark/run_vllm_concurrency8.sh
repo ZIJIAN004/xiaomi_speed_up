@@ -141,7 +141,21 @@ if not snapshots or any(s.get("peak_allocated_bytes") is None for s in snapshots
     raise SystemExit("worker memory RPC unavailable; inspect installed vLLM interface")
 print("Worker instrumentation ready")
 PY
-for DATASET in omnidocbench midv500 midv-lait; do
+DATASETS=(omnidocbench midv500 midv-lait)
+if [[ "${BENCHMARK_RUNTIME_SMOKE:-0}" == 1 ]]; then
+  DATASETS=(omnidocbench)
+  python - "$PORT" "$RESULT_ROOT/runtime_interfaces.json" <<'PYCODE'
+import json, sys
+from benchmark.monitor import rpc
+try:
+    data = {"status": "observed", "workers": rpc(f"http://127.0.0.1:{sys.argv[1]}", "benchmark_inspect_runtime")}
+except Exception as exc:
+    data = {"status": "unavailable", "error": str(exc)}
+with open(sys.argv[2], "w") as f:
+    json.dump(data, f, indent=2)
+PYCODE
+fi
+for DATASET in "${DATASETS[@]}"; do
   RUN_ARGS=()
   [[ -z "${MAX_TOKENS:-}" ]] || RUN_ARGS+=(--max-tokens "$MAX_TOKENS")
   [[ "${TRUST_REMOTE_CODE:-0}" != 1 ]] || RUN_ARGS+=(--trust-remote-code)
@@ -164,11 +178,11 @@ for DATASET in omnidocbench midv500 midv-lait; do
     --profile-max-iterations "$PROFILE_MAX_ITERATIONS" \
     "${RUN_ARGS[@]}" 2>&1 | tee "$LOG_DIR/$DATASET.log"
 done
-python - "$RESULT_ROOT" <<'PY'
+python - "$RESULT_ROOT" "${DATASETS[@]}" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 reports = {name: json.loads((root/name/"acceptance_report.json").read_text())
-           for name in ("omnidocbench", "midv500", "midv-lait")}
+           for name in sys.argv[2:]}
 (root/"acceptance_report.json").write_text(json.dumps(reports, indent=2) + "\n")
 for name, report in reports.items():
     missing = [r["id"] for r in report["criteria"] if r["status"] != "pass"]

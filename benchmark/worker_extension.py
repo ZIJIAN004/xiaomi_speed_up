@@ -138,6 +138,35 @@ class BenchmarkWorkerExtension:
         self._benchmark_legacy_profiler_step = True
         return {"bounded": True, "max_steps": steps, "source": "actual_torch_profiler_schedule_stepped_after_execute_model"}
 
+    def benchmark_inspect_runtime(self):
+        """Inspect already loaded worker objects without executing or allocating tensors."""
+        import inspect
+        def describe(value, methods):
+            if value is None:
+                return {"status": "unavailable"}
+            result = {"class": type(value).__module__ + "." + type(value).__qualname__, "methods": {}}
+            for name in methods:
+                method = getattr(value, name, None)
+                if callable(method):
+                    try:
+                        result["methods"][name] = {"signature": str(inspect.signature(method)),
+                            "source_file": inspect.getsourcefile(method)}
+                    except (TypeError, ValueError) as exc:
+                        result["methods"][name] = {"inspection_error": type(exc).__name__}
+            return result
+        runner = getattr(self, "model_runner", None)
+        model = getattr(runner, "model", None)
+        modules = dict(model.named_modules()) if model is not None else {}
+        candidates = {name: type(module).__module__ + "." + type(module).__qualname__
+                      for name, module in modules.items() if any(term in name.lower()
+                      for term in ("visual", "vision", "projector", "merger"))}
+        return {"pid": os.getpid(), "runner": describe(runner, ("execute_model", "sample_tokens")),
+                "model": describe(model, ("forward",)),
+                "sampler": describe(getattr(runner, "sampler", None), ("forward",)),
+                "model_sampler": describe(getattr(model, "sampler", None), ("forward",)),
+                "candidate_modules": candidates,
+                "scope": "actual loaded objects; signatures/module inventory, not proof hooks execute"}
+
     def benchmark_snapshot(self, reset="false"):
         import torch
         device = self.device
@@ -231,7 +260,7 @@ class BenchmarkWorkerExtension:
             return {"status": "unavailable", "reason": "no V1 execute_model"}
         self._benchmark_requests = {}
         self._benchmark_steps = {"step_count": 0, "batch_size_step_counts": {},
-                                 "scheduled_tokens_step_counts": {}, "request_batch_size_histograms": {}}
+                                 "scheduled_tokens_step_counts": {}, "request_batch_size_histograms": {}, "observed_schemas": {}, "output_type_step_counts": {}}
         original = runner.execute_model
         self._benchmark_telemetry_original = original
         @functools.wraps(original)
@@ -252,7 +281,19 @@ class BenchmarkWorkerExtension:
                     "multimodal_positions": positions,
                     "generated_token_ids": old.get("generated_token_ids", []),
                     "output_ids_observed_steps": old.get("output_ids_observed_steps", 0)}
+            schemas = self._benchmark_steps["observed_schemas"]
+            if "scheduler_output" not in schemas:
+                schemas["scheduler_output"] = {"class": type(scheduler_output).__module__ + "." + type(scheduler_output).__qualname__,
+                    "required_attributes": {name: hasattr(scheduler_output, name) for name in
+                        ("scheduled_new_reqs", "scheduled_cached_reqs", "num_scheduled_tokens", "total_num_scheduled_tokens")}}
+            new = getattr(scheduler_output, "scheduled_new_reqs", [])
+            if new and "new_request" not in schemas:
+                schemas["new_request"] = {name: hasattr(new[0], name) for name in
+                    ("req_id", "prompt_token_ids", "num_computed_tokens", "mm_features")}
             result = original(scheduler_output, *args, **kwargs)
+            output_type = type(result).__module__ + "." + type(result).__qualname__
+            counts = self._benchmark_steps["output_type_step_counts"]
+            counts[output_type] = counts.get(output_type, 0) + 1
             scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
             batch_size = len(scheduled)
             telemetry = self._benchmark_steps

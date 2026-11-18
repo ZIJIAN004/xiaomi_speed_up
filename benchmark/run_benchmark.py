@@ -552,7 +552,7 @@ def main():
     output.mkdir(parents=True)
     shutil.copy2(args.manifest, output / "manifest.jsonl")
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
+    config.update(diagnostic_only=os.environ.get("BENCHMARK_RUNTIME_SMOKE") == "1", request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
                   top_p=0.8, repetition_penalty=1.0, dtype_policy="fixed server launch dtype",
                   streaming=True, http_client="stdlib urllib; no hidden retries, one connection per request",
                   max_tokens_policy="omitted by default; server generation-config=vllm",

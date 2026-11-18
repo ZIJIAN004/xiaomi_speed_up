@@ -250,6 +250,24 @@ class ServerProcessorTests(unittest.TestCase):
             parents = [r["parent_apply_call_id"] for r in calls if r["kind"] == "hf_processor"]
             self.assertEqual(len(set(parents)), 8)
 
+    def test_request_context_is_only_attached_when_call_chain_really_encloses_processor(self):
+        import os
+        from benchmark.server_processor import wrap_method
+        class Processor:
+            def apply(self):
+                return 1
+        class InputProcessor:
+            def process_inputs(self, request_id, prompt):
+                return Processor().apply()
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"VLLM_BENCHMARK_PROCESSOR_DIR": folder}):
+            wrap_method(Processor, "apply", "multimodal_apply")
+            wrap_method(InputProcessor, "process_inputs", "input_process")
+            self.assertEqual(InputProcessor().process_inputs("req-1", "not logged"), 1)
+            Processor().apply()
+            rows = [json.loads(line) for p in Path(folder).glob("*.jsonl") for line in p.read_text().splitlines()]
+            calls = [r for r in rows if r.get("kind") == "multimodal_apply" and r["event"] == "call"]
+            self.assertEqual([r["request_id"] for r in calls], ["req-1", None])
+
     def test_processor_exception_propagates_and_context_resets(self):
         import os
         from benchmark.server_processor import wrap_method
@@ -315,6 +333,22 @@ class ServerProcessorTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_runtime_inspection_uses_loaded_objects_without_torch(self):
+        class Model:
+            def forward(self, value):
+                return value
+            def named_modules(self):
+                return [("", self), ("visual", self)]
+        runner = SimpleNamespace(model=Model(), execute_model=lambda scheduler_output: None,
+                                 sample_tokens=lambda: None, sampler=SimpleNamespace(forward=lambda value: value))
+        worker = BenchmarkWorkerExtension()
+        worker.model_runner = runner
+        report = worker.benchmark_inspect_runtime()
+        self.assertIn("execute_model", report["runner"]["methods"])
+        self.assertIn("sample_tokens", report["runner"]["methods"])
+        self.assertIn("visual", report["candidate_modules"])
+        self.assertIn("forward", report["sampler"]["methods"])
+
     def test_native_profiler_bound_and_unsupported_interface(self):
         import sys
         worker = BenchmarkWorkerExtension()
@@ -654,6 +688,37 @@ class RequestIntegrationTests(unittest.TestCase):
             self.assertEqual(len(list((args.output / "predictions").glob("*.md"))), 3)
             self.assertFalse(json.loads((args.output / "acceptance_report.json").read_text())["all_minimum_criteria_met"])
             self.assertTrue((args.output / "bottleneck_report.md").is_file())
+
+
+class RuntimeVerificationTests(unittest.TestCase):
+    def test_missing_runtime_files_cannot_verify_anything(self):
+        from scripts.summarize_benchmark_runtime import verify
+        with tempfile.TemporaryDirectory() as folder:
+            result = verify(folder)
+            self.assertFalse(result["all_runtime_checks_verified"])
+            self.assertTrue(result["read_errors"])
+            self.assertTrue(all(c["status"] == "not_verified" for c in result["checks"]))
+
+    def test_installed_hooks_without_actual_events_do_not_verify_execution(self):
+        from scripts.summarize_benchmark_runtime import verify
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            run = root / "omnidocbench"
+            run.mkdir()
+            dump_json(run / "profile_ranges.json", {"results": [{"installed": {s: "fake" for s in ("vision_encoder", "projector", "sampling")}}]})
+            result = verify(root)
+            checks = {r["check"]: r["status"] for r in result["checks"]}
+            self.assertEqual(checks["vision_encoder_hook_installed"], "verified")
+            self.assertEqual(checks["vision_encoder_cuda_events_observed"], "not_verified")
+            self.assertFalse(result["all_runtime_checks_verified"])
+
+    def test_source_probe_discovers_registration_without_model_initialization(self):
+        import ast
+        from scripts.check_benchmark_interfaces import source_evidence
+        value = source_evidence(source_evidence)
+        self.assertIn("inspect.getsource", value["calls"])
+        self.assertIn("signature", value)
+        ast.parse(value["source"])
 
 
 class CollectorIntegrationTests(unittest.TestCase):
