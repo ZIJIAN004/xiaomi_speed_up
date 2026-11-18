@@ -47,7 +47,8 @@ def finalize_predictions(output, samples, final):
 def _worst_samples(quality, count):
     # Explicit metric direction only; never guess which direction an arbitrary score uses.
     directions = dict(field_accuracy=False, precision=False, recall=False, f1=False,
-                      cer=True, wer=True, text_edit=True, formula_cdm=False, table_teds=False)
+                      cer=True, wer=True, text_edit=True, formula_edit=True, table_edit=True,
+                      reading_order_edit=True, formula_cdm=False, table_teds=False)
     observations = defaultdict(list)
     for row in quality.get('per_sample', []):
         if not isinstance(row, dict) or 'sample_id' not in row:

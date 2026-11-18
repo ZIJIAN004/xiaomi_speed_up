@@ -11,6 +11,7 @@ from benchmark.omnidocbench_v15 import prepare_pages, write_jsonl
 from benchmark.omnidocbench_quality import verify_evaluator
 from benchmark.omnidocbench_evaluator import evaluate, retain_evaluator_scores
 from benchmark.output_storage import retain_outputs
+from benchmark.evaluation_runtime import preflight, DEFAULT_IMAGE
 from benchmark.run_benchmark import main as run_pages, parse_args as parse_page_args
 
 
@@ -22,6 +23,8 @@ def main(argv=None):
     parser.add_argument('--gpu', default='1')
     parser.add_argument('--evaluator-root', type=Path, default=Path(__file__).resolve().parent.parent/'evaluation_pipeline/OmniDocBench')
     parser.add_argument('--eval-python', default=sys.executable)
+    parser.add_argument('--eval-backend',choices=('docker','python'),default='docker')
+    parser.add_argument('--eval-image',default=DEFAULT_IMAGE)
     parser.add_argument('--output-retention', choices=('sampled','all'), default='sampled')
     parser.add_argument('--retain-samples', type=int, default=10)
     parser.add_argument('--retain-worst', type=int, default=10)
@@ -39,8 +42,15 @@ def main(argv=None):
         '--server-processor-dir',str(root/'processor_raw'), *shared])
     if page_args.workers != 8 or page_args.backend != 'offline' or page_args.quality_command:
         parser.error('requires 8 offline page workers; scoring uses the v1_5 evaluator')
+    if (page_args.manifest.resolve() != root/'page_manifest.jsonl' or page_args.output.resolve() != inference
+            or Path(page_args.model).resolve() != args.model.resolve()
+            or page_args.profiler_dir.resolve() != root/'profiler_raw'
+            or page_args.server_processor_dir.resolve() != root/'processor_raw'):
+        parser.error('manifest/output/model/evidence paths are managed by this entry')
     page_args.output_retention = 'all'
     provenance = verify_evaluator(args.evaluator_root)
+    runtime = preflight(args.evaluator_root,args.eval_backend,args.eval_python,args.eval_image)
+    provenance["runtime"] = runtime
     root.mkdir(parents=True)
     pipeline_start = time.perf_counter()
     pages = prepare_pages(args.dataset,root)
@@ -95,7 +105,7 @@ def main(argv=None):
     eval_start = time.perf_counter()
     try:
         quality = evaluate(args.evaluator_root,args.eval_python,args.dataset/'OmniDocBench.json',
-                           inference/'predictions',pages,root,provenance)
+                           inference/'predictions',pages,root,provenance,runtime=runtime)
     except Exception as exc:
         quality = dict(status='failed',benchmark_version='1.5',evaluator_version='1.5',
                        gt_version='1.5',metrics={},reason=str(exc),sample_coverage_complete=False)

@@ -60,7 +60,7 @@ def write_report(path, summary, records, traces, acceptance):
     lines.extend(["", "这些数值只描述此工作负载中的关联。需结合长度分桶、真实阶段归因和单因素对照，才能判断输出长度或图像规模是否造成瓶颈。", "",
                   "## 调度、内存与底层热点", "",
                   "- 调度/排队/运行/等待/preemption、KV cache 与 prefix-cache 指标以 vllm_metrics.csv 的原指标名、labels 和窗口差值为证据。",
-                  "- CPU/GPU 利用率、功耗、温度与时钟保存在 monitor/system_samples.jsonl；没有 SM/Tensor Core 计数器时不作相关硬件饱和判断。",
+                  "- CPU/GPU 利用率、功耗、温度与时钟保存在 monitor/scalars.zip，分阶段在线摘要见 monitor/monitor_summary.json；没有 SM/Tensor Core 计数器时不作相关硬件饱和判断。",
                   "- 显存峰值为稳态窗口级，代表请求的 profiled 峰值单独保存；不把整个窗口峰值复制成各请求峰值。",
                   "- operator_top50.csv 和 kernel_top50.csv 分别定位算子与 kernel 热点；注意 kernel_attribution_ratio 与未归因 work。",
                   "- cpu_gpu_transfer.csv 给出传输和同步证据。GPU 活跃/空闲与 CPU/GPU overlap 的范围仅为实际 trace 事件窗口。",

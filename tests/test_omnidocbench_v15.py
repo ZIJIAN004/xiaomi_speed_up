@@ -262,7 +262,7 @@ class OmniDocBenchPipelineTests(unittest.TestCase):
             context = Mock(__enter__=Mock(return_value=backend),__exit__=Mock(return_value=False))
             monitor = NS(errors=[],phase='')
             monitor_context = Mock(__enter__=Mock(return_value=monitor),__exit__=Mock(return_value=False))
-            def evaluator(eval_root,python,gt,predictions,pages,destination,provenance):
+            def evaluator(eval_root,python,gt,predictions,pages,destination,provenance,**kwargs):
                 self.assertEqual(len(list(predictions.glob('*.md'))),6)
                 self.assertEqual({p.name for p in predictions.glob('*.md')},{str(i)+'.md' for i in range(6)})
                 if failure:
@@ -271,7 +271,7 @@ class OmniDocBenchPipelineTests(unittest.TestCase):
                 quality = normalize_scores(metric_result(),predictions,pages,destination/'evaluator_work',provenance)
                 dump_json(destination/'quality.json',quality)
                 return quality
-            with patch('benchmark.run_omnidocbench_v15.verify_evaluator',return_value={'branch':'v1_5','commit':'mock'}), patch('benchmark.run_omnidocbench_v15.prepare_pages',side_effect=lambda d,o:prepare_pages(d,o,expected_pages=6)), patch('benchmark.offline_backend.OfflineBackend',return_value=context) as constructor, patch('benchmark.offline_backend._ACTIVE',backend), patch('benchmark.run_benchmark.Monitor',return_value=monitor_context), patch('benchmark.run_benchmark.environment',return_value={}), patch('benchmark.run_omnidocbench_v15.evaluate',side_effect=evaluator), patch('urllib.request.build_opener',side_effect=AssertionError('HTTP forbidden')):
+            with patch('benchmark.run_omnidocbench_v15.preflight',return_value={'backend':'docker','image_id':'sha256:mock','preflight':{'status':'passed'}}), patch('benchmark.run_omnidocbench_v15.verify_evaluator',return_value={'branch':'v1_5','commit':'mock'}), patch('benchmark.run_omnidocbench_v15.prepare_pages',side_effect=lambda d,o:prepare_pages(d,o,expected_pages=6)), patch('benchmark.offline_backend.OfflineBackend',return_value=context) as constructor, patch('benchmark.offline_backend._ACTIVE',backend), patch('benchmark.run_benchmark.Monitor',return_value=monitor_context), patch('benchmark.run_benchmark.environment',return_value={}), patch('benchmark.run_omnidocbench_v15.evaluate',side_effect=evaluator), patch('urllib.request.build_opener',side_effect=AssertionError('HTTP forbidden')):
                 from contextlib import nullcontext
                 with self.assertRaisesRegex(RuntimeError,'quality evaluation') if failure else nullcontext():
                     main(['--dataset',str(data),'--model',str(model),'--output',str(output),

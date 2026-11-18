@@ -16,6 +16,20 @@ REGION_PROMPTS = {
 }
 
 
+def annotation_categories(value):
+    """GT labels for diagnostics only, never used as model prompt or OCR text."""
+    found = set()
+    if isinstance(value,dict) and not value.get('ignore',False):
+        if isinstance(value.get('category_type'),str):
+            found.add(value['category_type'])
+        for child in value.values():
+            found.update(annotation_categories(child))
+    elif isinstance(value,list):
+        for child in value:
+            found.update(annotation_categories(child))
+    return found
+
+
 def prepare_pages(dataset, output, expected_pages=1355):
     dataset, output = Path(dataset).resolve(), Path(output)
     if not (dataset/'images').is_dir():
@@ -47,9 +61,13 @@ def prepare_pages(dataset, output, expected_pages=1355):
     pages = []
     for row, name in zip(gt, names):
         sid = 'page_'+hashlib.sha256(name.encode()).hexdigest()
+        attributes = row['page_info'].get('page_attribute', {})
+        categories = annotation_categories(row['layout_dets']) if isinstance(row.get('layout_dets'),list) else None
         pages.append(dict(sample_id=sid, dataset='omnidocbench', benchmark_version='1.5', request_unit='page',
                           images=[str(by_name[name])], relative_path=name,
-                          page_attributes=row['page_info'].get('page_attribute', {})))
+                          page_attributes=attributes, document_type=attributes.get('data_source'),
+                          has_table=('table' in categories) if categories is not None else None,
+                          has_formula=bool(categories & {'equation_isolated','equation_inline'}) if categories is not None else None))
     write_jsonl(output/'input.jsonl', [dict(images=row['images']) for row in pages])
     write_jsonl(output/'page_manifest.jsonl', pages)
     return pages

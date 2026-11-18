@@ -352,11 +352,13 @@ OUTPUT_RETENTION=all \
 # 已准备好v1_5评分代码与依赖、以及支持模型的vLLM环境后执行
 bash scripts/run_omnidocbench_v15.sh
 
-# 如评分使用独立环境，指定其中的Python
-OMNIDOC_EVAL_PYTHON=/absolute/path/to/eval-env/bin/python   bash scripts/run_omnidocbench_v15.sh
+# 可选：不用Docker，使用已经配置好的独立Python评分环境
+OMNIDOC_EVAL_BACKEND=python OMNIDOC_EVAL_PYTHON=/absolute/path/to/eval-env/bin/python bash scripts/run_omnidocbench_v15.sh
 ```
 
-评分环境需按 OmniDocBench v1_5 的依赖说明准备，包括实际CDM所需的TeX/渲染工具。小米当前文档的v1.6 Docker镜像不作为v1.5环境使用。代码不声称依赖已经安装，也不自动下载任何模型。
+默认OMNIDOC_EVAL_BACKEND=docker，使用v1_5官方推荐镜像sunyuefeng/omnidocbench-env:v1.5提供依赖。镜像需提前准备，入口不自动pull。代码与标注/预测只读挂载，结果写回evaluator_work/result；执行的是本地v1_5源码，不是镜像内其他版本。记录源码commit、实际镜像ID和执行命令（evaluator_invocation.json），按该镜像ID运行。评分容器不使用GPU或网络，Linux下以当前UID/GID写输出。小米当前文档的v1.6镜像不作为v1.5环境使用。
+
+模型加载前做一次同公式的实际TeX/CDM自检，失败立即停止；独立最小检查可运行bash scripts/test_omnidocbench_docker.sh。上游显式记录CDM worker exception时不把返回0当完整有效评分。运行时单个坏LaTeX导致的合法0分仍保留，不改官方评分算法。Python模式同样要求已配置CDM依赖，不自动安装。
 
 流程：定量校验数据 → 整页manifest → 单卡离线加载一次 → warmup → 8页面请求并发steady → 必要重复输出重试 → 代表页面profile → 把采用的Markdown移动为原图片stem命名 → v1_5官方评分 → 汇总瓶颈指标 → 评分完整后选择性留存。
 

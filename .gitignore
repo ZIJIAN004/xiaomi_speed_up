@@ -21,3 +21,6 @@ scripts/startup_check_*/
 
 # User-prepared v1_5 evaluator checkout (separate repository)
 /evaluation_pipeline/OmniDocBench/
+
+# Local benchmark diagnostics and generated traces
+/benchmark/dia/
