@@ -28,11 +28,12 @@ def _wrap(current):
 
 
 def install() -> None:
+    # Use only the public API. The private implementation module changed
+    # names across scikit-image releases (_fit, fit, or package-local), while
+    # skimage.measure.ransac remains the supported entry point.
     import skimage.measure as measure
-    import skimage.measure._fit as fit
 
-    wrapped = _wrap(fit.ransac)
-    fit.ransac = wrapped
+    wrapped = _wrap(measure.ransac)
     measure.ransac = wrapped
 
     # visual_matcher.py imports ransac by value, so patch that binding too when
