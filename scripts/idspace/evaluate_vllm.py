@@ -47,10 +47,11 @@ def load_rows(manifest: Path, split: str, max_samples: int):
     return rows
 
 
-def make_benchmark_manifest(rows, source_root: Path, output: Path):
+def make_benchmark_manifest(rows, image_root: Path, output: Path):
     samples = []
     for index, row in enumerate(rows):
-        image = (source_root / row["image"]).resolve()
+        image_path = Path(row["image"])
+        image = (image_path if image_path.is_absolute() else image_root / image_path).resolve()
         if not image.is_file():
             raise FileNotFoundError(image)
         sample_id = f"idspace_{index:08d}"
@@ -81,6 +82,9 @@ def main() -> int:
     parser.add_argument("--input-jsonl", type=Path,
                         default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl"),
                         help="Input JSONL (default: /home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl)")
+    parser.add_argument("--image-root", type=Path,
+                        default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/images"),
+                        help="Root directory for image paths from JSONL")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpu", default="0")
@@ -105,7 +109,7 @@ def main() -> int:
         parser.error("gpu must be numeric")
 
     input_jsonl = args.input_jsonl.resolve() if args.input_jsonl else args.manifest / f"{args.split}.jsonl"
-    source_root = input_jsonl.parent.resolve()
+    image_root = args.image_root.resolve()
     rows = [json.loads(line) for line in input_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
     if args.max_samples:
         rows = rows[:args.max_samples]
@@ -113,7 +117,7 @@ def main() -> int:
         parser.error("selected split is empty")
     args.output.mkdir(parents=True)
     benchmark_manifest = args.output / "idspace_manifest.jsonl"
-    samples = make_benchmark_manifest(rows, source_root, benchmark_manifest)
+    samples = make_benchmark_manifest(rows, image_root, benchmark_manifest)
     targets = {sample["sample_id"]: row["target"] for sample, row in zip(samples, rows)}
     dump_json(args.output / "idspace_targets.json", targets)
 

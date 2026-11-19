@@ -15,6 +15,7 @@ IDSPACE_OUTPUT="${IDSPACE_OUTPUT:-$RUN_ROOT/idspace_validation}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/benchmark/data}"
 OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
 IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl}"
+IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/qkr/runs/idspace_e3/prepared/images}"
 LOG_ROOT="$RUN_ROOT/logs"
 mkdir -p "$LOG_ROOT"
 
@@ -50,6 +51,12 @@ validate_paths() {
     failed=1
   else
     log "IDSpace JSONL found: $IDSPACE_JSONL"
+  fi
+  if [[ ! -d "$IDSPACE_IMAGE_ROOT" ]]; then
+    log "Missing IDSpace image root: $IDSPACE_IMAGE_ROOT"
+    failed=1
+  else
+    log "IDSpace image root found: $IDSPACE_IMAGE_ROOT"
   fi
   if [[ ! -f "$MODEL_PATH/config.json" ]]; then
     log "Missing model config: $MODEL_PATH/config.json"
@@ -113,6 +120,7 @@ log "Starting IDSpace validation"
   cd "$PROJECT_ROOT" || exit 1
   "$SPEED_UP_PYTHON" scripts/idspace/evaluate_vllm.py \
     --input-jsonl "$IDSPACE_JSONL" \
+    --image-root "$IDSPACE_IMAGE_ROOT" \
     --model "$MODEL_PATH" \
     --output "$IDSPACE_OUTPUT" \
     --split validation \
