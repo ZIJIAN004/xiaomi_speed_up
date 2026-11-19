@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-"""Evaluate IDSpace JSON extraction with the repository's offline vLLM path.
-
-This is generation-based evaluation, not teacher-forced loss evaluation. It
-uses benchmark.offline_backend.AsyncLLM, keeps up to --workers requests in
-flight, and scores the generated JSON against each manifest target.
-"""
+"""Run the IDSpace task through benchmark.run_benchmark's full vLLM instrumentation."""
 from __future__ import annotations
 
 import argparse
 import json
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import shutil
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
-from PIL import Image
-
-from benchmark.offline_backend import OfflineBackend
-from benchmark.processor_audit import prepare_image
+from benchmark.metrics import dump_json
+from benchmark.omnidocbench_v15 import write_jsonl
+from benchmark.run_benchmark import main as run_benchmark, parse_args as parse_benchmark_args
 
 PROMPT = """Extract identity information from this ID card.
 
@@ -47,174 +38,109 @@ Required fields:
   \"place_of_issue\": null
 }"""
 
-FIELDS = (
-    "document_type", "issuing_country", "given_name", "surname", "date_of_birth",
-    "gender", "nationality", "personal_identification_number", "document_number",
-    "card_num", "personal_num", "birthday", "expire_date", "issue_authority",
-    "issue_date", "expiry_date", "place_of_issue",
-)
 
-
-def load_rows(manifest: Path, split: str, max_samples: int) -> list[dict[str, Any]]:
+def load_rows(manifest: Path, split: str, max_samples: int):
     path = manifest / f"{split}.jsonl"
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if max_samples:
         rows = rows[:max_samples]
-    for index, row in enumerate(rows):
-        if not isinstance(row.get("image"), str) or not isinstance(row.get("target"), dict):
-            raise ValueError(f"{path}:{index + 1} requires image and target fields")
     return rows
 
 
-def parse_json(text: str) -> tuple[Any | None, str | None]:
-    candidate = text.strip()
-    candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
-    candidate = re.sub(r"\s*```$", "", candidate)
-    try:
-        return json.loads(candidate), None
-    except json.JSONDecodeError as first:
-        decoder = json.JSONDecoder()
-        for index, char in enumerate(candidate):
-            if char != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(candidate[index:])
-                return value, None
-            except json.JSONDecodeError:
-                continue
-        return None, f"{type(first).__name__}: {first.msg}"
-
-
-def norm(value: Any) -> Any:
-    if isinstance(value, str):
-        return value.strip()
-    return value
-
-
-def score_record(target: dict[str, Any], text: str) -> dict[str, Any]:
-    prediction, error = parse_json(text)
-    object_prediction = prediction if isinstance(prediction, dict) else None
-    field_results = {}
-    for field in FIELDS:
-        expected = norm(target.get(field))
-        actual = norm(object_prediction.get(field)) if object_prediction is not None else None
-        field_results[field] = actual == expected
-    present_target_fields = [field for field in FIELDS if field in target]
-    valid_field_results = [field_results[field] for field in present_target_fields]
-    return {
-        "json_valid": object_prediction is not None,
-        "json_parse_error": error,
-        "prediction": object_prediction,
-        "field_results": field_results,
-        "field_count": len(present_target_fields),
-        "field_correct": sum(valid_field_results),
-        "field_exact_match": bool(valid_field_results) and all(valid_field_results),
-        "object_exact_match": object_prediction == target,
-    }
-
-
-def make_args(args: argparse.Namespace) -> SimpleNamespace:
-    return SimpleNamespace(
-        model=str(args.model), served_model_name=args.served_model_name,
-        max_model_len=args.max_model_len, dtype=args.dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=args.trust_remote_code, workers=args.workers,
-        profiler_dir=args.output.parent / (args.output.stem + "_profiler_raw"),
-        profile_max_iterations=1, server_processor_dir=args.output.parent / (args.output.stem + "_processor_raw"),
-        no_logprobs=True,
-    )
-
-
-def evaluate_split(rows: list[dict[str, Any]], manifest: Path, backend, args: argparse.Namespace) -> dict[str, Any]:
-    started = time.perf_counter()
-    records: list[dict[str, Any]] = []
-
-    def one(index: int, row: dict[str, Any]) -> dict[str, Any]:
-        request_started = time.perf_counter()
-        image, prep = prepare_image(manifest / row["image"])
-        try:
-            request_args = SimpleNamespace(
-                request_prompt=PROMPT,
-                retry_presence_penalty=1.5,
-                max_tokens=args.max_tokens,
-                no_logprobs=True,
-                request_timeout=args.request_timeout,
-            )
-            result = backend.infer(image, request_args, f"idspace-{index}", 0)
-        finally:
-            image.close()
-        text = result["text"]
-        scored = score_record(row["target"], text)
-        return {
-            "index": index, "image": row["image"], "target": row["target"],
-            "raw_text": text, "success": True, "request_seconds": time.perf_counter() - request_started,
-            "generated_tokens": result.get("usage", {}).get("completion_tokens"),
-            "prompt_tokens": result.get("usage", {}).get("prompt_tokens"),
-            "finish_reason": result.get("finish_reason"), "preprocess": prep, **scored,
-        }
-
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(one, index, row) for index, row in enumerate(rows)]
-        for future in as_completed(futures):
-            records.append(future.result())
-
-    records.sort(key=lambda row: row["index"])
-    valid_json = sum(row["json_valid"] for row in records)
-    field_total = sum(row["field_count"] for row in records)
-    field_correct = sum(row["field_correct"] for row in records)
-    return {
-        "split": args.split,
-        "samples": len(records),
-        "successful_requests": sum(row["success"] for row in records),
-        "json_valid_rate": valid_json / len(records) if records else 0.0,
-        "object_exact_match_rate": sum(row["object_exact_match"] for row in records) / len(records) if records else 0.0,
-        "field_exact_match_rate": sum(row["field_exact_match"] for row in records) / len(records) if records else 0.0,
-        "field_accuracy": field_correct / field_total if field_total else 0.0,
-        "field_correct": field_correct, "field_total": field_total,
-        "mean_request_seconds": sum(row["request_seconds"] for row in records) / len(records) if records else None,
-        "wall_seconds": time.perf_counter() - started,
-        "records": records,
-    }
+def make_benchmark_manifest(rows, source_root: Path, output: Path):
+    samples = []
+    for index, row in enumerate(rows):
+        image = (source_root / row["image"]).resolve()
+        if not image.is_file():
+            raise FileNotFoundError(image)
+        sample_id = f"idspace_{index:08d}"
+        samples.append({
+            "sample_id": sample_id,
+            "dataset": "idspace",
+            "benchmark_version": "idspace",
+            # `region` selects the runner's text-preserving output path; this is
+            # an internal storage mode, not a change to the IDSpace task.
+            "request_unit": "region",
+            "images": [str(image)],
+            "relative_path": row["image"],
+            "prompt": PROMPT,
+            "ground_truth_fields": row["target"],
+        })
+    write_jsonl(output, samples)
+    return samples
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True, help="IDSpace prepared directory")
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True, help="New benchmark result directory")
     parser.add_argument("--split", default="test")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--request-timeout", type=float, default=600)
-    parser.add_argument("--max-model-len", type=int, default=16384)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
-    parser.add_argument("--dtype", default="auto")
-    parser.add_argument("--served-model-name", default="Xiaomi-OCR-0")
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--representatives", type=int, default=5)
+    parser.add_argument("--profile-max-iterations", type=int, default=64)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--max-model-len", type=int, default=16384)
+    parser.add_argument("--monitor-interval", type=float, default=1.0)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--skip-processor-audit", action="store_true")
+    parser.add_argument("--output-retention", choices=("sampled", "all"), default="all")
     args = parser.parse_args()
     if args.workers < 1 or args.max_samples < 0 or args.max_tokens < 1:
         parser.error("workers must be positive; max-samples nonnegative; max-tokens positive")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.representatives < 3:
+        parser.error("representatives must be at least 3")
+    if args.output.exists():
+        parser.error("output must be a new directory")
     if not args.gpu.isdecimal():
         parser.error("gpu must be numeric")
-    import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    backend_args = make_args(args)
-    with OfflineBackend(backend_args) as backend:
-        rows = load_rows(args.manifest, args.split, args.max_samples)
-        summary = evaluate_split(rows, args.manifest, backend, args)
-        payload = {
-            "schema": "idspace_vllm_generation_report_v1",
-            "model": str(args.model), "manifest": str(args.manifest),
-            "split": args.split, "workers": args.workers, "max_tokens": args.max_tokens,
-            "prompt": PROMPT, "metric_scope": "generated JSON quality; no teacher-forced loss",
-            "backend": backend.metadata, "summary": {k: v for k, v in summary.items() if k != "records"},
-            "records": summary["records"],
-        }
-    args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+
+    rows = load_rows(args.manifest, args.split, args.max_samples)
+    if not rows:
+        parser.error("selected split is empty")
+    args.output.mkdir(parents=True)
+    benchmark_manifest = args.output / "idspace_manifest.jsonl"
+    samples = make_benchmark_manifest(rows, args.manifest, benchmark_manifest)
+    targets = {sample["sample_id"]: row["target"] for sample, row in zip(samples, rows)}
+    dump_json(args.output / "idspace_targets.json", targets)
+
+    argv = [
+        "--manifest", str(benchmark_manifest), "--output", str(args.output / "inference"),
+        "--model", str(args.model), "--served-model-name", "Xiaomi-OCR-0",
+        "--backend", "offline", "--gpu", args.gpu, "--workers", str(args.workers),
+        "--warmup", str(args.warmup), "--representatives", str(min(args.representatives, len(samples))),
+        "--max-tokens", str(args.max_tokens), "--max-model-len", str(args.max_model_len),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--profile-max-iterations", str(args.profile_max_iterations),
+        "--output-retention", args.output_retention,
+        "--quality-command", json.dumps([
+            os.environ.get("IDSPACE_SCORER_PYTHON", os.sys.executable),
+            str(Path(__file__).with_name("score_idspace_json.py")),
+            "--manifest", "{manifest}", "--predictions", "{predictions}", "--output", "{output}",
+        ]),
+    ]
+    if args.trust_remote_code:
+        argv.append("--trust-remote-code")
+    if args.skip_processor_audit:
+        argv.append("--skip-processor-audit")
+    if args.output_retention == "all":
+        argv.extend(["--retain-samples", "0", "--retain-worst", "0"])
+    else:
+        argv.extend(["--retain-samples", "10", "--retain-worst", "10"])
+
+    benchmark_args = parse_benchmark_args(argv)
+    run_benchmark(benchmark_args)
+    inference = args.output / "inference"
+    quality = inference / "quality.json"
+    if quality.is_file():
+        shutil.copy2(quality, args.output / "quality.json")
+    summary = inference / "summary.json"
+    if summary.is_file():
+        shutil.copy2(summary, args.output / "summary.json")
     return 0
 
 
