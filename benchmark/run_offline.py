@@ -45,7 +45,7 @@ def main():
                                ("GPU_MEM_UTIL", "--gpu-memory-utilization", "0.90"),
                                ("MAX_MODEL_LEN", "--max-model-len", "16384"), ("DTYPE", "--dtype", "auto"),
                                ("REQUEST_TIMEOUT", "--request-timeout", "600"), ("WARMUP", "--warmup", "5"),
-                               ("REPRESENTATIVES", "--representatives", "5"),
+                               ("REPRESENTATIVES", "--representatives", "50"),
                                ("PROFILE_MAX_ITERATIONS", "--profile-max-iterations", "64"),
                                ("OUTPUT_RETENTION", "--output-retention", "sampled"),
                                ("RETAIN_SAMPLES", "--retain-samples", "10"),

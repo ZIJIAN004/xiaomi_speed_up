@@ -10,6 +10,10 @@ from pathlib import Path
 from benchmark.metrics import overlap_duration, stats, union_duration, write_csv
 
 STAGE_NAMES = ("vision_encoder", "projector", "prefill", "decode", "sampling", "tokenizer_decode")
+STAGE_ALIASES = {
+    "runner_prefill": "prefill",
+    "runner_decode": "decode",
+}
 
 
 def arg_value(event, *keys):
@@ -115,9 +119,11 @@ def analyze_events(events, small_kernel_us=10):
             if e.get("cat") == "cpu_op":
                 operators[e["name"]]["cuda_time_total_ms"] += kernel["dur"] / 1000
         # Deepest stage wins: projector nested inside vision is not counted twice.
-        label = next((e["name"].split("::", 1)[1] for e in chain
+        label = next((STAGE_ALIASES.get(e["name"].split("::", 1)[1], e["name"].split("::", 1)[1])
+                      for e in chain
                       if e.get("name", "").startswith("benchmark::")
-                      and e["name"].split("::", 1)[1] in STAGE_NAMES), None)
+                      and (e["name"].split("::", 1)[1] in STAGE_NAMES
+                           or e["name"].split("::", 1)[1] in STAGE_ALIASES)), None)
         if label:
             stage_us[label] += kernel["dur"]
     if not operator_correlated:
@@ -191,6 +197,7 @@ def analyze_events(events, small_kernel_us=10):
               "stage_time_semantics": "sum of correlated GPU kernel durations; exclusive deepest-stage attribution, not stage wall latency",
               "observed_stage_ranges": sorted(observed_stages),
               "unattributed_kernel_time_ms": (sum(durations) - sum(stage_us.values())) / 1000 if kernels else None,
+              "stage_attribution_note": "runner_prefill/runner_decode aliases are normalized to prefill/decode; stage kernel work remains correlation-limited",
               "trace_peak_allocated_bytes": max(allocated) if allocated else None,
               "trace_peak_reserved_bytes": max(reserved) if reserved else None,
               "profile_memory_events": len(allocations),

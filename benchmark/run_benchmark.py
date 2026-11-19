@@ -474,7 +474,12 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
                 record["gpu_ttft_ms"] = event_stats["gpu_ttft_ms"]
                 for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling"):
                     record[stage + "_time_ms"] = event_stats["stages"].get(stage, {}).get("exclusive_ms")
+                    record[stage + "_cuda_event_time_ms"] = record[stage + "_time_ms"]
+                    record[stage + "_wall_time_ms"] = event_stats.get("host_wall_stages", {}).get(stage, {}).get("inclusive_ms")
+                    record[stage + "_wall_time_scope"] = "host wall span of stage event; not request wall time and not additive under overlap"
                     record[stage + "_time_source"] = "representative_current_stream_cuda_event_exclusive_span"
+                    record[stage + "_cuda_event_time_source"] = "representative_current_stream_cuda_event_exclusive_span"
+                    record[stage + "_wall_time_source"] = "representative_worker_host_wall_span"
                 n = record.get("generated_tokens")
                 record["tpot_ms"] = record["decode_time_ms"] / n if n and record.get("decode_time_ms") is not None else None
                 model_ms = sum(event_stats["stages"][stage]["exclusive_ms"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")
@@ -556,7 +561,7 @@ def parse_args(argv=None):
     parser.add_argument("--base-url", default="http://127.0.0.1:26000")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--representatives", type=int, default=5)
+    parser.add_argument("--representatives", type=int, default=50)
     parser.add_argument("--gpu", default="1")
     parser.add_argument("--server-pid", type=int)
     parser.add_argument("--max-model-len", type=int, default=16384)
@@ -583,8 +588,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.retain_samples < 0 or args.retain_worst < 0:
         parser.error("retention sample counts must be nonnegative")
-    if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 5 or args.monitor_interval <= 0:
-        parser.error("workers>=1, warmup>=3, representatives=3..5 and monitor-interval>0 required")
+    if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 1355 or args.monitor_interval <= 0:
+        parser.error("workers>=1, warmup>=3, representatives=3..1355 and monitor-interval>0 required")
     if args.profile_max_iterations < 1:
         parser.error("profile-max-iterations must be positive; unbounded representative traces are not enabled")
     if args.max_tokens is not None and args.max_tokens < 1:

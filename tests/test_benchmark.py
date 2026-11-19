@@ -57,6 +57,21 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(value["stages"]["prefill"]["exclusive_ms"], 10)
         self.assertEqual(value["gpu_ttft_ms"], 11)
 
+    def test_stage_host_wall_is_recorded_separately_from_cuda_event(self):
+        value = cuda_event_statistics([{"events": [
+            dict(id=0, stage="prefill", stream=0, start_ms=0, end_ms=10,
+                 parent_id=None, host_wall_time_ms=25),
+        ]}])
+        self.assertEqual(value["stages"]["prefill"]["exclusive_ms"], 10)
+        self.assertEqual(value["host_wall_stages"]["prefill"]["inclusive_ms"], 25)
+
+    def test_runner_phase_fallback_is_normalized(self):
+        value = cuda_event_statistics([{"events": [
+            dict(id=0, stage="runner_decode", stream=0, start_ms=0, end_ms=10,
+                 parent_id=None),
+        ]}])
+        self.assertEqual(value["stages"]["decode"]["exclusive_ms"], 10)
+
     def test_cuda_ttft_does_not_compare_different_stream_anchors(self):
         value = cuda_event_statistics([{"events": [
             dict(id=0, stage="prefill", stream=0, start_ms=0, end_ms=1, parent_id=None),

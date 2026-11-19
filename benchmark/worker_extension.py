@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 
 
@@ -31,6 +32,7 @@ class BenchmarkWorkerExtension:
                 event = {"id": len(self._benchmark_events), "stage": stage, "stream": key,
                          "parent_id": stack[-1] if stack else None, "thread_id": tid,
                          "start": torch.cuda.Event(enable_timing=True), "end": torch.cuda.Event(enable_timing=True),
+                         "host_start_ns": time.perf_counter_ns(), "host_end_ns": None,
                          "final_prefill_sampling": stage == "sampling" and getattr(self, "_benchmark_step_finishes_prompt", False)}
                 self._benchmark_events.append(event)
                 event["start"].record(stream)
@@ -42,6 +44,7 @@ class BenchmarkWorkerExtension:
                 yield
         finally:
             if event is not None:
+                event["host_end_ns"] = time.perf_counter_ns()
                 self._benchmark_event_stacks[event["thread_id"]].pop()
                 try:
                     event["end"].record(stream)
@@ -68,7 +71,9 @@ class BenchmarkWorkerExtension:
             anchor = self._benchmark_event_anchors[event["stream"]]
             events.append({k: v for k, v in event.items() if k not in ("start", "end")})
             events[-1].update(start_ms=anchor.elapsed_time(event["start"]),
-                              end_ms=anchor.elapsed_time(event["end"]))
+                              end_ms=anchor.elapsed_time(event["end"]),
+                              host_wall_time_ms=((event.get("host_end_ns") - event.get("host_start_ns")) / 1e6
+                                                 if event.get("host_end_ns") is not None else None))
         self._benchmark_events = []
         self._benchmark_event_anchors = {}
         return {"events": events, "scope": "per-stream CUDA elapsed timeline, includes stream idle gaps; not kernel work sum",

@@ -18,6 +18,8 @@ TOKEN_FIELDS = (
     "total_input_tokens", "generated_tokens", "generated_visible_tokens",
     "generated_special_tokens", "total_processed_tokens",
 )
+STAGE_ALIASES = {"runner_prefill": "prefill", "runner_decode": "decode"}
+
 PADDING_FIELDS = (
     "prompt_length_i", "max_prompt_length", "prompt_padding_tokens", "prompt_padding_ratio",
     "visual_length_i", "max_visual_tokens_in_batch", "visual_padding_tokens",
@@ -47,9 +49,10 @@ def stats(values):
 
 
 def cuda_event_statistics(worker_results):
-    """Only compare times within the same worker/stream anchor; nested ranges are exclusive."""
+    """Aggregate exclusive CUDA-event and host-wall spans without synthetic zeros."""
     totals = {}
     worker_ttft = []
+    host_totals = {}
     for worker in worker_results:
         events = [e for e in worker.get("events", []) if isinstance(e.get("start_ms"), (int, float))
                   and isinstance(e.get("end_ms"), (int, float)) and e["end_ms"] >= e["start_ms"]]
@@ -65,6 +68,11 @@ def cuda_event_statistics(worker_results):
             stage["count"] += 1
             stage["inclusive_ms"] += inclusive
             stage["exclusive_ms"] += exclusive
+            wall = e.get("host_wall_time_ms")
+            if isinstance(wall, (int, float)):
+                wall_stage = host_totals.setdefault(e["stage"], {"count": 0, "inclusive_ms": 0.0})
+                wall_stage["count"] += 1
+                wall_stage["inclusive_ms"] += wall
         prefill = [e for e in events if e["stage"] == "prefill"]
         first_token = [e for e in events if e.get("final_prefill_sampling")]
         if prefill and first_token and len({e["stream"] for e in prefill}) == 1:
@@ -73,9 +81,21 @@ def cuda_event_statistics(worker_results):
                        key=lambda e: e["end_ms"], default=None)
             if last:
                 worker_ttft.append(last["end_ms"] - first["start_ms"])
-    return {"stages": totals, "gpu_ttft_ms": max(worker_ttft) if worker_ttft else None,
+    stage_sources = {}
+    for stage in ("prefill", "decode"):
+        runner = "runner_" + stage
+        if stage not in totals and runner in totals:
+            totals[stage] = dict(totals[runner])
+            stage_sources[stage] = "runner_phase_cuda_event_fallback"
+        elif stage in totals:
+            stage_sources[stage] = "nested_stage_cuda_event"
+        if stage not in host_totals and runner in host_totals:
+            host_totals[stage] = dict(host_totals[runner])
+    return {"stages": totals, "host_wall_stages": host_totals, "stage_sources": stage_sources,
+            "gpu_ttft_ms": max(worker_ttft) if worker_ttft else None,
             "gpu_ttft_source": "first model prefill event to final-prefill sampling completion on same CUDA stream",
-            "scope": "representative with profiler; per-stream elapsed spans, not pure kernel work; nested stages exclusive"}
+            "scope": "representative with profiler; per-stream elapsed spans, not pure kernel work; nested stages exclusive",
+            "host_wall_scope": "representative worker host spans; includes CPU/runtime waits and is not additive under overlap"}
 
 
 def weighted_stats(counts):
