@@ -586,6 +586,7 @@ def parse_args(argv=None):
     parser.add_argument("--retain-worst", type=int, default=10)
     parser.add_argument("--retention-seed", type=int, default=42)
     args = parser.parse_args(argv)
+    args.enforce_eager = True
     if args.retain_samples < 0 or args.retain_worst < 0:
         parser.error("retention sample counts must be nonnegative")
     if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 1355 or args.monitor_interval <= 0:
@@ -594,6 +595,8 @@ def parse_args(argv=None):
         parser.error("profile-max-iterations must be positive; unbounded representative traces are not enabled")
     if args.max_tokens is not None and args.max_tokens < 1:
         parser.error("max-tokens must be positive or omitted")
+    if not args.enforce_eager:
+        parser.error("CUDA Graph is intentionally disabled; enforce-eager must remain enabled")
     if args.output.exists():
         parser.error("output must be a new directory; refusing to reuse historical predictions")
     if args.backend == "http" and not args.base_url.startswith(("http://127.0.0.1:", "http://localhost:")):
@@ -643,6 +646,8 @@ def main(args=None):
     config.update(benchmark_version="1.5" if samples[0].get("dataset") == "omnidocbench" else None,
                   request_unit=samples[0].get("request_unit", "page"), diagnostic_only=os.environ.get("BENCHMARK_RUNTIME_SMOKE") == "1", request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
                   top_p=0.8, repetition_penalty=1.0, dtype_policy="fixed server launch dtype",
+                  cuda_graph_policy="disabled via enforce_eager=True",
+                  enforce_eager=True,
                   streaming=True, http_client="stdlib urllib; no hidden retries, one connection per request",
                   max_tokens_policy="omitted by default; server generation-config=vllm",
                   profiler_results_excluded_from_steady_state=True,
