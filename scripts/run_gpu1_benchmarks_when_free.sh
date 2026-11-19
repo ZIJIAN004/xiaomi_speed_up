@@ -12,6 +12,9 @@ INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
 RUN_ROOT="${RUN_ROOT:-/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results/gpu1_serial_$(date +%Y%m%d_%H%M%S)}"
 OMNI_OUTPUT="${OMNI_OUTPUT:-$RUN_ROOT/omnidocbench_v15}"
 IDSPACE_OUTPUT="${IDSPACE_OUTPUT:-$RUN_ROOT/idspace_validation}"
+OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/benchmark/data}"
+OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
+IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl}"
 LOG_ROOT="$RUN_ROOT/logs"
 mkdir -p "$LOG_ROOT"
 
@@ -23,6 +26,50 @@ query_free_mib() {
   nvidia-smi -i "$GPU_ID" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
     | tr -d '[:space:]' | head -n 1
 }
+
+validate_paths() {
+  local failed=0
+  if [[ ! -d "$PROJECT_ROOT" ]]; then
+    log "Missing project root: $PROJECT_ROOT"
+    failed=1
+  fi
+  if [[ ! -d "$OMNIDOC_ROOT/images" || ! -f "$OMNIDOC_ROOT/OmniDocBench.json" ]]; then
+    log "Missing OmniDocBench data: expected $OMNIDOC_ROOT/images and $OMNIDOC_ROOT/OmniDocBench.json"
+    failed=1
+  else
+    log "OmniDocBench data found: $OMNIDOC_ROOT"
+  fi
+  if [[ ! -f "$OMNIDOC_EVALUATOR_ROOT/pdf_validation.py" ]]; then
+    log "Missing OmniDocBench evaluator: $OMNIDOC_EVALUATOR_ROOT/pdf_validation.py"
+    failed=1
+  else
+    log "OmniDocBench evaluator found: $OMNIDOC_EVALUATOR_ROOT"
+  fi
+  if [[ ! -f "$IDSPACE_JSONL" ]]; then
+    log "Missing IDSpace JSONL: $IDSPACE_JSONL"
+    failed=1
+  else
+    log "IDSpace JSONL found: $IDSPACE_JSONL"
+  fi
+  if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+    log "Missing model config: $MODEL_PATH/config.json"
+    failed=1
+  else
+    log "Model path found: $MODEL_PATH"
+  fi
+  if [[ ! -x "$SPEED_UP_PYTHON" ]]; then
+    log "Missing executable Python: $SPEED_UP_PYTHON"
+    failed=1
+  else
+    log "speed_up Python found: $SPEED_UP_PYTHON"
+  fi
+  return "$failed"
+}
+
+if ! validate_paths; then
+  log "Path validation failed; no benchmark will start"
+  exit 2
+fi
 
 log "Waiting for GPU $GPU_ID free memory > ${FREE_THRESHOLD_MIB} MiB (23 GiB), checking every ${INTERVAL_SECONDS}s"
 while :; do
@@ -52,7 +99,8 @@ log "Starting OmniDocBench v1.5"
   MODEL_PATH="$MODEL_PATH" \
   GPU_ID="$GPU_ID" \
   RESULT_ROOT="$OMNI_OUTPUT" \
-  OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}" \
+  OMNIDOC_ROOT="$OMNIDOC_ROOT" \
+  OMNIDOC_EVALUATOR_ROOT="$OMNIDOC_EVALUATOR_ROOT" \
   OMNIDOC_EVAL_BACKEND="python" \
   OMNIDOC_EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-/home/mr_jiang/miniforge3/envs/omnidocbench_v15/bin/python}" \
   OUTPUT_RETENTION="${OUTPUT_RETENTION:-all}" \
@@ -64,7 +112,7 @@ log "Starting IDSpace validation"
 (
   cd "$PROJECT_ROOT" || exit 1
   "$SPEED_UP_PYTHON" scripts/idspace/evaluate_vllm.py \
-    --input-jsonl /home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl \
+    --input-jsonl "$IDSPACE_JSONL" \
     --model "$MODEL_PATH" \
     --output "$IDSPACE_OUTPUT" \
     --split validation \
