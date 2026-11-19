@@ -65,7 +65,9 @@ def prepare_pages(dataset, output, expected_pages=1355):
         categories = annotation_categories(row['layout_dets']) if isinstance(row.get('layout_dets'),list) else None
         pages.append(dict(sample_id=sid, dataset='omnidocbench', benchmark_version='1.5', request_unit='page',
                           images=[str(by_name[name])], relative_path=name,
-                          page_attributes=attributes, document_type=attributes.get('data_source'),
+                          page_attributes=attributes,
+                          evaluator_categories=(sorted(categories) if categories is not None else None),
+                          document_type=attributes.get('data_source'),
                           has_table=('table' in categories) if categories is not None else None,
                           has_formula=bool(categories & {'equation_isolated','equation_inline'}) if categories is not None else None))
     write_jsonl(output/'input.jsonl', [dict(images=row['images']) for row in pages])

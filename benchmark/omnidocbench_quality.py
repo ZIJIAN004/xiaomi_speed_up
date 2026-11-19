@@ -38,6 +38,35 @@ def verify_evaluator(root):
     return dict(repository=str(root), branch='v1_5', commit=head, tracked_files_clean=True)
 
 
+def _page_metric_eligibility(pages):
+    """Return pages with at least one official page-level target category.
+
+    OmniDocBench can contain pages made only of figures, masks, headers,
+    footers, page numbers, or ignored annotations. The official evaluator does
+    not emit page-level Edit_dist rows for those pages; they are not inference
+    failures and must not be used as the denominator of evaluator coverage.
+    """
+    eligible = set()
+    non_evaluable = set()
+    for row in pages:
+        stem = Path(row['images'][0]).stem
+        # Synthetic callers and older manifests lack GT category metadata;
+        # preserve the strict historical behavior unless eligibility is known.
+        if row.get('evaluator_categories') is None:
+            eligible.add(stem)
+            continue
+        categories = set(row['evaluator_categories'])
+        # v1_5 page-level outputs are emitted for the evaluator's canonical
+        # targets. Dataset-only annotations such as text_span/text_mask,
+        # figures, captions, headers, footers, and ignored equations are not
+        # page-level Edit_dist targets in this end-to-end adapter.
+        if categories & {'text', 'text_block', 'table', 'equation_isolated', 'display_formula'}:
+            eligible.add(stem)
+        else:
+            non_evaluable.add(stem)
+    return eligible, non_evaluable
+
+
 def normalize_scores(result, predictions, pages, work, provenance):
     scores = {}
     for name, keys in SCORES.items():
@@ -65,16 +94,23 @@ def normalize_scores(result, predictions, pages, work, provenance):
                 if isinstance(value,(int,float)) and math.isfinite(value):
                     per_page[Path(image).stem][name] = value
     expected_stems = {Path(row['images'][0]).stem for row in pages}
-    observed = set(per_page)&expected_stems
-    coverage_complete = expected == actual and observed == expected_stems
+    eligible_stems, non_evaluable_stems = _page_metric_eligibility(pages)
+    observed = set(per_page) & expected_stems
+    observed_eligible = observed & eligible_stems
+    missing_eligible = eligible_stems - observed
+    coverage_complete = expected == actual and not missing_eligible
     return dict(status='complete' if not missing and coverage_complete else 'incomplete',
         benchmark_version='1.5', evaluator_version='1.5', gt_version='1.5',
         evaluator=provenance, metrics=scores, missing_metrics=missing,
-        required_metrics=list(SCORES)+['overall'], evaluated_samples=len(observed),
-        expected_samples=len(expected), sample_coverage_complete=coverage_complete,
-        prediction_coverage_complete=actual == expected,
-        unobserved_evaluator_pages=sorted(expected_stems-observed),
-        evaluation_coverage_source='union of actual official per-page Edit_dist outputs, not input file count',
+        required_metrics=list(SCORES)+['overall'], evaluated_samples=len(observed_eligible),
+        expected_samples=len(eligible_stems), input_page_count=len(expected_stems),
+        evaluator_eligible_pages=sorted(eligible_stems),
+        non_evaluable_pages=sorted(non_evaluable_stems),
+        sample_coverage_complete=coverage_complete,
+        prediction_coverage_complete=actual == {stem + '.md' for stem in expected_stems},
+        unobserved_evaluator_pages=sorted(missing_eligible),
+        observed_non_evaluable_pages=sorted(observed & non_evaluable_stems),
+        evaluation_coverage_source='official page-level Edit_dist union over GT pages with applicable evaluator categories; non-evaluable figure/mask-only pages excluded',
         version_matches_design=True, metric_units={**{k:'ratio_0_1' for k in SCORES}, 'overall':'percent_0_100'},
         per_sample=[dict(sample_id=row['sample_id'],metrics=per_page[Path(row['images'][0]).stem]) for row in pages],
         per_sample_note='official page-level edit scores when emitted; no invented page-level CDM/TEDS',

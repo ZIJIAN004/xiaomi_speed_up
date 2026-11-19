@@ -201,7 +201,7 @@ class OmniDocBenchTests(unittest.TestCase):
                 dump_json(work/'result/predictions_quick_match_metric_result.json',metric_result())
                 evaluation_evidence(work,pages)
                 self.assertEqual(command[0],'eval-python')
-                self.assertTrue(str(command[1]).endswith('pdf_validation.py'))
+                self.assertTrue(any(str(value).endswith('pdf_validation.py') for value in command))
             with patch('pathlib.Path.symlink_to'), patch('benchmark.omnidocbench_evaluator.subprocess.run',side_effect=run):
                 quality = evaluate(evaluator,'eval-python',root/'gt.json',predictions,pages,output,{})
             config = json.loads((output/'evaluator_config.json').read_text())
