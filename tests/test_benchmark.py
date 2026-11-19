@@ -60,10 +60,10 @@ class MetricsTests(unittest.TestCase):
     def test_stage_host_wall_is_recorded_separately_from_cuda_event(self):
         value = cuda_event_statistics([{"events": [
             dict(id=0, stage="prefill", stream=0, start_ms=0, end_ms=10,
-                 parent_id=None, host_wall_time_ms=25),
+                 parent_id=None, host_call_span_ms=25),
         ]}])
         self.assertEqual(value["stages"]["prefill"]["exclusive_ms"], 10)
-        self.assertEqual(value["host_wall_stages"]["prefill"]["inclusive_ms"], 25)
+        self.assertEqual(value["host_call_spans"]["prefill"]["inclusive_ms"], 25)
 
     def test_runner_phase_fallback_is_normalized(self):
         value = cuda_event_statistics([{"events": [

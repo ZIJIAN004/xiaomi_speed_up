@@ -39,6 +39,7 @@ class BenchmarkWorkerExtension:
                 stack.append(event["id"])
             else:
                 self._benchmark_event_skipped_capture += 1
+            self._benchmark_event_skipped_capture_stages.append(stage)
         try:
             with torch.profiler.record_function("benchmark::" + (annotation or stage)):
                 yield
@@ -60,6 +61,7 @@ class BenchmarkWorkerExtension:
             self._benchmark_event_anchors = {}
             self._benchmark_event_stacks = {}
             self._benchmark_event_skipped_capture = 0
+            self._benchmark_event_skipped_capture_stages = []
             self._benchmark_step_finishes_prompt = False
             return {"enabled": True, "scope": "representative_only_current_stream_cuda_events"}
         self._benchmark_events_enabled = False
@@ -72,12 +74,13 @@ class BenchmarkWorkerExtension:
             events.append({k: v for k, v in event.items() if k not in ("start", "end")})
             events[-1].update(start_ms=anchor.elapsed_time(event["start"]),
                               end_ms=anchor.elapsed_time(event["end"]),
-                              host_wall_time_ms=((event.get("host_end_ns") - event.get("host_start_ns")) / 1e6
+                              host_call_span_ms=((event.get("host_end_ns") - event.get("host_start_ns")) / 1e6
                                                  if event.get("host_end_ns") is not None else None))
         self._benchmark_events = []
         self._benchmark_event_anchors = {}
         return {"events": events, "scope": "per-stream CUDA elapsed timeline, includes stream idle gaps; not kernel work sum",
                 "skipped_graph_capture_ranges": getattr(self, "_benchmark_event_skipped_capture", 0),
+                "skipped_graph_capture_stages": list(getattr(self, "_benchmark_event_skipped_capture_stages", [])),
                 "measurement_sync": "one final synchronize; caller invokes after stop_profile and records whether stop succeeded"}
 
     def benchmark_profile_limit(self, max_steps="64", trace_dir="", restore="false"):

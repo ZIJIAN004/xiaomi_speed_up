@@ -475,11 +475,11 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
                 for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling"):
                     record[stage + "_time_ms"] = event_stats["stages"].get(stage, {}).get("exclusive_ms")
                     record[stage + "_cuda_event_time_ms"] = record[stage + "_time_ms"]
-                    record[stage + "_wall_time_ms"] = event_stats.get("host_wall_stages", {}).get(stage, {}).get("inclusive_ms")
-                    record[stage + "_wall_time_scope"] = "host wall span of stage event; not request wall time and not additive under overlap"
+                    record[stage + "_host_call_span_ms"] = event_stats.get("host_call_spans", {}).get(stage, {}).get("inclusive_ms")
+                    record[stage + "_host_call_span_scope"] = "representative worker call span; includes CPU/runtime waits; not request wall time and not additive under overlap"
                     record[stage + "_time_source"] = "representative_current_stream_cuda_event_exclusive_span"
                     record[stage + "_cuda_event_time_source"] = "representative_current_stream_cuda_event_exclusive_span"
-                    record[stage + "_wall_time_source"] = "representative_worker_host_wall_span"
+                    record[stage + "_host_call_span_source"] = event_stats.get("host_call_span_sources", {}).get(stage, "representative_worker_host_call_span")
                 n = record.get("generated_tokens")
                 record["tpot_ms"] = record["decode_time_ms"] / n if n and record.get("decode_time_ms") is not None else None
                 model_ms = sum(event_stats["stages"][stage]["exclusive_ms"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")
