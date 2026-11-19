@@ -8,20 +8,18 @@
 
 ## 关键特殊性
 
-### 两阶段文档解析
+### 整页端到端文档解析
 
-本实验不是一次整页 VLM 请求，而是 Xiaomi-OCR-0 官方复现路径：
+本实验直接将每张页面图片交给 Xiaomi-OCR-0，生成一份页面级 Markdown：
 
 ```text
 整页图片
-  → 阶段 1：PaddleX 版 PP-DocLayoutV3 版面检测
-  → layout JSONL
-  → 阶段 2：按区域裁剪并调用 Xiaomi-OCR-0
-  → 区域结果合并为页面级 Markdown
+  → Xiaomi-OCR-0 整页推理
+  → 页面级 Markdown
   → OmniDocBench v1.5 evaluator
 ```
 
-阶段 1 的 `bbox/polygon` 是中间结果，不是最终评分对象。阶段 2 的表格先生成 OTSL，再由后处理转换为 Markdown 中的 HTML；公式保留 LaTeX。最终评分对象是每页 Markdown。
+当前正式评测不执行 PaddleX 版面检测、区域裁剪、区域 OCR 或页面拼接。最终评分对象是每页 Markdown。
 
 ### 版本必须固定
 
@@ -36,12 +34,11 @@ evaluator：OmniDocBench v1.5 evaluator
 ### Batch 和并发不是同一个量
 
 ```text
-layout batch_size=8：阶段 1 的 PP-DocLayoutV3 一次处理 8 页
-VLM workers=8：阶段 2 最多 8 个区域请求同时在途
+page workers=8：最多 8 个页面请求同时在途
 vLLM scheduler batch：由 vLLM 根据 running/waiting 请求、KV cache 和 token 调度实际形成，不能由 workers=8 推断为 batch=8
 ```
 
-阶段 1 使用固定 `threshold=0.25` 和 `batch_size=8`。阶段 2 使用 vLLM server，客户端 `workers=8` 作为本轮 concurrency 配置。
+客户端 `workers=8` 是本轮并发窗口，实际 scheduler batch、padding 和 KV cache 状态必须来自服务端证据。
 
 ## 实验步骤
 
@@ -55,7 +52,7 @@ vLLM scheduler batch：由 vLLM 根据 running/waiting 请求、KV cache 和 tok
 - dtype、`gpu_memory_utilization`、`max_model_len`
 - attention backend、CUDA Graph 实际状态、chunked prefill/prefix cache 实际配置
 - `temperature=0`、`top_p=0.8`、presence/repetition penalty
-- layout threshold、layout batch size、VLM workers、max tokens
+- page workers、max tokens
 
 ### 2. 准备 v1.5 数据
 
@@ -69,63 +66,32 @@ OmniDocBench_v1.5/
 
 定量检查图片数、GT 记录数、图片与 `image_path` 的覆盖关系。输入 manifest 只包含 v1.5 评测页面，不把 PDF、示例图或其他版本文件混入。
 
-### 3. 阶段 1：生成 layout JSONL
+### 3. 整页端到端推理
 
-使用：
-
-```bash
-python -m evaluation_pipeline.layout_detect_paddlex \
-  --input_jsonl "$INPUT_JSONL" \
-  --output_jsonl "$LAYOUT_JSONL" \
-  --gpu_ids 1 \
-  --batch_size 8 \
-  --threshold 0.25
-```
-
-保存 layout JSONL、layout 日志和阶段 1 的耗时。阶段 1 不计入 vLLM VLM 请求的单请求 latency，但要单独报告其总耗时。
-
-### 4. 阶段 2：vLLM 区域推理
-
-使用已有 `--layout-jsonl`，避免重新加载另一套 layout 模型：
-
-```bash
-python -m evaluation_pipeline.twostage_img2md \
-  --input-jsonl "$INPUT_JSONL" \
-  --layout-jsonl "$LAYOUT_JSONL" \
-  --output_dir "$PRED_DIR" \
-  --model_path "$MODEL_PATH" \
-  --served_model_name Xiaomi-OCR-0 \
-  --vlm_gpus 1 \
-  --port 26000 \
-  --workers 8 \
-  --temperature 0.0 \
-  --top_p 0.8 \
-  --presence_penalty 0.0 \
-  --repetition_penalty 1.0
-```
+当前正式流程直接将每张页面图片交给 Xiaomi-OCR-0，生成一份页面级 Markdown，不执行 PaddleX 版面检测、区域裁切或区域拼接。
 
 运行时记录：
 
-- 每个 region 请求的开始/结束、成功/失败和 finish reason
+- 每个 page 请求的开始/结束、成功/失败和 finish reason
 - prompt/input、generated/total token（优先使用 vLLM usage，禁止用字符数冒充 token）
 - TTFT、ITL/TPOT（只有 streaming 证据充分时才填写）
-- region crop、processor、HTTP、后处理和写盘耗时
+- 图片预处理、processor、HTTP、后处理和写盘耗时
 - vLLM `/metrics` 中的 running/waiting、KV cache、token throughput、request latency 和 preemption
 - GPU 利用率、显存、功耗、温度、时钟、CPU/RSS
 
 `workers=8` 是客户端并发窗口，不是实际 vLLM batch。实际 scheduler batch、padding 和 KV cache 状态必须来自服务端证据。
 
-### 5. 预热、稳态和 profile 分开
+### 4. 预热、稳态和 profile 分开
 
 - 服务启动/模型加载/compile/graph capture：单独记录 cold start
 - 每个数据集预热 3–5 次：不进入稳态统计
 - 正式样本：记录全量请求级 metrics
-- 代表样本：选择不同图像面积、区域数量、输出长度和文档类型，独立启用有限 worker profiler
+- 代表样本：选择不同图像面积、输出长度和文档类型，独立启用有限 worker profiler
 - profiler trace 不与普通稳态 latency、throughput 混合
 
-### 6. 质量评分
+### 5. 质量评分
 
-将阶段 2 生成的最终页面 Markdown 交给 **OmniDocBench v1.5 end-to-end evaluator**，报告：
+将整页推理生成的页面 Markdown 交给 **OmniDocBench v1.5 end-to-end evaluator**，报告：
 
 - Text Edit Distance
 - Formula Edit Distance
@@ -145,7 +111,7 @@ python -m evaluation_pipeline.twostage_img2md \
 config.json
 environment.txt
 manifest.jsonl
-layout_results.jsonl
+page_manifest.jsonl
 per_sample_metrics.jsonl
 vllm_metrics.csv
 gpu_metrics.csv

@@ -10,10 +10,9 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 from benchmark.metrics import dump_json, load_jsonl
-from benchmark.omnidocbench_v15 import prepare_pages, prepare_regions, assemble_pages, write_jsonl, REGION_PROMPTS
+from benchmark.omnidocbench_v15 import prepare_pages, write_jsonl
 from benchmark.omnidocbench_quality import normalize_scores, verify_evaluator, SCORES
 from benchmark.omnidocbench_evaluator import evaluate, retain_evaluator_scores
-from benchmark.processor_audit import prepare_image
 
 
 def dataset(root, count=2):
@@ -86,59 +85,6 @@ class OmniDocBenchTests(unittest.TestCase):
             Image.new('RGB',(2,2)).save(data/'images/extra.png')
             with self.assertRaises(ValueError):
                 prepare_pages(data, root/'out', expected_pages=2)
-
-    def test_region_crop_before_resize_and_prompts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            data = dataset(root,1)
-            pages = prepare_pages(data,root/'out',expected_pages=1)
-            layout = [dict(index=0,label='text',task_type='text',bbox_2d=[0,0,500,1000]),
-                      dict(index=1,label='table',task_type='table',bbox_2d=[500,0,1000,1000]),
-                      dict(index=2,label='image',task_type='skip',bbox_2d=[0,0,1000,1000])]
-            write_jsonl(root/'layout.jsonl',[dict(images=pages[0]['images'],layout_result=layout)])
-            regions,_ = prepare_regions(pages,root/'layout.jsonl',root/'out')
-            self.assertEqual(len(regions),2)
-            self.assertEqual(regions[1]['prompt'],REGION_PROMPTS['table'])
-            self.assertEqual(regions[0]['regions_per_page'],3)
-            image, metrics = prepare_image(regions[0]['images'][0],bbox_2d=regions[0]['bbox_2d'])
-            self.assertEqual(image.size,(20,20))
-            self.assertEqual(metrics['source_page_width'],40)
-            self.assertEqual(metrics['original_width'],20)
-            self.assertIsNotNone(metrics['region_crop_time_ms'])
-            image.close()
-
-    def test_layout_path_mismatch_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_jsonl(root/'layout.jsonl',[dict(images=['different'],layout_result=[])])
-            with self.assertRaisesRegex(ValueError,'exactly'):
-                prepare_regions([dict(images=['page'],sample_id='a')],root/'layout.jsonl',root)
-
-    def test_merge_uses_official_page_name_and_preserves_failed_regions(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            data = dataset(root,1)
-            out = root/'out'
-            pages = prepare_pages(data,out,expected_pages=1)
-            layout = [dict(index=0,label='text',task_type='text',bbox_2d=[0,0,500,1000]),
-                      dict(index=1,label='text',task_type='text',bbox_2d=[500,0,1000,1000])]
-            write_jsonl(root/'layout.jsonl',[dict(images=pages[0]['images'],layout_result=layout)])
-            regions,layouts = prepare_regions(pages,root/'layout.jsonl',out)
-            region_out = root/'regions'
-            region_out.mkdir()
-            text = region_out/'a.md'
-            text.write_text('hello')
-            dump_json(region_out/'prediction_mapping.json',[
-                dict(sample_id=regions[0]['sample_id'],success=True,prediction_path=str(text)),
-                dict(sample_id=regions[1]['sample_id'],success=False)])
-            write_jsonl(region_out/'per_sample_metrics.jsonl',[
-                dict(sample_id=r['sample_id'],request_start_s=1,request_end_s=2) for r in regions])
-            rows,mapping = assemble_pages(pages,regions,layouts,region_out,out)
-            self.assertEqual((out/'predictions/0.md').read_text(),'hello')
-            self.assertFalse(rows[0]['success'])
-            self.assertEqual(rows[0]['failed_regions'],1)
-            self.assertTrue(mapping[0]['success'])
-            self.assertFalse(mapping[0]['inference_success'])
 
     def test_real_metric_schema_scales_coverage_and_missing_cdm(self):
         with tempfile.TemporaryDirectory() as directory:

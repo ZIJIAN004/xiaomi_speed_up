@@ -351,8 +351,13 @@ def collect_run(run_dir, small_kernel_us=10):
     quality["missing_metrics"] = [k for k in required_quality if not isinstance(quality.get("metrics", {}).get(k), (int, float))
                                   or isinstance(quality.get("metrics", {}).get(k), bool)
                                   or not math.isfinite(quality["metrics"][k])]
-    quality["expected_samples"] = len(expected)
-    quality["sample_coverage_complete"] = (quality.get("evaluated_samples") == len(expected)
+    # Official OmniDocBench coverage may intentionally exclude input pages with
+    # no applicable page-level target (figure/mask-only or ignored annotations).
+    # Preserve the evaluator denominator instead of replacing it with the raw
+    # manifest count; the latter caused false incomplete results.
+    quality.setdefault("input_page_count", len(expected))
+    quality.setdefault("expected_samples", len(expected))
+    quality["sample_coverage_complete"] = (quality.get("evaluated_samples") == quality.get("expected_samples")
                                            and quality.get("sample_coverage_complete") is not False)
     quality["version_matches_design"] = quality.get("benchmark_version") == "1.5" if dataset == "omnidocbench" else None
     if quality.get("status") == "complete" and (quality["missing_metrics"] or not quality["sample_coverage_complete"]

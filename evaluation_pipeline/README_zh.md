@@ -1,11 +1,6 @@
 # 文档解析任务评测流程
 
-本目录提供 Xiaomi-OCR-0 文档解析任务的两条推理路线：
-
-1. **端到端（e2e）**：整页图片直接推理得到 Markdown。
-2. **两阶段（two-stage）**：先用 PP-DocLayoutV3(PaddleX版) 检测版面区域，再逐个区域识别并组装为页面级 Markdown。
-
-两条路线都使用 OmniDocBench v1.6 的评测代码和相同配置进行评测。我们使用的配置已公开在 [`configs/end2end.yaml`](configs/end2end.yaml)。英文说明见 [README.md](README.md)。
+本目录提供 Xiaomi-OCR-0 的端到端文档解析路径：整页图片直接推理得到页面级 Markdown。正式 benchmark 使用 `benchmark/` 中记录的 OmniDocBench v1.5 官方评分器。英文说明见 [README.md](README.md)。
 
 ## 环境版本
 
@@ -25,7 +20,7 @@
 ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204
 ```
 
-该镜像用于计算评测指标。GPU 推理需要单独准备支持 Qwen3.5 多模态模型的 vLLM 环境，并安装仓库根目录的 `requirements.txt`；两阶段的版面检测还需要兼容的 PaddlePaddle 和 `requirements-paddlex.txt`。具体安装见 [INSTALL.md](../INSTALL.md)。
+GPU 推理需要单独准备模型与 vLLM 环境。具体安装见 [INSTALL.md](../INSTALL.md)。
 
 
 ## 输入数据格式
@@ -50,7 +45,7 @@ mkdir -p "$OUTPUT_DIR"
 
 ## vLLM 推理超参数
 
-端到端和两阶段的主推理使用以下生成参数：
+端到端主推理使用以下生成参数：
 
 | 参数 | 数值 |
 | --- | --- |
@@ -83,50 +78,9 @@ python -m evaluation_pipeline.e2e_img2md \
 
 后处理会将 OTSL 转成最终 Markdown 中的 HTML 表格，评测使用最终的逐页 `.md` 文件。
 
-## 两阶段推理
-
-### 1. 用 PaddleX 生成 layout
-
-使用 [`layout_detect_paddlex.py`](layout_detect_paddlex.py)，通过 **PaddleX 版 PP-DocLayoutV3，阈值 0.25** 生成版面检测结果：
-
-```bash
-LAYOUT_JSONL="$OUTPUT_DIR/layout_paddlex-th0.25.jsonl"
-python -m evaluation_pipeline.layout_detect_paddlex \
-  --input_jsonl "$INPUT_JSONL" \
-  --output_jsonl "$LAYOUT_JSONL" \
-  --gpu_ids "$GPUS" --batch_size 8 --threshold 0.25
-```
-
-首次运行时 PaddleX 会下载 PP-DocLayoutV3；也可以通过 `--model_dir` 指定本地 **PaddleX 格式**权重。
-
-### 2. 分区域识别并组装页面
-
-在 vLLM 环境中运行 [`twostage_img2md.py`](twostage_img2md.py)，通过 `--layout-jsonl` 传入上一阶段生成的文件：
-
-```bash
-python -m evaluation_pipeline.twostage_img2md \
-  --input-jsonl "$INPUT_JSONL" \
-  --layout-jsonl "$LAYOUT_JSONL" \
-  --output_dir "$OUTPUT_DIR/stage2" \
-  --model_path "$MODEL" --served_model_name Xiaomi-OCR-0 \
-  --vlm_gpus "$GPUS" --port 26000 --gpu_mem_util 0.8 --workers 8 \
-  --temperature 0.0 --top_p 0.8 \
-  --presence_penalty 0.0 --repetition_penalty 1.0 \
-  --max_tokens 16384 --request_timeout 600 \
-  --retry-repetitive --retry-presence-penalty 1.5 \
-  --start_server --stop_server
-```
-
-两阶段复现需保持以下设置：
-
-- **复现时传入 PaddleX 生成的 `--layout-jsonl`。** 若改用 `--layout_model_dir`，脚本会通过 HF Transformers 加载 layout 模型，该路径默认阈值为 `0.3`。
-- 输入 JSONL 和 layout JSONL 中的图片路径字符串必须完全一致，脚本按该路径关联检测结果。
-- **每个 PaddleX 阈值都必须独立运行。** 原生后处理使高阈值结果不一定是低阈值结果按 score 过滤后的子集，不能通过离线过滤替代重新生成。比较阈值时使用独立的 layout 文件。
-- 区域表格同样使用 OTSL 提示词，在页面组装时转换为 HTML。评测对象是最终的页面级 Markdown。
-
 ## 评测
 
-复用 Docker 镜像内的 OmniDocBench v1.6 `pdf_validation.py`，配置使用本仓库的 [`configs/end2end.yaml`](configs/end2end.yaml)。该配置包含以下指标：
+正式评测使用 OmniDocBench v1.5 官方 `pdf_validation.py`。该配置包含以下指标：
 
 | 类别 | 指标 |
 | --- | --- |

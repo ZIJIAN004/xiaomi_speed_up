@@ -1,11 +1,8 @@
 # Document Parsing Evaluation Pipeline
 
-This directory provides two inference approaches for document parsing with Xiaomi-OCR-0:
+This directory provides the end-to-end document parsing path with Xiaomi-OCR-0: each whole-page image is converted directly into page-level Markdown. The formal benchmark path uses the official OmniDocBench v1.5 evaluator documented under `benchmark/`.
 
-1. **End-to-end (e2e)**: Convert a whole-page image directly into Markdown.
-2. **Two-stage**: Use PaddleX to detect layout regions, recognize each region, and assemble the results into page-level Markdown.
-
-Both approaches use the OmniDocBench v1.6 evaluation code and the same configuration. Our evaluation configuration is available at [`configs/end2end.yaml`](configs/end2end.yaml). For Chinese instructions, see [README_zh.md](README_zh.md).
+For Chinese instructions, see [README_zh.md](README_zh.md).
 
 ## Environment Versions
 
@@ -25,7 +22,7 @@ The Docker image used for evaluation is:
 ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204
 ```
 
-This image is used to compute evaluation metrics. For GPU inference, prepare a separate vLLM environment with Qwen3.5 multimodal model support and install `requirements.txt` from the repository root. Two-stage layout detection also requires a compatible PaddlePaddle installation and `requirements-paddlex.txt`. See [INSTALL.md](../INSTALL.md) for installation details.
+This image is used to compute evaluation metrics. For GPU inference, prepare a separate vLLM environment with Qwen3.5 multimodal model support and install `requirements.txt` from the repository root. See [INSTALL.md](../INSTALL.md) for installation details.
 
 ## Input Data Format
 
@@ -63,7 +60,7 @@ Primary inference for both approaches uses the following generation parameters:
 
 ## End-to-End Inference
 
-Use [`e2e_img2md.py`](e2e_img2md.py) to generate per-page Markdown:
+Use [`e2e_img2md.py`](e2e_img2md.py) to generate per-page Markdown for the standalone e2e inference utility:
 
 ```bash
 python -m evaluation_pipeline.e2e_img2md \
@@ -79,47 +76,6 @@ python -m evaluation_pipeline.e2e_img2md \
 ```
 
 Postprocessing converts OTSL into HTML tables in the final Markdown. Evaluation uses the final per-page `.md` files.
-
-## Two-Stage Inference
-
-### 1. Generate Layout with PaddleX
-
-Use [`layout_detect_paddlex.py`](layout_detect_paddlex.py) to generate layout detection results with **the PaddleX implementation of PP-DocLayoutV3 at threshold 0.25**:
-
-```bash
-LAYOUT_JSONL="$OUTPUT_DIR/layout_paddlex-th0.25.jsonl"
-python -m evaluation_pipeline.layout_detect_paddlex \
-  --input_jsonl "$INPUT_JSONL" \
-  --output_jsonl "$LAYOUT_JSONL" \
-  --gpu_ids "$GPUS" --batch_size 8 --threshold 0.25
-```
-
-PaddleX downloads PP-DocLayoutV3 on the first run. You can also use `--model_dir` to specify local weights in **PaddleX format**.
-
-### 2. Recognize Regions and Assemble Pages
-
-Run [`twostage_img2md.py`](twostage_img2md.py) in the vLLM environment, passing the file generated in the previous stage through `--layout-jsonl`:
-
-```bash
-python -m evaluation_pipeline.twostage_img2md \
-  --input-jsonl "$INPUT_JSONL" \
-  --layout-jsonl "$LAYOUT_JSONL" \
-  --output_dir "$OUTPUT_DIR/stage2" \
-  --model_path "$MODEL" --served_model_name Xiaomi-OCR-0 \
-  --vlm_gpus "$GPUS" --port 26000 --gpu_mem_util 0.8 --workers 8 \
-  --temperature 0.0 --top_p 0.8 \
-  --presence_penalty 0.0 --repetition_penalty 1.0 \
-  --max_tokens 16384 --request_timeout 600 \
-  --retry-repetitive --retry-presence-penalty 1.5 \
-  --start_server --stop_server
-```
-
-Keep the following settings when reproducing two-stage results:
-
-- **Pass the PaddleX-generated layout through `--layout-jsonl`.** If you use `--layout_model_dir` instead, the script loads the layout model through HF Transformers, with a default threshold of `0.3` for that path.
-- Image path strings in the input JSONL and layout JSONL must match exactly. The script uses these paths to associate detection results.
-- **Run PaddleX independently for each threshold.** Native postprocessing means higher-threshold results are not necessarily a subset obtained by filtering lower-threshold results by score. Offline filtering cannot replace regeneration. Use separate layout files when comparing thresholds.
-- Table regions also use OTSL prompts and are converted to HTML during page assembly. Evaluation uses the final page-level Markdown.
 
 ## Evaluation
 
