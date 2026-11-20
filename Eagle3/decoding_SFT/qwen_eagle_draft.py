@@ -58,7 +58,8 @@ class DraftAttention(nn.Module):
         self.q_norm = Qwen35RMSNorm(head_dim, eps)
         self.k_norm = Qwen35RMSNorm(head_dim, eps)
 
-    def forward(self, x: torch.Tensor, cache: Optional[dict[str, torch.Tensor]] = None):
+    def forward(self, x: torch.Tensor, cache: Optional[list[dict[str, torch.Tensor]]] = None,
+                position_ids: Optional[torch.Tensor] = None):
         bsz, q_len, _ = x.shape
         q_gate = self.q_proj(x).view(bsz, q_len, self.num_heads, 2 * self.head_dim)
         q, gate = q_gate.chunk(2, dim=-1)
@@ -67,27 +68,38 @@ class DraftAttention(nn.Module):
         q = self.q_norm(q).transpose(1, 2)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
-        past_k = cache["k"] if cache is not None else None
-        past_v = cache["v"] if cache is not None else None
-        past_len = 0 if past_k is None else past_k.shape[-2]
-        raw_k = torch.cat([past_k, k], dim=-2) if past_k is not None else k
-        raw_v = torch.cat([past_v, v], dim=-2) if past_v is not None else v
-        k_all = raw_k.repeat_interleave(self.num_groups, dim=1)
-        v_all = raw_v.repeat_interleave(self.num_groups, dim=1)
-        scores = torch.matmul(q, k_all.transpose(-2, -1)) * self.scale
-        causal = torch.triu(
-            torch.ones(q_len, q_len, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        if past_len:
-            mask = torch.cat([torch.zeros(q_len, past_len, device=x.device, dtype=torch.bool), causal], dim=-1)
-        else:
-            mask = causal
-        scores = scores.masked_fill(mask[None, None], torch.finfo(scores.dtype).min)
+        if position_ids is None:
+            position_ids = torch.arange(q_len, device=x.device)
+        position_ids = position_ids.reshape(-1)
+        inv = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim))
+        angles = position_ids[:, None].float() * inv[None, :]
+        cos = angles.cos()[None, None, :, :]
+        sin = angles.sin()[None, None, :, :]
+        def rope(t):
+            even, odd = t[..., ::2], t[..., 1::2]
+            return torch.stack([even * cos + odd * -sin, even * sin + odd * cos], dim=-1).flatten(-2)
+        q = rope(q)
+        k = rope(k)
+        k_current = k.repeat_interleave(self.num_groups, dim=1)
+        v_current = v.repeat_interleave(self.num_groups, dim=1)
+        scores = torch.matmul(q, k_current.transpose(-2, -1)) * self.scale
+        causal = torch.triu(torch.ones(q_len, q_len, device=x.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal[None, None], torch.finfo(scores.dtype).min)
+        values = [v_current]
+        for previous in cache or []:
+            pk = previous["k"].repeat_interleave(self.num_groups, dim=1)
+            pv = previous["v"].repeat_interleave(self.num_groups, dim=1)
+            scores = torch.cat([scores, (q * pk).sum(-1, keepdim=True) * self.scale], dim=-1)
+            values.append(pv)
         probs = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
-        out = torch.matmul(probs, v_all).transpose(1, 2).contiguous()
-        out = out.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        out = torch.matmul(probs[..., :q_len], values[0])
+        offset = q_len
+        for pv in values[1:]:
+            out = out + probs[..., offset:offset + 1] * pv
+            offset += 1
+        out = out.transpose(1, 2).contiguous().reshape(bsz, q_len, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate.reshape(bsz, q_len, -1))
-        return self.o_proj(out), {"k": raw_k, "v": raw_v}
+        return self.o_proj(out), (cache or []) + [{"k": k, "v": v}]
 
 
 class DraftBlock(nn.Module):

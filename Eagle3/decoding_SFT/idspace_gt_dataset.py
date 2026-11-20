@@ -114,6 +114,9 @@ class IDSpaceGroundTruthDataset(Dataset):
         # Keep image_grid_thw as [num_images, 3]. Only tensors with a
         # leading batch dimension are unbatched here; Qwen3.5 expects
         # image_grid_thw to remain rank-2 in get_image_features().
+        # Keep processor tensors unbatched except image_grid_thw, whose
+        # processor batch shape [num_images, 3] is already the model shape.
+        # The training loop adds the batch dimension to the rank-1 tensors.
         encoded = {
             key: (value if key == "image_grid_thw" else value.squeeze(0))
             for key, value in encoded.items()
@@ -129,18 +132,18 @@ class IDSpaceGroundTruthDataset(Dataset):
 
 
 def collate_single(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return batch-size-one tensors with the batch axis restored.
-
-    The processor emits a batch axis for sequence tensors, while
-    ``image_grid_thw`` is already ``[num_images, 3]`` and must remain rank-2
-    for Qwen3.5. The dataset removes the sequence batch axis for convenient
-    sample inspection, so the collator restores it before model.forward().
-    """
+    """Collate one multimodal sample and restore model batch dimensions."""
     if len(batch) != 1:
-        raise NotImplementedError("multimodal padding is pending validation; use batch_size=1")
-    sample = dict(batch[0])
-    for key in ("input_ids", "attention_mask", "mm_token_type_ids", "assistant_mask"):
-        value = sample.get(key)
-        if torch.is_tensor(value) and value.ndim == 1:
-            sample[key] = value.unsqueeze(0)
-    return sample
+        raise NotImplementedError("multimodal collation currently supports batch_size=1 only")
+    sample = batch[0]
+    batched = {}
+    for key, value in sample.items():
+        if not torch.is_tensor(value):
+            batched[key] = value
+        elif key in {"image_grid_thw", "pixel_values"}:
+            # Qwen3.5 processor expects image_grid_thw [num_images, 3] and
+            # pixel_values [num_patches, channels] for a single image.
+            batched[key] = value
+        else:
+            batched[key] = value.unsqueeze(0)
+    return batched
