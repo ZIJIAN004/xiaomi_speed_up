@@ -263,7 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--served-model-name", default="Xiaomi-OCR-0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=16384)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--init-timeout", type=float, default=1200)
     parser.add_argument("--dtype", default="auto")
