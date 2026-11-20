@@ -11,7 +11,7 @@ OMNIDOC_EVAL_IMAGE="${OMNIDOC_EVAL_IMAGE:-sunyuefeng/omnidocbench-env:v1.5}"
 SPEED_UP_PYTHON="${SPEED_UP_PYTHON:-python}"
 OMNIDOC_EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-python}"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/xiaomi-ocr-0/model}"
-GPU_ID="${GPU_ID:-1}"
+GPU_ID="${GPU_ID:-0}"
 [[ -d "$OMNIDOC_ROOT/images" && -f "$OMNIDOC_ROOT/OmniDocBench.json" ]] || { echo "Missing images/ or OmniDocBench.json under $OMNIDOC_ROOT" >&2; exit 2; }
 [[ -f "$OMNIDOC_EVALUATOR_ROOT/pdf_validation.py" ]] || { echo "Missing v1_5 evaluator: $OMNIDOC_EVALUATOR_ROOT/pdf_validation.py (the dataset does not include evaluator code)." >&2; exit 2; }
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || { echo 'GPU_ID must be one physical GPU index.' >&2; exit 2; }

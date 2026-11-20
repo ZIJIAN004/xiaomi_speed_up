@@ -20,7 +20,7 @@ def main(argv=None):
     parser.add_argument('--dataset', required=True, type=Path)
     parser.add_argument('--model', type=Path, default=Path('/home/mr_jiang/models/xiaomi-ocr-0/model'))
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--gpu', default='1')
+    parser.add_argument('--gpu', default='0')
     parser.add_argument('--evaluator-root', type=Path, default=Path(__file__).resolve().parent.parent/'evaluation_pipeline/OmniDocBench')
     parser.add_argument('--eval-python', default=sys.executable)
     parser.add_argument('--eval-backend',choices=('docker','python'),default='docker')
