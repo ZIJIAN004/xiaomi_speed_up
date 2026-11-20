@@ -32,5 +32,5 @@ Default generation settings match the existing IDSpace path:
 temperature=0
 top_p=0.8
 repetition_penalty=1.0
-max_tokens=4096
+max_tokens=None
 ```

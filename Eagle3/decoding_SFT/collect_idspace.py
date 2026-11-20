@@ -263,7 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--served-model-name", default="Xiaomi-OCR-0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=16384)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--init-timeout", type=float, default=1200)
     parser.add_argument("--dtype", default="auto")
@@ -278,8 +278,8 @@ def parse_args() -> argparse.Namespace:
         if not args.gpu.isdecimal():
             parser.error("gpu must be a numeric CUDA index")
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    if args.max_tokens < 1 or args.max_samples < 0 or args.max_model_len < 1:
-        parser.error("max-tokens/max-model-len must be positive; max-samples must be nonnegative")
+    if args.max_tokens is not None and args.max_tokens < 1 or args.max_samples < 0 or args.max_model_len < 1:
+        parser.error("max-tokens must be positive when provided; max-model-len must be positive; max-samples must be nonnegative")
     if not args.model.is_dir() or not (args.model / "config.json").is_file():
         parser.error(f"local model directory/config.json not found: {args.model}")
     return args
