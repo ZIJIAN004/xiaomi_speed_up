@@ -60,9 +60,16 @@ def parse_args() -> argparse.Namespace:
                    default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/train.jsonl"))
     p.add_argument("--image-root", type=Path,
                    default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/images"))
-    p.add_argument("--output", type=Path, default=Path("target_inspection.json"))
+    p.add_argument("--output", type=Path,
+                   default=Path(__file__).resolve().parent / "target_inspection.json")
     p.add_argument("--max-samples", type=int, default=10)
     p.add_argument("--max-model-len", type=int, default=16384)
+    p.add_argument("--low-layer", type=int, default=1,
+                   help="hidden-state index for low-level feature; 0 is embedding output")
+    p.add_argument("--mid-layer", type=int, default=None,
+                   help="hidden-state index for mid-level feature; defaults to middle decoder layer")
+    p.add_argument("--high-layer", type=int, default=-1,
+                   help="hidden-state index for high-level feature; -1 is final hidden state")
     p.add_argument("--trust-remote-code", action="store_true")
     return p.parse_args()
 
@@ -131,7 +138,7 @@ def finite_fraction(value: Any) -> float | None:
 
 
 def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
-                tokenizer: Any, image_root: Path, device: Any) -> dict[str, Any]:
+                tokenizer: Any, image_root: Path, device: Any, args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     started = time.perf_counter()
@@ -209,8 +216,46 @@ def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
         result["logits_finite_fraction"] = finite_fraction(logits)
         if logits.ndim != 3 or logits.shape[1] != len(input_ids):
             raise ValueError("logits sequence length does not match input_ids")
-        if hidden_states is None or len(hidden_states) < 4:
-            raise ValueError("target model did not return enough hidden-state layers")
+        if hidden_states is None or len(hidden_states) < 2:
+            raise ValueError("target model did not return hidden-state layers")
+        if result["full_input_ids_length"] > args.max_model_len:
+            raise ValueError("expanded multimodal sequence exceeds configured max-model-len")
+
+        # Verify the embedding lookup needed by the draft head. This is not a
+        # second model pass: it is the frozen target embedding table queried by
+        # the same teacher-forced input IDs.
+        embedding_layer = model.get_input_embeddings()
+        token_embeddings = embedding_layer(model_inputs["input_ids"])
+        result["token_embeddings_shape"] = tensor_shape(token_embeddings)
+        if token_embeddings.shape[:2] != logits.shape[:2]:
+            raise ValueError("target token embeddings and logits have different [batch, sequence] shapes")
+        result["token_embeddings_finite_fraction"] = finite_fraction(token_embeddings)
+
+        # Select the three feature levels that the future EAGLE fusion layer
+        # will consume. The script validates shape compatibility only; it does
+        # not choose final layers for the model implementation.
+        hidden_count = len(hidden_states)
+        mid_index = args.mid_layer if args.mid_layer is not None else hidden_count // 2
+        selected_indices = [args.low_layer, mid_index, args.high_layer]
+        selected_indices = [index if index >= 0 else hidden_count + index for index in selected_indices]
+        if any(index < 0 or index >= hidden_count for index in selected_indices):
+            raise ValueError(f"selected hidden layer is out of range: {selected_indices}, count={hidden_count}")
+        selected = [hidden_states[index] for index in selected_indices]
+        selected_shapes = [tensor_shape(value) for value in selected]
+        result.update({
+            "selected_feature_layers": selected_indices,
+            "selected_feature_shapes": selected_shapes,
+            "selected_feature_hidden_size": [shape[-1] for shape in selected_shapes],
+        })
+        if any(value.shape != selected[0].shape for value in selected[1:]):
+            raise ValueError("selected low/mid/high hidden states do not have identical shapes")
+        fused_input = torch.cat(selected, dim=-1)
+        result["feature_fusion_input_shape"] = tensor_shape(fused_input)
+        result["feature_fusion_output_shape_if_linear_3H_to_H"] = [
+            fused_input.shape[0], fused_input.shape[1], selected[0].shape[-1]
+        ]
+        if finite_fraction(fused_input) != 1.0:
+            raise ValueError("selected hidden states contain NaN or Inf")
 
         # Causal alignment: logits[:, t] predicts input_ids[t+1]. Only target
         # positions whose target token is in the assistant span are counted.
@@ -221,14 +266,27 @@ def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
         if valid_count == 0:
             raise ValueError("assistant prediction mask is empty after causal shift")
         next_token_accuracy = float((prediction[valid] == next_ids[valid]).float().mean().item())
+
+        # Validate the exact teacher loss operation needed later. This is a
+        # self-teacher numerical check, not a quality score.
+        assistant_logits = logits[0, :-1][valid]
+        teacher_probs = torch.softmax(assistant_logits.float(), dim=-1)
+        teacher_log_probs = torch.log_softmax(assistant_logits.float(), dim=-1)
+        teacher_ce = -(teacher_probs * teacher_log_probs).sum(dim=-1).mean()
+        probability_sum_error = float((teacher_probs.sum(dim=-1) - 1).abs().max().item())
         result.update({
             "causal_logit_positions": int(logits.shape[1] - 1),
             "assistant_prediction_positions": valid_count,
             "assistant_next_token_argmax_accuracy": next_token_accuracy,
             "assistant_mask_shift": "assistant_mask[1:] aligns logits[:, :-1] with input_ids[1:]",
+            "teacher_probability_sum_max_error": probability_sum_error,
+            "teacher_self_cross_entropy": float(teacher_ce.item()),
+            "teacher_loss_finite": bool(torch.isfinite(teacher_ce).item()),
             "status": "ok",
             "failure_stage": None,
         })
+        if probability_sum_error > 1e-4 or not torch.isfinite(teacher_ce):
+            raise ValueError("teacher distribution/loss is numerically invalid")
     except Exception as exc:
         result["failure"] = f"{type(exc).__name__}: {exc}"
     finally:
@@ -266,7 +324,7 @@ def main() -> int:
 
     records = []
     for index, row in enumerate(rows):
-        record = inspect_row(row, index, processor, model, tokenizer, args.image_root, device)
+        record = inspect_row(row, index, processor, model, tokenizer, args.image_root, device, args)
         records.append(record)
         print(json.dumps(record, ensure_ascii=False), flush=True)
 
