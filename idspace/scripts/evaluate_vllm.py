@@ -100,7 +100,7 @@ def main() -> int:
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--representatives", type=int, default=5)
+    parser.add_argument("--representatives", type=int, default=50)
     parser.add_argument("--profile-max-iterations", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=16384)

@@ -127,7 +127,7 @@ log "Starting IDSpace validation"
     --workers 8 \
     --gpu "$GPU_ID" \
     --warmup "${IDSPACE_WARMUP:-5}" \
-    --representatives "${IDSPACE_REPRESENTATIVES:-5}" \
+    --representatives "${IDSPACE_REPRESENTATIVES:-50}" \
     --output-retention all
 ) >"$LOG_ROOT/idspace_validation.log" 2>&1 || idspace_status=$?
 log "IDSpace validation finished with status $idspace_status"
