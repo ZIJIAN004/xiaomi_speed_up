@@ -64,6 +64,10 @@ def make_benchmark_manifest(rows, image_root: Path, output: Path):
             "request_unit": "region",
             "images": [str(image)],
             "relative_path": row["image"],
+            "country": row.get("country"),
+            "modality": row.get("modality"),
+            "template_id": row.get("template_id"),
+            "document_id": row.get("document_id"),
             "prompt": PROMPT,
             "ground_truth_fields": row["target"],
         })
