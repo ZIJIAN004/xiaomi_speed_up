@@ -142,11 +142,15 @@ def first_mismatch(left: list[int], right: list[int]) -> int | None:
     return min(len(left), len(right)) if len(left) != len(right) else None
 
 
-def suffix_start(sequence: list[int], suffix: list[int]) -> int | None:
-    if not suffix or len(suffix) > len(sequence):
-        return None
-    start = len(sequence) - len(suffix)
-    return start if sequence[start:] == suffix else None
+def find_subsequence(sequence: list[int], needle: list[int]) -> list[int]:
+    if not needle or len(needle) > len(sequence):
+        return []
+    matches = []
+    width = len(needle)
+    for start in range(len(sequence) - width + 1):
+        if sequence[start:start + width] == needle:
+            matches.append(start)
+    return matches
 
 
 def finite_fraction(value: Any) -> float | None:
@@ -199,26 +203,32 @@ def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
         user_ids = user_inputs["input_ids"][0].tolist()
         answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
         prefix_mismatch = first_mismatch(user_ids, input_ids)
-        answer_start = suffix_start(input_ids, answer_ids)
+        answer_matches = find_subsequence(input_ids, answer_ids)
         result.update({
             "user_input_ids_length": len(user_ids),
             "full_input_ids_length": len(input_ids),
             "assistant_answer_tokenized_length": len(answer_ids),
             "prefix_mismatch_index": prefix_mismatch,
             "prefix_exact": prefix_mismatch is None and len(user_ids) <= len(input_ids),
-            "assistant_suffix_exact": answer_start is not None,
+            "assistant_answer_match_count": len(answer_matches),
+            "assistant_subsequence_exact": len(answer_matches) == 1,
             "processor_shapes": {key: tensor_shape(value) for key, value in full_inputs.items()},
         })
-        if answer_start is None:
-            raise ValueError("ground-truth assistant answer is not an exact suffix of full conversation")
-
+        if len(answer_matches) != 1:
+            raise ValueError(
+                "ground-truth assistant answer must occur exactly once as a contiguous subsequence "
+                f"(matches={len(answer_matches)})"
+            )
+        answer_start = answer_matches[0]
+        answer_end = answer_start + len(answer_ids)
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
-        assistant_mask[answer_start:] = True
+        assistant_mask[answer_start:answer_end] = True
         result["assistant_token_count"] = int(assistant_mask.sum().item())
         result["assistant_start"] = answer_start
-        result["assistant_end"] = len(input_ids)
-        result["assistant_boundary_tokens"] = len(input_ids) - len(user_ids)
-        result["assistant_boundary_note"] = "assistant loss starts from exact GT answer suffix; chat-template assistant boundary tokens are context"
+        result["assistant_end"] = answer_end
+        result["assistant_boundary_tokens_before"] = answer_start - len(user_ids)
+        result["assistant_boundary_tokens_after"] = len(input_ids) - answer_end
+        result["assistant_boundary_note"] = "loss covers exact GT answer span; chat-template assistant boundary tokens remain context"
 
         model_inputs = {
             key: value.to(device) if hasattr(value, "to") else value
@@ -369,8 +379,8 @@ def main() -> int:
         "status_counts": dict(counts),
         "failure_stage_counts": dict(failure_stages),
         "failure_rate": (len(records) - len(ok)) / len(records),
-        "assistant_suffix_alignment_failure_rate": sum(
-            record.get("assistant_suffix_exact") is False for record in records
+        "assistant_subsequence_alignment_failure_rate": sum(
+            record.get("assistant_subsequence_exact") is False for record in records
         ) / len(records),
         "mean_assistant_tokens_ok": (
             sum(record["assistant_token_count"] for record in ok) / len(ok) if ok else None
