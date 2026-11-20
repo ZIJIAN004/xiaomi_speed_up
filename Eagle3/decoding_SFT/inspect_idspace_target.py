@@ -142,6 +142,13 @@ def first_mismatch(left: list[int], right: list[int]) -> int | None:
     return min(len(left), len(right)) if len(left) != len(right) else None
 
 
+def suffix_start(sequence: list[int], suffix: list[int]) -> int | None:
+    if not suffix or len(suffix) > len(sequence):
+        return None
+    start = len(sequence) - len(suffix)
+    return start if sequence[start:] == suffix else None
+
+
 def finite_fraction(value: Any) -> float | None:
     if not hasattr(value, "isfinite"):
         return None
@@ -190,22 +197,28 @@ def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
         )
         input_ids = full_inputs["input_ids"][0].tolist()
         user_ids = user_inputs["input_ids"][0].tolist()
+        answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
         prefix_mismatch = first_mismatch(user_ids, input_ids)
+        answer_start = suffix_start(input_ids, answer_ids)
         result.update({
             "user_input_ids_length": len(user_ids),
             "full_input_ids_length": len(input_ids),
+            "assistant_answer_tokenized_length": len(answer_ids),
             "prefix_mismatch_index": prefix_mismatch,
             "prefix_exact": prefix_mismatch is None and len(user_ids) <= len(input_ids),
+            "assistant_suffix_exact": answer_start is not None,
             "processor_shapes": {key: tensor_shape(value) for key, value in full_inputs.items()},
         })
-        if prefix_mismatch is not None or len(user_ids) >= len(input_ids):
-            raise ValueError("user-only tokenization is not an exact prefix of full conversation")
+        if answer_start is None:
+            raise ValueError("ground-truth assistant answer is not an exact suffix of full conversation")
 
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
-        assistant_mask[len(user_ids):] = True
+        assistant_mask[answer_start:] = True
         result["assistant_token_count"] = int(assistant_mask.sum().item())
-        result["assistant_start"] = len(user_ids)
+        result["assistant_start"] = answer_start
         result["assistant_end"] = len(input_ids)
+        result["assistant_boundary_tokens"] = len(input_ids) - len(user_ids)
+        result["assistant_boundary_note"] = "assistant loss starts from exact GT answer suffix; chat-template assistant boundary tokens are context"
 
         model_inputs = {
             key: value.to(device) if hasattr(value, "to") else value
@@ -356,8 +369,8 @@ def main() -> int:
         "status_counts": dict(counts),
         "failure_stage_counts": dict(failure_stages),
         "failure_rate": (len(records) - len(ok)) / len(records),
-        "prefix_alignment_failure_rate": sum(
-            record.get("prefix_mismatch_index") is not None for record in records
+        "assistant_suffix_alignment_failure_rate": sum(
+            record.get("assistant_suffix_exact") is False for record in records
         ) / len(records),
         "mean_assistant_tokens_ok": (
             sum(record["assistant_token_count"] for record in ok) / len(ok) if ok else None
