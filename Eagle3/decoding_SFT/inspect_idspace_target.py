@@ -321,8 +321,8 @@ def main() -> int:
         args.model,
         trust_remote_code=args.trust_remote_code,
         torch_dtype="auto",
-        device_map={"": "cuda:0"},
     )
+    model = model.to(device)
     model.eval()
     tokenizer = processor.tokenizer
     rows = load_rows(args.input_jsonl, args.max_samples)
