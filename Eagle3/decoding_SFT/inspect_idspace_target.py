@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-jsonl", type=Path,
                    default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/train.jsonl"))
     p.add_argument("--image-root", type=Path,
-                   default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/images"))
+                   default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared"))
     p.add_argument("--output", type=Path,
                    default=Path(__file__).resolve().parent / "target_inspection.json")
     p.add_argument("--max-samples", type=int, default=10)
@@ -90,11 +90,21 @@ def resolve_image(row: dict[str, Any], image_root: Path) -> Path:
     if not isinstance(value, str):
         raise ValueError("row.image is not a string")
     path = Path(value)
-    path = path if path.is_absolute() else image_root / path
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return path
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [image_root / path]
+        # IDSpace prepared JSONL rows may store either `ALB/...` or
+        # `images/ALB/...`; support both without changing the source JSONL.
+        if path.parts and path.parts[0] == image_root.name:
+            candidates.append(image_root.parent / path)
+        if path.parts and path.parts[0] == "images":
+            candidates.append(image_root.parent / path)
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError("; ".join(str(candidate.resolve()) for candidate in candidates))
 
 
 def load_image(path: Path) -> Image.Image:
