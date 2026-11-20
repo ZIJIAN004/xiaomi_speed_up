@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Standard ground-truth Xiaomi-EAGLE training skeleton.
-
-This implements the official data/loss contract but intentionally stops at the
-validated target-interface boundary. Run only after implementing the pending
-Qwen3.5 multimodal embedding/cache adapter in qwen_eagle_draft.py.
-"""
+"""Train the standard ground-truth Xiaomi-EAGLE draft head (batch size 1)."""
 from __future__ import annotations
 
 import argparse
@@ -29,27 +24,57 @@ def parse_args():
     p.add_argument("--rollout-decay", type=float, default=0.8)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--low-layer", type=int, default=1)
+    p.add_argument("--mid-layer", type=int, default=12)
+    p.add_argument("--high-layer", type=int, default=24)
     p.add_argument("--trust-remote-code", action="store_true")
     return p.parse_args()
 
 
-def freeze_target(model):
+def freeze(model):
     model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+    for p in model.parameters():
+        p.requires_grad_(False)
 
 
-def standard_distillation_loss(target_logits, draft_logits, assistant_mask):
-    """Full-vocabulary soft CE; mask only assistant next-token positions."""
-    target_probs = torch.softmax(target_logits.float().detach(), dim=-1)
-    draft_log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
-    token_loss = -(target_probs * draft_log_probs).sum(dim=-1)
-    mask = assistant_mask.to(device=token_loss.device, dtype=token_loss.dtype)
-    # Causal alignment: logits[t] predicts input_ids[t+1].
+def build_multimodal_embeddings(target, batch):
+    """Reproduce Xiaomi's text lookup + visual masked_scatter path."""
+    base = target.model
+    input_ids = batch["input_ids"]
+    embeds = base.get_input_embeddings()(input_ids)
+    if "pixel_values" not in batch:
+        return embeds
+    image_out = base.get_image_features(
+        batch["pixel_values"], batch.get("image_grid_thw"), return_dict=True
+    )
+    image_embeds = torch.cat(image_out.pooler_output, dim=0).to(embeds.device, embeds.dtype)
+    image_mask, _ = base.get_placeholder_mask(
+        input_ids, inputs_embeds=embeds, image_features=image_embeds
+    )
+    return embeds.masked_scatter(image_mask, image_embeds)
+
+
+def shift_text_embeddings(embeddings, input_ids, mm_token_type_ids):
+    """Official left shift for text positions while preserving visual positions."""
+    shifted = embeddings.clone()
+    if mm_token_type_ids is None:
+        return torch.cat([embeddings[:, 1:], embeddings[:, -1:]], dim=1)
+    for b in range(embeddings.shape[0]):
+        text = (mm_token_type_ids[b] == 0).nonzero(as_tuple=False).flatten()
+        if text.numel() > 1:
+            shifted[b, text[:-1]] = embeddings[b, text[1:]]
+            shifted[b, text[-1]] = embeddings[b, text[-1]]
+    return shifted
+
+
+def distill_loss(target_logits, draft_logits, mask):
+    teacher = torch.softmax(target_logits.float().detach(), dim=-1)
+    student = torch.log_softmax(draft_logits.float(), dim=-1)
+    token_loss = -(teacher * student).sum(dim=-1)
+    mask = mask.to(token_loss.device, token_loss.dtype)
     mask = mask[..., 1:]
     token_loss = token_loss[..., :-1]
-    denominator = mask.sum().clamp_min(1.0)
-    return (token_loss * mask).sum() / denominator
+    return (token_loss * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def main():
@@ -57,33 +82,57 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda:0")
-
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    processor_path = args.processor or args.model
-    processor = AutoProcessor.from_pretrained(
-        processor_path, trust_remote_code=args.trust_remote_code
-    )
+    processor = AutoProcessor.from_pretrained(args.processor or args.model, trust_remote_code=args.trust_remote_code)
     target = AutoModelForImageTextToText.from_pretrained(
         args.model, trust_remote_code=args.trust_remote_code, torch_dtype="auto"
     ).to(device)
-    freeze_target(target)
-
-    hidden_size = target.config.text_config.hidden_size if hasattr(target.config, "text_config") else target.config.hidden_size
-    vocab_size = target.config.text_config.vocab_size if hasattr(target.config, "text_config") else target.config.vocab_size
-    intermediate_size = target.config.text_config.intermediate_size if hasattr(target.config, "text_config") else target.config.intermediate_size
+    freeze(target)
+    text_config = getattr(target.config, "text_config", target.config)
+    hidden = text_config.hidden_size
+    vocab = text_config.vocab_size
+    intermediate = text_config.intermediate_size
+    heads = text_config.num_attention_heads
+    kv_heads = text_config.num_key_value_heads
+    head_dim = getattr(text_config, "head_dim", hidden // heads)
+    eps = text_config.rms_norm_eps
 
     dataset = IDSpaceGroundTruthDataset(args.train_jsonl, args.image_root, processor, args.max_samples)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_single)
-    draft = XiaomiEagleDraft(hidden_size, vocab_size, intermediate_size).to(device)
+    draft = XiaomiEagleDraft(
+        hidden, vocab, intermediate, heads, kv_heads, head_dim, eps,
+        args.low_layer, args.mid_layer, args.high_layer, args.rollout_steps,
+    ).to(device, dtype=next(target.parameters()).dtype)
     optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # The target multimodal embedding/feature-to-draft-cache adapter is not
-    # guessed here. It must be implemented and validated before training.
-    raise NotImplementedError(
-        "Pending: build target multimodal embeddings, initialize draft cache, "
-        "and run full-sequence 7-step rollout with validated Qwen3.5 adapter"
-    )
+    for epoch in range(args.epochs):
+        draft.train()
+        for step, raw in enumerate(loader):
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                target_out = target(**{k: v for k, v in batch.items() if k not in {"assistant_mask", "sample_index", "target", "image_path"}},
+                                    output_hidden_states=True, return_dict=True, use_cache=False)
+                multimodal_embeds = build_multimodal_embeddings(target, batch)
+                feature = draft.initial_feature(target_out.hidden_states)
+                target_logits = target_out.logits
+            total = torch.zeros((), device=device, dtype=torch.float32)
+            current_embeds = multimodal_embeds
+            cache = None
+            for rollout in range(args.rollout_steps):
+                feature, draft_logits, cache = draft.step(feature, current_embeds, cache)
+                total = total + (args.rollout_decay ** rollout) * distill_loss(
+                    target_logits, draft_logits, batch["assistant_mask"]
+                )
+                current_embeds = shift_text_embeddings(
+                    current_embeds, batch["input_ids"], batch.get("mm_token_type_ids")
+                )
+            total.backward()
+            optimizer.step()
+            print(f"epoch={epoch} step={step} loss={total.item():.6f}", flush=True)
+        torch.save({"draft": draft.state_dict(), "args": vars(args)}, args.output_dir / f"epoch_{epoch}.pt")
 
 
 if __name__ == "__main__":
