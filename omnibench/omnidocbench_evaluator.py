@@ -7,8 +7,8 @@ import shutil
 import subprocess
 
 from benchmark.metrics import dump_json
-from benchmark.omnidocbench_quality import normalize_scores
-from benchmark.evaluation_runtime import docker_command
+from omnibench.omnidocbench_quality import normalize_scores
+from omnibench.evaluation_runtime import docker_command
 
 
 def evaluate(root, python, gt, predictions, pages, output, provenance, runtime=None):

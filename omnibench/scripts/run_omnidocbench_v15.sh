@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT_DIR"
 # Repository-relative defaults; environment variables can override them.
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$ROOT_DIR/benchmark/data}"
@@ -35,4 +35,4 @@ ARGS=(--dataset "$OMNIDOC_ROOT" --model "$MODEL_PATH" --output "$RESULT_ROOT" --
 [[ -z "${DCGM_URL:-}" ]] || ARGS+=(--dcgm-url "$DCGM_URL")
 [[ "${RETRY_REPETITIVE:-1}" != 1 ]] || ARGS+=(--retry-repetitive)
 echo 'OmniDocBench 1.5: offline whole pages(workers=8; no PaddleX) -> page evaluation'
-"$SPEED_UP_PYTHON" -m benchmark.run_omnidocbench_v15 "${ARGS[@]}" 2>&1 | tee "${RESULT_ROOT}.log"
+"$SPEED_UP_PYTHON" -m omnibench.run_omnidocbench_v15 "${ARGS[@]}" 2>&1 | tee "${RESULT_ROOT}.log"

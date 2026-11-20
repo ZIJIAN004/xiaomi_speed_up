@@ -10,9 +10,9 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 from benchmark.metrics import dump_json, load_jsonl
-from benchmark.omnidocbench_v15 import prepare_pages, write_jsonl
-from benchmark.omnidocbench_quality import normalize_scores, verify_evaluator, SCORES
-from benchmark.omnidocbench_evaluator import evaluate, retain_evaluator_scores
+from omnibench.omnidocbench_v15 import prepare_pages, write_jsonl
+from omnibench.omnidocbench_quality import normalize_scores, verify_evaluator, SCORES
+from omnibench.omnidocbench_evaluator import evaluate, retain_evaluator_scores
 
 
 def dataset(root, count=2):
@@ -48,14 +48,14 @@ class OmniDocBenchTests(unittest.TestCase):
             self.skipTest('bash unavailable')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root/'scripts').mkdir()
-            shutil.copy2(Path(__file__).resolve().parent.parent/'scripts/run_omnidocbench_v15.sh',root/'scripts/run_omnidocbench_v15.sh')
+            (root/'omnibench/scripts').mkdir(parents=True)
+            shutil.copy2(Path(__file__).resolve().parent.parent/'omnibench/scripts/run_omnidocbench_v15.sh',root/'omnibench/scripts/run_omnidocbench_v15.sh')
             (root/'benchmark/data/images').mkdir(parents=True)
             (root/'benchmark/data/OmniDocBench.json').write_text('[]')
             env = dict(os.environ)
             env.pop('OMNIDOC_ROOT',None)
             env.pop('OMNIDOC_EVALUATOR_ROOT',None)
-            result = subprocess.run([bash,'scripts/run_omnidocbench_v15.sh'],cwd=root,env=env,capture_output=True,text=True)
+            result = subprocess.run([bash,'omnibench/scripts/run_omnidocbench_v15.sh'],cwd=root,env=env,capture_output=True,text=True)
             self.assertEqual(result.returncode,2,result.stderr)
             self.assertIn('Missing v1_5 evaluator:',result.stderr)
             self.assertIn('evaluation_pipeline/OmniDocBench/pdf_validation.py',result.stderr)
@@ -121,12 +121,12 @@ class OmniDocBenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/'pdf_validation.py').write_text('# mock')
-            with patch('benchmark.omnidocbench_quality.subprocess.check_output',side_effect=['abc','abc','abc','']):
+            with patch('omnibench.omnidocbench_quality.subprocess.check_output',side_effect=['abc','abc','abc','']):
                 self.assertEqual(verify_evaluator(root)['commit'],'abc')
-            with patch('benchmark.omnidocbench_quality.subprocess.check_output',side_effect=['new','old','old']):
+            with patch('omnibench.omnidocbench_quality.subprocess.check_output',side_effect=['new','old','old']):
                 with self.assertRaisesRegex(ValueError,'v1_5'):
                     verify_evaluator(root)
-            with patch('benchmark.omnidocbench_quality.subprocess.check_output',side_effect=['abc','abc','abc',' M metrics.py']):
+            with patch('omnibench.omnidocbench_quality.subprocess.check_output',side_effect=['abc','abc','abc',' M metrics.py']):
                 with self.assertRaisesRegex(ValueError,'differ'):
                     verify_evaluator(root)
 
@@ -148,7 +148,7 @@ class OmniDocBenchTests(unittest.TestCase):
                 evaluation_evidence(work,pages)
                 self.assertEqual(command[0],'eval-python')
                 self.assertTrue(any(str(value).endswith('pdf_validation.py') for value in command))
-            with patch('pathlib.Path.symlink_to'), patch('benchmark.omnidocbench_evaluator.subprocess.run',side_effect=run):
+            with patch('pathlib.Path.symlink_to'), patch('omnibench.omnidocbench_evaluator.subprocess.run',side_effect=run):
                 quality = evaluate(evaluator,'eval-python',root/'gt.json',predictions,pages,output,{})
             config = json.loads((output/'evaluator_config.json').read_text())
             self.assertEqual(config['end2end_eval']['metrics']['display_formula']['metric'],['Edit_dist','CDM'])
@@ -183,7 +183,7 @@ class OmniDocBenchPipelineTests(unittest.TestCase):
         self.run_pipeline(failure=True)
 
     def run_pipeline(self, failure=False):
-        from benchmark.run_omnidocbench_v15 import main
+        from omnibench.run_omnidocbench_v15 import main
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = dataset(root,6)
@@ -217,7 +217,7 @@ class OmniDocBenchPipelineTests(unittest.TestCase):
                 quality = normalize_scores(metric_result(),predictions,pages,destination/'evaluator_work',provenance)
                 dump_json(destination/'quality.json',quality)
                 return quality
-            with patch('benchmark.run_omnidocbench_v15.preflight',return_value={'backend':'docker','image_id':'sha256:mock','preflight':{'status':'passed'}}), patch('benchmark.run_omnidocbench_v15.verify_evaluator',return_value={'branch':'v1_5','commit':'mock'}), patch('benchmark.run_omnidocbench_v15.prepare_pages',side_effect=lambda d,o:prepare_pages(d,o,expected_pages=6)), patch('benchmark.offline_backend.OfflineBackend',return_value=context) as constructor, patch('benchmark.offline_backend._ACTIVE',backend), patch('benchmark.run_benchmark.Monitor',return_value=monitor_context), patch('benchmark.run_benchmark.environment',return_value={}), patch('benchmark.run_omnidocbench_v15.evaluate',side_effect=evaluator), patch('urllib.request.build_opener',side_effect=AssertionError('HTTP forbidden')):
+            with patch('omnibench.run_omnidocbench_v15.preflight',return_value={'backend':'docker','image_id':'sha256:mock','preflight':{'status':'passed'}}), patch('omnibench.run_omnidocbench_v15.verify_evaluator',return_value={'branch':'v1_5','commit':'mock'}), patch('omnibench.run_omnidocbench_v15.prepare_pages',side_effect=lambda d,o:prepare_pages(d,o,expected_pages=6)), patch('benchmark.offline_backend.OfflineBackend',return_value=context) as constructor, patch('benchmark.offline_backend._ACTIVE',backend), patch('benchmark.run_benchmark.Monitor',return_value=monitor_context), patch('benchmark.run_benchmark.environment',return_value={}), patch('omnibench.run_omnidocbench_v15.evaluate',side_effect=evaluator), patch('urllib.request.build_opener',side_effect=AssertionError('HTTP forbidden')):
                 from contextlib import nullcontext
                 with self.assertRaisesRegex(RuntimeError,'quality evaluation') if failure else nullcontext():
                     main(['--dataset',str(data),'--model',str(model),'--output',str(output),

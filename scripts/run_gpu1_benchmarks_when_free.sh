@@ -111,14 +111,14 @@ log "Starting OmniDocBench v1.5"
   OMNIDOC_EVAL_BACKEND="python" \
   OMNIDOC_EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-/home/mr_jiang/miniforge3/envs/omnidocbench_v15/bin/python}" \
   OUTPUT_RETENTION="${OUTPUT_RETENTION:-all}" \
-  bash scripts/run_omnidocbench_v15.sh
+  bash omnibench/scripts/run_omnidocbench_v15.sh
 ) >"$LOG_ROOT/omnidocbench.log" 2>&1 || omni_status=$?
 log "OmniDocBench finished with status $omni_status; continuing regardless"
 
 log "Starting IDSpace validation"
 (
   cd "$PROJECT_ROOT" || exit 1
-  "$SPEED_UP_PYTHON" scripts/idspace/evaluate_vllm.py \
+  "$SPEED_UP_PYTHON" idspace/scripts/evaluate_vllm.py \
     --input-jsonl "$IDSPACE_JSONL" \
     --image-root "$IDSPACE_IMAGE_ROOT" \
     --model "$MODEL_PATH" \

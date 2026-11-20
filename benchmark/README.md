@@ -342,7 +342,7 @@ OUTPUT_RETENTION=all \
 
 ## OmniDocBench v1.5 端到端入口
 
-运行 scripts/run_omnidocbench_v15.sh。完整页面直接进入 Xiaomi-OCR-0，不调用 PaddleX、版面检测、区域裁剪或区域合并，不需要 PP-DocLayoutV3 权重。一个主请求对应一页，单个离线 AsyncLLM、TP/PP/DP=1，最多8个页面请求在途。不是固定GPU batch=8，也不启动HTTP服务。
+运行 omnibench/scripts/run_omnidocbench_v15.sh。完整页面直接进入 Xiaomi-OCR-0，不调用 PaddleX、版面检测、区域裁剪或区域合并，不需要 PP-DocLayoutV3 权重。一个主请求对应一页，单个离线 AsyncLLM、TP/PP/DP=1，最多8个页面请求在途。不是固定GPU batch=8，也不启动HTTP服务。
 
 默认数据为仓库下 benchmark/data（远程对应 /home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/data），包含 OmniDocBench.json 与 images/。保留现有v1.5数据，程序从GT生成页面清单，定量核对1355条GT、图片覆盖、缺失/额外/重复文件。输入文件不修改、不重新下载、不把GT文本送给模型。
 
@@ -350,10 +350,10 @@ OUTPUT_RETENTION=all \
 
 ```bash
 # 已准备好v1_5评分代码与依赖、以及支持模型的vLLM环境后执行
-bash scripts/run_omnidocbench_v15.sh
+bash omnibench/scripts/run_omnidocbench_v15.sh
 
 # 可选：不用Docker，使用已经配置好的独立Python评分环境
-OMNIDOC_EVAL_BACKEND=python OMNIDOC_EVAL_PYTHON=/absolute/path/to/eval-env/bin/python bash scripts/run_omnidocbench_v15.sh
+OMNIDOC_EVAL_BACKEND=python OMNIDOC_EVAL_PYTHON=/absolute/path/to/eval-env/bin/python bash omnibench/scripts/run_omnidocbench_v15.sh
 ```
 
 默认OMNIDOC_EVAL_BACKEND=docker，使用v1_5官方推荐镜像sunyuefeng/omnidocbench-env:v1.5提供依赖。镜像需提前准备，入口不自动pull。代码与标注/预测只读挂载，结果写回evaluator_work/result；执行的是本地v1_5源码，不是镜像内其他版本。记录源码commit、实际镜像ID和执行命令（evaluator_invocation.json），按该镜像ID运行。评分容器不使用GPU或网络，Linux下以当前UID/GID写输出。小米当前文档的v1.6镜像不作为v1.5环境使用。

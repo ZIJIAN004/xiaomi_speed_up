@@ -100,7 +100,7 @@ export GPU_ID=1
 bash scripts/test_omnidocbench_python.sh
 
 # 正式端到端评测：整页推理，不使用 PaddleX
-bash scripts/run_omnidocbench_v15.sh
+bash omnibench/scripts/run_omnidocbench_v15.sh
 ```
 
 自检必须先输出：
@@ -213,7 +213,7 @@ REPRESENTATIVES=5 \
 PROFILE_MAX_ITERATIONS=64 \
 OMNIDOC_EVAL_BACKEND=python \
 OMNIDOC_EVAL_PYTHON=/home/mr_jiang/miniforge3/envs/omnidocbench_v15/bin/python \
-bash scripts/run_omnidocbench_v15.sh
+bash omnibench/scripts/run_omnidocbench_v15.sh
 ```
 
 不要把 runtime smoke 的 `max_tokens=32` 配置带入正式评测。正式入口未显式设置 `MAX_TOKENS` 时，使用当前正式脚本的剩余上下文策略。

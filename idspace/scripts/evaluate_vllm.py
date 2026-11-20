@@ -9,7 +9,6 @@ import shutil
 from pathlib import Path
 
 from benchmark.metrics import dump_json
-from benchmark.omnidocbench_v15 import write_jsonl
 from benchmark.run_benchmark import main as run_benchmark, parse_args as parse_benchmark_args
 
 PROMPT = """Extract identity information from this ID card.
@@ -37,6 +36,13 @@ Required fields:
   \"expiry_date\": null,
   \"place_of_issue\": null
 }"""
+
+
+def write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def load_rows(manifest: Path, split: str, max_samples: int):

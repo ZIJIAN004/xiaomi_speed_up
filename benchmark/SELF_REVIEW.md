@@ -132,7 +132,7 @@
 
 ## OmniDocBench v1.5 两阶段启动入口自审（2026-11-18）
 
-- 读取ANALYSIS_FLOW.md并核对Xiaomi公开evaluation_pipeline/README；确认官方当前使用v1.6，不能把原整页offline入口冒充两阶段。本轮新增scripts/run_omnidocbench_v15.sh和专用编排，数据地址留空，模型默认/home/mr_jiang/models/xiaomi-ocr-0/model，GPU 1，layout batch8/threshold.25，VLM offline workers8。
+- 读取ANALYSIS_FLOW.md并核对Xiaomi公开evaluation_pipeline/README；确认官方当前使用v1.6，不能把原整页offline入口冒充两阶段。本轮新增omnibench/scripts/run_omnidocbench_v15.sh和专用编排，数据地址留空，模型默认/home/mr_jiang/models/xiaomi-ocr-0/model，GPU 1，layout batch8/threshold.25，VLM offline workers8。
 - 版本依据为opendatalab/OmniDocBench的实际v1_5分支pdf_validation.py、task/end2end_run_eval.py、metrics/cal_metric.py和README。脚本只调用用户已有的干净v1_5评价器，核对HEAD/ref并记录commit；不安装、下载或切换评价器，不使用v1.6配置。v1_5默认CDM worker数与新版README不同，不冒称强制16。
 - GT驱动检查1355条页面、GT重复名、图片缺失/多余、stem唯一性；Python定量报告计数/覆盖率。PaddleX在独立子进程结束后再加载VLM，单卡可见性映射为物理1→逻辑0。版本字段写根目录config/environment/quality。
 - 区域crop复用官方helper，在原分辨率页上裁剪后限长边2048，不写裁剪文件；text/table/formula prompt逐区域传入原生模板、Processor audit与实际离线请求，避免沿用整页prompt。enable_thinking=False、tokenize=False、引擎add_special_tokens=False不变；padding_side仍实际记录；MAX_MODEL_LEN16384不改，MAX_TOKENS为空仍用剩余上下文，不自动设16k输出cap。

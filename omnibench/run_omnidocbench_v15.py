@@ -7,11 +7,11 @@ import sys
 import time
 
 from benchmark.metrics import dump_json, load_jsonl, ratio
-from benchmark.omnidocbench_v15 import prepare_pages, write_jsonl
-from benchmark.omnidocbench_quality import verify_evaluator
-from benchmark.omnidocbench_evaluator import evaluate, retain_evaluator_scores
+from omnibench.omnidocbench_v15 import prepare_pages, write_jsonl
+from omnibench.omnidocbench_quality import verify_evaluator
+from omnibench.omnidocbench_evaluator import evaluate, retain_evaluator_scores
 from benchmark.output_storage import retain_outputs
-from benchmark.evaluation_runtime import preflight, DEFAULT_IMAGE
+from omnibench.evaluation_runtime import preflight, DEFAULT_IMAGE
 from benchmark.run_benchmark import main as run_pages, parse_args as parse_page_args
 
 
