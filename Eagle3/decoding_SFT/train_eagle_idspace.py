@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 from pathlib import Path
@@ -16,11 +17,13 @@ from qwen_eagle_draft import XiaomiEagleDraft
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=Path, required=True)
+    p.add_argument("--model", type=Path, default=None)
     p.add_argument("--processor", type=Path, default=None)
-    p.add_argument("--train-jsonl", type=Path, required=True)
-    p.add_argument("--image-root", type=Path, required=True)
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--train-jsonl", type=Path, default=None)
+    p.add_argument("--image-root", type=Path, default=None)
+    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--toy", action="store_true", help="run a tiny synthetic forward/backward test without loading Xiaomi")
+    p.add_argument("--toy-device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--rollout-steps", type=int, default=7)
     p.add_argument("--rollout-decay", type=float, default=0.8)
@@ -98,8 +101,57 @@ def update_topk_active(target_logits, draft_logits, assistant_mask, active, top_
     return active & (~valid | reliable)
 
 
+def run_toy(args):
+    device = torch.device(args.toy_device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--toy-device cuda requested but CUDA is unavailable")
+    torch.manual_seed(7)
+    hidden, vocab, intermediate = 32, 128, 64
+    draft = XiaomiEagleDraft(
+        hidden, vocab, intermediate, 4, 2, 8, 1e-6,
+        low_layer=1, mid_layer=3, high_layer=5, rollout_steps=3,
+    ).to(device)
+    optimizer = torch.optim.AdamW(draft.parameters(), lr=1e-3)
+    batch, seq = 1, 8
+    hidden_states = tuple(torch.randn(batch, seq, hidden, device=device) for _ in range(6))
+    feature = draft.initial_feature(hidden_states)
+    embeddings = torch.randn(batch, seq, hidden, device=device)
+    target_logits = torch.randn(batch, seq, vocab, device=device)
+    assistant_mask = torch.zeros(batch, seq, dtype=torch.bool, device=device)
+    assistant_mask[:, 3:] = True
+    active = torch.ones(batch, seq - 1, dtype=torch.bool, device=device)
+    cache = None
+    total = torch.zeros((), device=device)
+    for step in range(3):
+        feature, draft_logits, cache = draft.step(feature, embeddings, cache)
+        total = total + (0.8 ** step) * distill_loss(
+            target_logits, draft_logits, assistant_mask, active
+        )
+        active = update_topk_active(target_logits, draft_logits, assistant_mask, active, args.top_k)
+    optimizer.zero_grad(set_to_none=True)
+    total.backward()
+    grad_params = [name for name, p in draft.named_parameters() if p.grad is not None and torch.isfinite(p.grad).all()]
+    if len(grad_params) != len(list(draft.named_parameters())):
+        raise RuntimeError("toy backward did not produce finite gradients for every draft parameter")
+    optimizer.step()
+    print(json.dumps({
+        "status": "ok", "device": str(device), "loss": float(total.item()),
+        "feature_shape": list(feature.shape), "draft_logits_shape": list(draft_logits.shape),
+        "cache_rollouts": len(cache), "active_positions": int(active.sum()),
+        "draft_parameters_with_finite_grad": len(grad_params),
+        "top_k": args.top_k,
+    }, ensure_ascii=False))
+
+
 def main():
     args = parse_args()
+    if args.toy:
+        run_toy(args)
+        return
+    required = {"model": args.model, "train_jsonl": args.train_jsonl, "image_root": args.image_root, "output_dir": args.output_dir}
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError("missing required training arguments: " + ", ".join("--" + name.replace("_", "-") for name in missing))
     if not args.model.is_dir():
         raise FileNotFoundError(args.model)
     if not args.train_jsonl.is_file():
