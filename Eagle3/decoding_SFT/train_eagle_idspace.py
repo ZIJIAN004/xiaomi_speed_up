@@ -14,11 +14,11 @@ from qwen_eagle_draft import XiaomiEagleDraft
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=Path, default=Path("/home/mr_jiang/models/xiaomi-ocr-0/model"))
+    p.add_argument("--model", type=Path, required=True)
     p.add_argument("--processor", type=Path, default=None)
-    p.add_argument("--train-jsonl", type=Path, default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/train.jsonl"))
-    p.add_argument("--image-root", type=Path, default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared"))
-    p.add_argument("--output-dir", type=Path, default=Path("Eagle3/decoding_SFT/checkpoints"))
+    p.add_argument("--train-jsonl", type=Path, required=True)
+    p.add_argument("--image-root", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--rollout-steps", type=int, default=7)
     p.add_argument("--rollout-decay", type=float, default=0.8)
@@ -94,6 +94,12 @@ def update_topk_active(target_logits, draft_logits, assistant_mask, active, top_
 
 def main():
     args = parse_args()
+    if not args.model.is_dir():
+        raise FileNotFoundError(args.model)
+    if not args.train_jsonl.is_file():
+        raise FileNotFoundError(args.train_jsonl)
+    if not args.image_root.is_dir():
+        raise FileNotFoundError(args.image_root)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if args.top_k < 0:

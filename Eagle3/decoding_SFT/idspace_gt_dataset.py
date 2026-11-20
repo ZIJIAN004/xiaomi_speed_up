@@ -111,7 +111,14 @@ class IDSpaceGroundTruthDataset(Dataset):
 
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
         assistant_mask[answer_start:answer_end] = True
-        encoded = {key: value.squeeze(0) for key, value in encoded.items() if torch.is_tensor(value)}
+        # Keep image_grid_thw as [num_images, 3]. Only tensors with a
+        # leading batch dimension are unbatched here; Qwen3.5 expects
+        # image_grid_thw to remain rank-2 in get_image_features().
+        encoded = {
+            key: (value if key == "image_grid_thw" else value.squeeze(0))
+            for key, value in encoded.items()
+            if torch.is_tensor(value)
+        }
         encoded.update({
             "assistant_mask": assistant_mask,
             "sample_index": index,
