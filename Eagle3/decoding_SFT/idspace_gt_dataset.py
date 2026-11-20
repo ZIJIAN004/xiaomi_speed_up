@@ -129,11 +129,18 @@ class IDSpaceGroundTruthDataset(Dataset):
 
 
 def collate_single(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Initial implementation is intentionally batch-size one.
+    """Return batch-size-one tensors with the batch axis restored.
 
-    Multimodal padding and image-grid collation must be validated against the
-    Xiaomi processor before supporting batch > 1.
+    The processor emits a batch axis for sequence tensors, while
+    ``image_grid_thw`` is already ``[num_images, 3]`` and must remain rank-2
+    for Qwen3.5. The dataset removes the sequence batch axis for convenient
+    sample inspection, so the collator restores it before model.forward().
     """
     if len(batch) != 1:
-        raise NotImplementedError("multimodal batch collation is pending validation; use batch_size=1")
-    return batch[0]
+        raise NotImplementedError("multimodal padding is pending validation; use batch_size=1")
+    sample = dict(batch[0])
+    for key in ("input_ids", "attention_mask", "mm_token_type_ids", "assistant_mask"):
+        value = sample.get(key)
+        if torch.is_tensor(value) and value.ndim == 1:
+            sample[key] = value.unsqueeze(0)
+    return sample
