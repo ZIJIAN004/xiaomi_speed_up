@@ -11,6 +11,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -107,7 +108,8 @@ class DraftBlock(nn.Module):
         x, cache = self.attn(x, cache)
         x = residual + x
         residual = x
-        x = self.down_proj(torch.silu(self.gate_proj(self.post_norm(x))) * self.up_proj(self.post_norm(x)))
+        normalized = self.post_norm(x)
+        x = self.down_proj(F.silu(self.gate_proj(normalized)) * self.up_proj(normalized))
         return residual + x, cache
 
 

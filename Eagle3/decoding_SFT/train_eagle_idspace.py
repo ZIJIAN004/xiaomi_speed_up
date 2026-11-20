@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from pathlib import Path
 
 import torch
@@ -32,6 +34,10 @@ def parse_args():
         help="enable cumulative target top-k loss gate; bare flag uses k=3",
     )
     p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--wandb-project", default="xiaomi-eagle-idspace")
+    p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
+    p.add_argument("--wandb-log-every", type=int, default=1)
     return p.parse_args()
 
 
@@ -130,6 +136,31 @@ def main():
     optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    wandb = None
+    if args.wandb_mode != "disabled":
+        try:
+            import wandb as _wandb
+        except ImportError as exc:
+            raise RuntimeError("wandb is required; install it in the active environment or use --wandb-mode disabled") from exc
+        wandb = _wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            mode=args.wandb_mode,
+            config={
+                "model": str(args.model), "train_jsonl": str(args.train_jsonl),
+                "max_samples": args.max_samples, "epochs": args.epochs,
+                "rollout_steps": args.rollout_steps, "rollout_decay": args.rollout_decay,
+                "learning_rate": args.learning_rate, "low_layer": args.low_layer,
+                "mid_layer": args.mid_layer, "high_layer": args.high_layer,
+                "top_k": args.top_k, "hidden_size": hidden, "vocab_size": vocab,
+                "device": str(device), "dataset_size": len(dataset),
+            },
+        )
+
+    total_steps = args.epochs * len(loader)
+    global_step = 0
+    run_started = time.perf_counter()
     for epoch in range(args.epochs):
         draft.train()
         for step, raw in enumerate(loader):
@@ -162,9 +193,48 @@ def main():
                     current_embeds, batch["input_ids"], batch.get("mm_token_type_ids")
                 )
             total.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=1.0)
             optimizer.step()
-            print(f"epoch={epoch} step={step} loss={total.item():.6f}", flush=True)
+            global_step += 1
+            elapsed = time.perf_counter() - run_started
+            steps_per_sec = global_step / max(elapsed, 1e-9)
+            remaining_steps = max(total_steps - global_step, 0)
+            eta_sec = remaining_steps / max(steps_per_sec, 1e-9)
+            assistant_tokens = int(batch["assistant_mask"].sum().item())
+            active_positions = int(active.sum().item())
+            metrics = {
+                "train/loss": float(total.item()),
+                "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "train/grad_norm": float(grad_norm),
+                "train/epoch": epoch,
+                "train/step": step,
+                "train/global_step": global_step,
+                "train/rollout_steps": args.rollout_steps,
+                "train/assistant_tokens": assistant_tokens,
+                "train/active_positions_after_gate": active_positions,
+                "train/active_ratio_after_gate": active_positions / max(int(active.numel()), 1),
+                "perf/step_time_sec": elapsed / global_step,
+                "perf/steps_per_sec": steps_per_sec,
+                "perf/samples_per_sec": steps_per_sec,
+                "perf/processed_samples": global_step,
+                "perf/total_samples": total_steps,
+                "perf/progress": global_step / max(total_steps, 1),
+                "perf/eta_sec": eta_sec,
+                "perf/elapsed_sec": elapsed,
+                "perf/gpu_memory_allocated_gb": torch.cuda.memory_allocated(device) / 1024**3,
+                "perf/gpu_memory_reserved_gb": torch.cuda.memory_reserved(device) / 1024**3,
+            }
+            if wandb is not None and (global_step % args.wandb_log_every == 0 or global_step == total_steps):
+                wandb.log(metrics, step=global_step)
+            print(
+                f"epoch={epoch} step={step} global_step={global_step}/{total_steps} "
+                f"loss={total.item():.6f} samples/s={steps_per_sec:.4f} "
+                f"eta={eta_sec/60:.1f}min active={active_positions}/{active.numel()}",
+                flush=True,
+            )
         torch.save({"draft": draft.state_dict(), "args": vars(args)}, args.output_dir / f"epoch_{epoch}.pt")
+    if wandb is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
