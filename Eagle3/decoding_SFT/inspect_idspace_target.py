@@ -55,7 +55,9 @@ Required fields:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", type=Path, default=Path("/home/mr_jiang/models/xiaomi-ocr-0"))
+    p.add_argument("--model", type=Path, default=Path("/home/mr_jiang/models/xiaomi-ocr-0/model"))
+    p.add_argument("--processor", type=Path, default=None,
+                   help="processor/tokenizer directory; defaults to --model")
     p.add_argument("--input-jsonl", type=Path,
                    default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/train.jsonl"))
     p.add_argument("--image-root", type=Path,
@@ -302,6 +304,9 @@ def main() -> int:
         raise ValueError("--max-samples must be positive")
     if not args.model.is_dir():
         raise FileNotFoundError(args.model)
+    processor_path = args.processor or args.model
+    if not processor_path.is_dir():
+        raise FileNotFoundError(processor_path)
     if not args.input_jsonl.is_file():
         raise FileNotFoundError(args.input_jsonl)
 
@@ -311,7 +316,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; this validation is required to run on GPU 0")
     device = torch.device("cuda:0")
-    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=args.trust_remote_code)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model,
         trust_remote_code=args.trust_remote_code,
