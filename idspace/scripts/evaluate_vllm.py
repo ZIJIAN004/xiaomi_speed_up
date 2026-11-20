@@ -98,7 +98,7 @@ def main() -> int:
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpu", default="0")
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--representatives", type=int, default=5)
     parser.add_argument("--profile-max-iterations", type=int, default=64)
@@ -109,8 +109,8 @@ def main() -> int:
     parser.add_argument("--skip-processor-audit", action="store_true")
     parser.add_argument("--output-retention", choices=("sampled", "all"), default="all")
     args = parser.parse_args()
-    if args.workers < 1 or args.max_samples < 0 or args.max_tokens < 1:
-        parser.error("workers must be positive; max-samples nonnegative; max-tokens positive")
+    if args.workers < 1 or args.max_samples < 0 or (args.max_tokens is not None and args.max_tokens < 1):
+        parser.error("workers must be positive; max-samples nonnegative; max-tokens positive when provided")
     if args.representatives < 3:
         parser.error("representatives must be at least 3")
     if args.output.exists():
@@ -136,7 +136,7 @@ def main() -> int:
         "--model", str(args.model), "--served-model-name", "Xiaomi-OCR-0",
         "--backend", "offline", "--gpu", args.gpu, "--workers", str(args.workers),
         "--warmup", str(args.warmup), "--representatives", str(min(args.representatives, len(samples))),
-        "--max-tokens", str(args.max_tokens), "--max-model-len", str(args.max_model_len),
+        "--max-model-len", str(args.max_model_len),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--profile-max-iterations", str(args.profile_max_iterations),
         "--output-retention", args.output_retention,
@@ -146,6 +146,8 @@ def main() -> int:
             "--manifest", "{manifest}", "--predictions", "{predictions}", "--output", "{output}",
         ]),
     ]
+    if args.max_tokens is not None:
+        argv.extend(["--max-tokens", str(args.max_tokens)])
     if args.trust_remote_code:
         argv.append("--trust-remote-code")
     if args.skip_processor_audit:
