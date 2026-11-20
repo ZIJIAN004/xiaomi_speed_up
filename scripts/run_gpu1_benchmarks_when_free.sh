@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -u
 
-# Wait for the selected GPU (default GPU 0) to have >21 GiB free, then run both evaluations sequentially.
+# Wait for the selected GPU (default GPU 1) to have >21 GiB free, then run both evaluations sequentially.
 # A failure in one benchmark is recorded but does not prevent the other.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPEED_UP_PYTHON="${SPEED_UP_PYTHON:-/home/mr_jiang/miniforge3/envs/speed_up/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/xiaomi-ocr-0/model}"
-GPU_ID="${GPU_ID:-0}"
+GPU_ID="${GPU_ID:-1}"
 FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-21504}"  # 21 GiB
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
-RUN_ROOT="${RUN_ROOT:-/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results/gpu0_serial_$(date +%Y%m%d_%H%M%S)}"
+RUN_ROOT="${RUN_ROOT:-/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results/gpu1_serial_$(date +%Y%m%d_%H%M%S)}"
 OMNI_OUTPUT="${OMNI_OUTPUT:-$RUN_ROOT/omnidocbench_v15}"
 IDSPACE_OUTPUT="${IDSPACE_OUTPUT:-$RUN_ROOT/idspace_validation}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/benchmark/data}"
