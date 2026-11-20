@@ -27,6 +27,10 @@ def parse_args():
     p.add_argument("--low-layer", type=int, default=1)
     p.add_argument("--mid-layer", type=int, default=12)
     p.add_argument("--high-layer", type=int, default=24)
+    p.add_argument(
+        "--top-k", type=int, nargs="?", const=3, default=0,
+        help="enable cumulative target top-k loss gate; bare flag uses k=3",
+    )
     p.add_argument("--trust-remote-code", action="store_true")
     return p.parse_args()
 
@@ -67,20 +71,33 @@ def shift_text_embeddings(embeddings, input_ids, mm_token_type_ids):
     return shifted
 
 
-def distill_loss(target_logits, draft_logits, mask):
+def distill_loss(target_logits, draft_logits, mask, active=None):
     teacher = torch.softmax(target_logits.float().detach(), dim=-1)
     student = torch.log_softmax(draft_logits.float(), dim=-1)
     token_loss = -(teacher * student).sum(dim=-1)
-    mask = mask.to(token_loss.device, token_loss.dtype)
-    mask = mask[..., 1:]
+    mask = mask.to(token_loss.device, token_loss.dtype)[..., 1:]
     token_loss = token_loss[..., :-1]
+    if active is not None:
+        mask = mask * active.to(mask.device, mask.dtype)
     return (token_loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def update_topk_active(target_logits, draft_logits, assistant_mask, active, top_k):
+    if top_k <= 0:
+        return active
+    target_topk = target_logits.detach().topk(top_k, dim=-1).indices
+    draft_token = draft_logits.detach().argmax(dim=-1, keepdim=True)
+    reliable = (target_topk == draft_token).any(dim=-1)[..., :-1]
+    valid = assistant_mask.to(reliable.device, torch.bool)[..., 1:]
+    return active & (~valid | reliable)
 
 
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if args.top_k < 0:
+        raise ValueError("--top-k must be nonnegative")
     device = torch.device("cuda:0")
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -121,10 +138,19 @@ def main():
             total = torch.zeros((), device=device, dtype=torch.float32)
             current_embeds = multimodal_embeds
             cache = None
+            active = torch.ones(
+                batch["assistant_mask"].shape[0],
+                batch["assistant_mask"].shape[1] - 1,
+                device=device,
+                dtype=torch.bool,
+            )
             for rollout in range(args.rollout_steps):
                 feature, draft_logits, cache = draft.step(feature, current_embeds, cache)
                 total = total + (args.rollout_decay ** rollout) * distill_loss(
-                    target_logits, draft_logits, batch["assistant_mask"]
+                    target_logits, draft_logits, batch["assistant_mask"], active
+                )
+                active = update_topk_active(
+                    target_logits, draft_logits, batch["assistant_mask"], active, args.top_k
                 )
                 current_embeds = shift_text_embeddings(
                     current_embeds, batch["input_ids"], batch.get("mm_token_type_ids")
