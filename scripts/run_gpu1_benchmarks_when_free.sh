@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -u
 
-# Wait for the selected GPU (default GPU 0) to have >22 GiB free, then run both evaluations sequentially.
+# Wait for the selected GPU (default GPU 0) to have >21 GiB free, then run both evaluations sequentially.
 # A failure in one benchmark is recorded but does not prevent the other.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPEED_UP_PYTHON="${SPEED_UP_PYTHON:-/home/mr_jiang/miniforge3/envs/speed_up/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/xiaomi-ocr-0/model}"
 GPU_ID="${GPU_ID:-0}"
-FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-22528}"  # 22 GiB
+FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-21504}"  # 21 GiB
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
 RUN_ROOT="${RUN_ROOT:-/home/mr_jiang/speed_up/Xiaomi-OCR-0/benchmark/results/gpu0_serial_$(date +%Y%m%d_%H%M%S)}"
 OMNI_OUTPUT="${OMNI_OUTPUT:-$RUN_ROOT/omnidocbench_v15}"
@@ -78,7 +78,7 @@ if ! validate_paths; then
   exit 2
 fi
 
-log "Waiting for GPU $GPU_ID free memory > ${FREE_THRESHOLD_MIB} MiB (22 GiB), checking every ${INTERVAL_SECONDS}s"
+log "Waiting for GPU $GPU_ID free memory > ${FREE_THRESHOLD_MIB} MiB (21 GiB), checking every ${INTERVAL_SECONDS}s"
 while :; do
   free_mib="$(query_free_mib)"
   if [[ "$free_mib" =~ ^[0-9]+$ ]]; then
