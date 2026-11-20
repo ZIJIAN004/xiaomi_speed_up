@@ -1,18 +1,18 @@
 # IDSpace decoding data collection
 
-This directory collects Xiaomi-OCR-0 inference data for later EAGLE3 decoding-SFT. It deliberately does **not** run the repository bottleneck instrumentation, profiling, warmup, or benchmark aggregation.
+This collector reuses the existing IDSpace inference contract from `idspace/scripts/evaluate_vllm.py` and the local vLLM/processor path from `benchmark/offline_backend.py`:
 
-The input is the prepared IDSpace `train.jsonl` format already used by `idspace/scripts/evaluate_vllm.py`, with at least:
+- same IDSpace `train.jsonl` row format;
+- same `image` + `image-root` resolution;
+- same identity-card prompt;
+- native `AutoProcessor.apply_chat_template` with `enable_thinking=False`;
+- local vLLM `AsyncLLM`, no HTTP and no remote host.
 
-```json
-{"image": "relative/path.png", "target": {...}}
-```
+It intentionally removes the benchmark-only pieces: bottleneck monitor, profiler, warmup, representative selection, quality scoring, retry/retention, and benchmark metrics.
 
-The collector writes one JSON object per line containing the source row, prompt, raw model response, actual token IDs when the Transformers backend exposes them, and timing.
+## PowerShell command
 
-## Direct Transformers backend
-
-Use an existing Python environment that already has the Xiaomi-OCR-0 Transformers dependencies. Do not run from the downloaded model directory.
+The model must be a **local directory** containing `config.json`; the script refuses a remote model name.
 
 ```powershell
 python "C:\Users\zijia\Desktop\Diligram\xiaomi_speed_up\Eagle3\decoding_SFT\collect_idspace.py" `
@@ -20,23 +20,17 @@ python "C:\Users\zijia\Desktop\Diligram\xiaomi_speed_up\Eagle3\decoding_SFT\coll
   --input-jsonl "C:\data\IDSpace\prepared\train.jsonl" `
   --image-root "C:\data\IDSpace\prepared\images" `
   --output-jsonl "C:\data\IDSpace\runs\xiaomi_train_inference.jsonl" `
-  --trust-remote-code
+  --gpu 0 `
+  --max-samples 2
 ```
 
-For a first local smoke run, add `--max-samples 2` and use a new output file.
+Remove `--max-samples 2` after the smoke run. Add `--trust-remote-code` only if the local checkpoint requires it. The script uses one local vLLM engine, not the repository benchmark runner, and writes one JSON object per sample. It does not use the OpenAI client, HTTP, Transformers `generate`, or the benchmark bottleneck pipeline.
 
-## OpenAI-compatible vLLM/SGLang backend
+Default generation settings match the existing IDSpace path:
 
-This path sends direct inference requests to an already-running local server and still skips all benchmark instrumentation:
-
-```powershell
-python "C:\Users\zijia\Desktop\Diligram\xiaomi_speed_up\Eagle3\decoding_SFT\collect_idspace.py" `
-  --backend openai `
-  --base-url "http://127.0.0.1:8000/v1" `
-  --model "SeerRay-Lab/Xiaomi-OCR-0" `
-  --input-jsonl "C:\data\IDSpace\prepared\train.jsonl" `
-  --image-root "C:\data\IDSpace\prepared\images" `
-  --output-jsonl "C:\data\IDSpace\runs\xiaomi_train_inference.jsonl"
+```text
+temperature=0
+top_p=0.8
+repetition_penalty=1.0
+max_tokens=2048
 ```
-
-The script uses deterministic decoding (`temperature=0`, `top_p=0.8`) to match the repository's IDSpace inference settings. It does not modify the input JSONL or create a benchmark manifest.
