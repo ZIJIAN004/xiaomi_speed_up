@@ -40,7 +40,8 @@ class FeatureFusion(nn.Module):
 class DraftAttention(nn.Module):
     """New 2H-input causal attention with an explicit draft K/V cache."""
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int,
-                 head_dim: int, eps: float):
+                 head_dim: int, eps: float, rope_theta: float = 10000.0,
+                 mrope_section: tuple[int, ...] = (11, 11, 10)):
         super().__init__()
         if num_heads % num_kv_heads:
             raise ValueError("num_attention_heads must divide num_key_value_heads")
@@ -50,6 +51,8 @@ class DraftAttention(nn.Module):
         self.num_groups = num_heads // num_kv_heads
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
+        self.rope_theta = rope_theta
+        self.mrope_section = mrope_section
         input_size = 2 * hidden_size
         self.q_proj = nn.Linear(input_size, 2 * num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(input_size, num_kv_heads * head_dim, bias=False)
@@ -69,17 +72,26 @@ class DraftAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         if position_ids is None:
-            position_ids = torch.arange(q_len, device=x.device)
-        position_ids = position_ids.reshape(-1)
-        inv = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim))
-        angles = position_ids[:, None].float() * inv[None, :]
-        cos = angles.cos()[None, None, :, :]
-        sin = angles.sin()[None, None, :, :]
-        def rope(t):
-            even, odd = t[..., ::2], t[..., 1::2]
-            return torch.stack([even * cos + odd * -sin, even * sin + odd * cos], dim=-1).flatten(-2)
-        q = rope(q)
-        k = rope(k)
+            position_ids = torch.arange(q_len, device=x.device).view(1, -1)
+        if position_ids.ndim == 2:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError("draft position_ids must have shape [3, batch, sequence]")
+        inv = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim))
+        dim = min(self.head_dim // 2, position_ids.shape[0] * max(self.mrope_section))
+        freqs = position_ids[..., None].float() * inv[:dim // 3 if dim >= 3 else dim].to(position_ids.device)
+        # For Qwen M-RoPE, recomposition interleaves T/H/W frequency sections.
+        base = freqs[0]
+        for axis, section in enumerate(self.mrope_section[1:], start=1):
+            width = min(section * 3, base.shape[-1] - (section * 3))
+            if width > 0:
+                base[..., axis:width:3] = freqs[axis, ..., axis:width:3]
+        cos = torch.cat([base, base], dim=-1).cos().to(q.dtype)
+        sin = torch.cat([base, base], dim=-1).sin().to(q.dtype)
+        cos = cos[:, None]
+        sin = sin[:, None]
+        q = (q * cos) + (torch.cat((-q[..., self.head_dim // 2:], q[..., :self.head_dim // 2]), dim=-1) * sin)
+        k = (k * cos) + (torch.cat((-k[..., self.head_dim // 2:], k[..., :self.head_dim // 2]), dim=-1) * sin)
         k_current = k.repeat_interleave(self.num_groups, dim=1)
         v_current = v.repeat_interleave(self.num_groups, dim=1)
         scores = torch.matmul(q, k_current.transpose(-2, -1)) * self.scale
@@ -104,20 +116,21 @@ class DraftAttention(nn.Module):
 
 class DraftBlock(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int,
-                 num_kv_heads: int, head_dim: int, eps: float):
+                 num_kv_heads: int, head_dim: int, eps: float,
+                 rope_theta: float = 10000.0, mrope_section: tuple[int, ...] = (11, 11, 10)):
         super().__init__()
         self.feature_norm = Qwen35RMSNorm(hidden_size, eps)
         self.embedding_norm = Qwen35RMSNorm(hidden_size, eps)
-        self.attn = DraftAttention(hidden_size, num_heads, num_kv_heads, head_dim, eps)
+        self.attn = DraftAttention(hidden_size, num_heads, num_kv_heads, head_dim, eps, rope_theta, mrope_section)
         self.post_norm = Qwen35RMSNorm(hidden_size, eps)
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
-    def forward(self, feature, embedding, cache=None):
+    def forward(self, feature, embedding, cache=None, position_ids=None):
         residual = feature
         x = torch.cat([self.embedding_norm(embedding), self.feature_norm(feature)], dim=-1)
-        x, cache = self.attn(x, cache)
+        x, cache = self.attn(x, cache, position_ids=position_ids)
         x = residual + x
         residual = x
         normalized = self.post_norm(x)
@@ -140,7 +153,7 @@ class XiaomiEagleDraft(nn.Module):
     def initial_feature(self, target_hidden_states):
         return self.fusion(tuple(target_hidden_states))
 
-    def step(self, feature, embedding, cache=None):
-        feature, cache = self.block(feature, embedding, cache)
+    def step(self, feature, embedding, cache=None, position_ids=None):
+        feature, cache = self.block(feature, embedding, cache, position_ids=position_ids)
         logits = self.draft_lm_head(self.output_norm(feature))
         return feature, logits, cache

@@ -234,7 +234,10 @@ def main():
                 dtype=torch.bool,
             )
             for rollout in range(args.rollout_steps):
-                feature, draft_logits, cache = draft.step(feature, current_embeds, cache)
+                feature, draft_logits, cache = draft.step(
+                    feature, current_embeds, cache,
+                    position_ids=batch.get("position_ids"),
+                )
                 total = total + (args.rollout_decay ** rollout) * distill_loss(
                     target_logits, draft_logits, batch["assistant_mask"], active
                 )
