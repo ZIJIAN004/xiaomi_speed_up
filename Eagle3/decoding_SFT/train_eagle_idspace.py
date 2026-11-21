@@ -50,54 +50,84 @@ def freeze(model):
         p.requires_grad_(False)
 
 
-def build_multimodal_embeddings(target, batch):
-    """Reproduce Xiaomi's text lookup + visual masked_scatter path."""
-    base = target.model
-    input_ids = batch["input_ids"]
-    embeds = base.get_input_embeddings()(input_ids)
-    if "pixel_values" not in batch:
-        return embeds
-    image_out = base.get_image_features(
-        batch["pixel_values"], batch.get("image_grid_thw"), return_dict=True
-    )
-    image_embeds = torch.cat(image_out.pooler_output, dim=0).to(embeds.device, embeds.dtype)
-    image_mask, _ = base.get_placeholder_mask(
-        input_ids, inputs_embeds=embeds, image_features=image_embeds
-    )
-    return embeds.masked_scatter(image_mask, image_embeds)
+def target_forward_with_context(target, batch):
+    """Capture native post-vision embeddings and positions in the SAME forward.
+
+    No second vision pass, placeholder re-embedding, or inferred M-RoPE formula.
+    The pre-hook observes exactly what the loaded target gives its text model.
+    """
+    captured = {}
+    def capture(module, args, kwargs):
+        if args:
+            raise RuntimeError("expected keyword arguments at native language_model boundary")
+        for name in ("inputs_embeds", "position_ids"):
+            value = kwargs.get(name)
+            if value is None:
+                raise RuntimeError(f"native target did not supply {name}; inspect loaded model implementation")
+            captured[name] = value.detach().clone()
+    handle = target.model.language_model.register_forward_pre_hook(capture, with_kwargs=True)
+    try:
+        output = target(**{k: v for k, v in batch.items()
+                           if k not in {"assistant_mask", "sample_index", "target", "image_path"}},
+                        output_hidden_states=True, return_dict=True, use_cache=False)
+    finally:
+        handle.remove()
+    if not captured:
+        raise RuntimeError("native language_model capture hook was not called")
+    return output, captured["inputs_embeds"], captured["position_ids"]
 
 
-def shift_text_embeddings(embeddings, input_ids, mm_token_type_ids):
-    """Official left shift for text positions while preserving visual positions."""
-    shifted = embeddings.clone()
-    if mm_token_type_ids is None:
-        return torch.cat([embeddings[:, 1:], embeddings[:, -1:]], dim=1)
-    for b in range(embeddings.shape[0]):
-        text = (mm_token_type_ids[b] == 0).nonzero(as_tuple=False).flatten()
-        if text.numel() > 1:
-            shifted[b, text[:-1]] = embeddings[b, text[1:]]
-            shifted[b, text[-1]] = embeddings[b, text[-1]]
-    return shifted
+def shift_left(tensor, pad=None):
+    """Shift the complete sequence axis (dimension 1), retaining length.
+
+    Visual embeddings move with their sequence slots, just like every other
+    embedding. Keeping visual slots fixed would break the official TTT alignment.
+    """
+    tail = torch.zeros_like(tensor[:, :1]) if pad is None else pad
+    return torch.cat((tensor[:, 1:], tail), dim=1)
+
+
+def rollout_loss(draft, feature, embeddings, teacher_logits, assistant_mask,
+                 position_ids, steps, decay, top_k, pad_embedding):
+    """Official TTT alignment: h[t] + e[t+r+1] predicts token[t+r+2]."""
+    current_embeds = shift_left(embeddings, pad_embedding)
+    teacher_logits = shift_left(teacher_logits)
+    # Teacher logits[t+1] predict token[t+2]; mask is on the predicted token.
+    mask = shift_left(shift_left(assistant_mask))
+    active = torch.ones_like(mask, dtype=torch.bool)
+    cache = None
+    total = feature.new_zeros((), dtype=torch.float32)
+    for rollout in range(steps):
+        feature, draft_logits, cache = draft.step(
+            feature, current_embeds, cache, position_ids=position_ids)
+        total = total + decay ** rollout * distill_loss(teacher_logits, draft_logits, mask, active)
+        # Current loss is retained; only subsequent rounds are gated out.
+        active = update_topk_active(teacher_logits, draft_logits, mask, active, top_k)
+        current_embeds = shift_left(current_embeds, pad_embedding)
+        teacher_logits = shift_left(teacher_logits)
+        mask = shift_left(mask)
+    return total, feature, draft_logits, cache, active
 
 
 def distill_loss(target_logits, draft_logits, mask, active=None):
     teacher = torch.softmax(target_logits.float().detach(), dim=-1)
     student = torch.log_softmax(draft_logits.float(), dim=-1)
     token_loss = -(teacher * student).sum(dim=-1)
-    mask = mask.to(token_loss.device, token_loss.dtype)[..., 1:]
-    token_loss = token_loss[..., :-1]
+    mask = mask.to(token_loss.device, token_loss.dtype)
     if active is not None:
         mask = mask * active.to(mask.device, mask.dtype)
-    return (token_loss * mask).sum() / mask.sum().clamp_min(1.0)
+    return (token_loss * mask).mean()  # official EAGLE reduction over B x T
 
 
 def update_topk_active(target_logits, draft_logits, assistant_mask, active, top_k):
     if top_k <= 0:
         return active
+    if top_k > target_logits.shape[-1]:
+        raise ValueError("--top-k exceeds vocabulary size")
     target_topk = target_logits.detach().topk(top_k, dim=-1).indices
     draft_token = draft_logits.detach().argmax(dim=-1, keepdim=True)
-    reliable = (target_topk == draft_token).any(dim=-1)[..., :-1]
-    valid = assistant_mask.to(reliable.device, torch.bool)[..., 1:]
+    reliable = (target_topk == draft_token).any(dim=-1)
+    valid = assistant_mask.to(reliable.device, torch.bool)
     return active & (~valid | reliable)
 
 
@@ -107,9 +137,11 @@ def run_toy(args):
         raise RuntimeError("--toy-device cuda requested but CUDA is unavailable")
     torch.manual_seed(7)
     hidden, vocab, intermediate = 32, 128, 64
+    from toy_rotary import ToyRotary
+    rotary = ToyRotary()
     draft = XiaomiEagleDraft(
         hidden, vocab, intermediate, 4, 2, 8, 1e-6,
-        low_layer=1, mid_layer=3, high_layer=5, rollout_steps=3,
+        low_layer=1, mid_layer=3, high_layer=5, rollout_steps=3, rotary_emb=rotary,
     ).to(device)
     optimizer = torch.optim.AdamW(draft.parameters(), lr=1e-3)
     batch, seq = 1, 8
@@ -119,15 +151,10 @@ def run_toy(args):
     target_logits = torch.randn(batch, seq, vocab, device=device)
     assistant_mask = torch.zeros(batch, seq, dtype=torch.bool, device=device)
     assistant_mask[:, 3:] = True
-    active = torch.ones(batch, seq - 1, dtype=torch.bool, device=device)
-    cache = None
-    total = torch.zeros((), device=device)
-    for step in range(3):
-        feature, draft_logits, cache = draft.step(feature, embeddings, cache)
-        total = total + (0.8 ** step) * distill_loss(
-            target_logits, draft_logits, assistant_mask, active
-        )
-        active = update_topk_active(target_logits, draft_logits, assistant_mask, active, args.top_k)
+    positions = torch.arange(seq, device=device).view(1, 1, -1).expand(3, batch, -1)
+    total, feature, draft_logits, cache, active = rollout_loss(
+        draft, feature, embeddings, target_logits, assistant_mask,
+        positions, 3, 0.8, args.top_k, torch.zeros_like(embeddings[:, :1]))
     optimizer.zero_grad(set_to_none=True)
     total.backward()
     grad_params = [name for name, p in draft.named_parameters() if p.grad is not None and torch.isfinite(p.grad).all()]
@@ -145,6 +172,8 @@ def run_toy(args):
 
 def main():
     args = parse_args()
+    if args.rollout_steps < 1 or args.epochs < 1 or args.wandb_log_every < 1 or args.top_k < 0:
+        raise ValueError("rollout-steps, epochs, wandb-log-every must be positive; top-k must be nonnegative")
     if args.toy:
         run_toy(args)
         return
@@ -184,6 +213,7 @@ def main():
     draft = XiaomiEagleDraft(
         hidden, vocab, intermediate, heads, kv_heads, head_dim, eps,
         args.low_layer, args.mid_layer, args.high_layer, args.rollout_steps,
+        rotary_emb=target.model.language_model.rotary_emb,
     ).to(device, dtype=next(target.parameters()).dtype)
     optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -218,35 +248,19 @@ def main():
         for step, raw in enumerate(loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
             optimizer.zero_grad(set_to_none=True)
+            capacity = getattr(text_config, "max_position_embeddings", None)
+            if capacity and batch["input_ids"].shape[1] + args.rollout_steps - 1 > capacity:
+                raise ValueError("expanded multimodal sequence plus rollout exceeds target position capacity")
             with torch.no_grad():
-                target_out = target(**{k: v for k, v in batch.items() if k not in {"assistant_mask", "sample_index", "target", "image_path"}},
-                                    output_hidden_states=True, return_dict=True, use_cache=False)
-                multimodal_embeds = build_multimodal_embeddings(target, batch)
-                feature = draft.initial_feature(target_out.hidden_states)
+                target_out, multimodal_embeds, position_ids = target_forward_with_context(target, batch)
                 target_logits = target_out.logits
-            total = torch.zeros((), device=device, dtype=torch.float32)
-            current_embeds = multimodal_embeds
-            cache = None
-            active = torch.ones(
-                batch["assistant_mask"].shape[0],
-                batch["assistant_mask"].shape[1] - 1,
-                device=device,
-                dtype=torch.bool,
-            )
-            for rollout in range(args.rollout_steps):
-                feature, draft_logits, cache = draft.step(
-                    feature, current_embeds, cache,
-                    position_ids=batch.get("position_ids"),
-                )
-                total = total + (args.rollout_decay ** rollout) * distill_loss(
-                    target_logits, draft_logits, batch["assistant_mask"], active
-                )
-                active = update_topk_active(
-                    target_logits, draft_logits, batch["assistant_mask"], active, args.top_k
-                )
-                current_embeds = shift_text_embeddings(
-                    current_embeds, batch["input_ids"], batch.get("mm_token_type_ids")
-                )
+                # Official padding shifts token IDs and appends ID 0, then embeds.
+                pad_embedding = target.get_input_embeddings()(torch.zeros_like(batch["input_ids"][:, :1]))
+            # Fusion is TRAINABLE: it must not be inside the target no_grad block.
+            feature = draft.initial_feature(target_out.hidden_states)
+            total, feature, draft_logits, cache, active = rollout_loss(
+                draft, feature, multimodal_embeds, target_logits, batch["assistant_mask"],
+                position_ids, args.rollout_steps, args.rollout_decay, args.top_k, pad_embedding)
             total.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=1.0)
             optimizer.step()

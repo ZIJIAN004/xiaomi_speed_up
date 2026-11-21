@@ -1,0 +1,178 @@
+"""Focused CPU regressions; no checkpoint, data downloads, or CUDA required."""
+import unittest
+import ast
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+from torch import nn
+
+from qwen_eagle_draft import DraftAttention, XiaomiEagleDraft
+from toy_rotary import ToyRotary
+from idspace_gt_dataset import collate_single
+from train_eagle_idspace import rollout_loss, shift_left, target_forward_with_context, update_topk_active
+
+
+class TrainingTests(unittest.TestCase):
+    def test_cache_matches_explicit_allowed_edges(self):
+        torch.manual_seed(3)
+        attn = DraftAttention(16, 4, 2, 8, 1e-6, ToyRotary())
+        b, t = 2, 5
+        positions = torch.arange(t).view(1, 1, t).expand(3, b, t).clone()
+        positions[1] *= 2
+        positions[2] *= 3
+        cache = None
+        for depth in range(3):
+            x = torch.randn(b, t, 32, requires_grad=True)
+            result, cache = attn(x, cache, positions)
+            raw, gate = attn.q_proj(x).view(b, t, 4, 16).chunk(2, -1)
+            q = attn.q_norm(raw).transpose(1, 2)
+            cos, sin = attn.rotary_emb(x, positions + depth)
+            d = cos.shape[-1]
+            rot = q[..., :d]
+            turned = torch.cat((-rot[..., d // 2:], rot[..., :d // 2]), -1)
+            q = torch.cat((rot * cos[:, None] + turned * sin[:, None], q[..., d:]), -1)
+            expected = torch.zeros_like(q)
+            for row in range(t):
+                # Independent graph: base prefix, then one same-column key per rollout.
+                keys = [cache[0]['k'].repeat_interleave(2, 1)[:, :, :row + 1]]
+                vals = [cache[0]['v'].repeat_interleave(2, 1)[:, :, :row + 1]]
+                for entry in cache[1:]:
+                    keys.append(entry['k'].repeat_interleave(2, 1)[:, :, row:row + 1])
+                    vals.append(entry['v'].repeat_interleave(2, 1)[:, :, row:row + 1])
+                keys, vals = torch.cat(keys, 2), torch.cat(vals, 2)
+                weights = (q[:, :, row:row + 1] * keys).sum(-1).mul(8 ** -0.5).softmax(-1)
+                expected[:, :, row] = (weights[..., None] * vals).sum(2)
+            expected = expected.transpose(1, 2).reshape(b, t, 32)
+            expected = attn.o_proj(expected * gate.reshape(b, t, 32).sigmoid())
+            torch.testing.assert_close(result, expected)
+        result.sum().backward()
+        self.assertTrue(all(entry['k'].grad_fn is not None for entry in cache))
+
+    @unittest.skipUnless(os.environ.get('QWEN35_SOURCE'), 'set QWEN35_SOURCE to native Qwen source for source oracle')
+    def test_against_native_rotary_source(self):
+        # Extract only the rotary class, never import/execute the downloaded module.
+        source = ast.parse(Path(os.environ['QWEN35_SOURCE']).read_text(encoding='utf-8'))
+        node = next(n for n in source.body if isinstance(n, ast.ClassDef)
+                    and n.name == 'Qwen3_5TextRotaryEmbedding')
+        namespace = {'torch': torch, 'nn': nn, 'Qwen3_5TextConfig': object,
+                     'dynamic_rope_update': lambda fn: fn}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<native-rotary>', 'exec'), namespace)
+        config = SimpleNamespace(max_position_embeddings=1024, head_dim=8,
+                                 hidden_size=16, num_attention_heads=4,
+                                 rope_parameters={'rope_type': 'default', 'rope_theta': 10000.,
+                                                  'partial_rotary_factor': .5, 'mrope_section': [1, 1, 0]})
+        # PyTorch 2.2 lacks nn.Buffer; this CPU oracle needs only its tensor value.
+        if hasattr(nn, 'Buffer'):
+            native = namespace['Qwen3_5TextRotaryEmbedding'](config)
+        else:
+            with patch.object(nn, 'Buffer', lambda value, persistent=False: value, create=True):
+                native = namespace['Qwen3_5TextRotaryEmbedding'](config)
+        fixture = ToyRotary()
+        positions = torch.randint(0, 40, (3, 2, 5))
+        x = torch.randn(2, 5, 32)
+        for a, b in zip(native(x, positions), fixture(x, positions)):
+            torch.testing.assert_close(a, b)
+        native_attn = DraftAttention(16, 4, 2, 8, 1e-6, native)
+        self.assertEqual(native_attn(x, position_ids=positions)[0].shape, (2, 5, 16))
+
+    def test_four_planes_and_cache_shape_guard(self):
+        attn = DraftAttention(16, 4, 2, 8, 1e-6, ToyRotary())
+        x = torch.randn(2, 5, 32)
+        p = torch.arange(5).view(1, 1, 5).expand(4, 2, 5)
+        a, cache = attn(x, position_ids=p)
+        b, _ = attn(x, position_ids=p[1:])
+        torch.testing.assert_close(a, b)
+        with self.assertRaises(ValueError):
+            attn(x[:, :1], cache, p[..., :1])
+
+    def test_rollout_alignment(self):
+        class RecordingDraft:
+            def __init__(self):
+                self.embeddings = []
+            def step(self, feature, embedding, cache, position_ids):
+                self.embeddings.append(embedding.clone())
+                return feature, torch.zeros(1, 6, 3, requires_grad=True), (cache or []) + [{}]
+        draft = RecordingDraft()
+        embeddings = torch.arange(6.).view(1, 6, 1)
+        teacher = embeddings.expand(1, 6, 3)
+        mask = torch.tensor([[False, False, True, True, True, False]])
+        seen = []
+        def loss(t, d, m, active):
+            seen.append((t.clone(), m.clone()))
+            return d.sum() * 0
+        with patch('train_eagle_idspace.distill_loss', loss):
+            rollout_loss(draft, embeddings, embeddings, teacher, mask, None, 3, .8, 0,
+                         torch.full((1, 1, 1), -1.))
+        for depth in range(3):
+            self.assertEqual(draft.embeddings[depth][0, 0, 0].item(), depth + 1)
+            self.assertEqual(seen[depth][0][0, 0, 0].item(), depth + 1)
+            expected = mask
+            for _ in range(depth + 2):
+                expected = shift_left(expected)
+            torch.testing.assert_close(seen[depth][1], expected)
+
+    def test_dtype_cast_preserves_rotary_buffers(self):
+        attention = DraftAttention(16, 4, 2, 8, 1e-6, ToyRotary())
+        original = attention.rotary_emb.inv_freq.clone()
+        attention.to(dtype=torch.bfloat16)
+        self.assertEqual(attention.q_proj.weight.dtype, torch.bfloat16)
+        self.assertEqual(attention.rotary_emb.inv_freq.dtype, torch.float32)
+        torch.testing.assert_close(attention.rotary_emb.inv_freq, original, rtol=0, atol=0)
+
+    def test_gate_is_cumulative(self):
+        teacher = torch.tensor([[[4., 0.], [4., 0.]]])
+        wrong = teacher.flip(-1)
+        active = torch.ones(1, 2, dtype=torch.bool)
+        active = update_topk_active(teacher, wrong, active, active, 1)
+        self.assertFalse(active.any())
+        active = update_topk_active(teacher, teacher, torch.ones_like(active), active, 1)
+        self.assertFalse(active.any())
+
+    def test_native_context_capture_and_hook_cleanup(self):
+        class Text(nn.Module):
+            def forward(self, **kwargs):
+                return kwargs['inputs_embeds']
+        class Target(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = Text()
+            def forward(self, **kwargs):
+                e = torch.randn(1, 5, 8)
+                p = torch.arange(5).view(1, 1, 5).expand(3, 1, 5)
+                return self.model.language_model(inputs_embeds=e, position_ids=p)
+        target = Target()
+        result, embeds, positions = target_forward_with_context(target, {})
+        torch.testing.assert_close(result, embeds)
+        self.assertEqual(positions.shape, (3, 1, 5))
+        self.assertFalse(target.model.language_model._forward_pre_hooks)
+
+    def test_collator_preserves_native_ranks(self):
+        sample = {'input_ids': torch.zeros(1, 6, dtype=torch.long),
+                  'position_ids': torch.zeros(4, 1, 6, dtype=torch.long),
+                  'pixel_values': torch.zeros(1, 12),
+                  'image_grid_thw': torch.ones(1, 3, dtype=torch.long),
+                  'assistant_mask': torch.ones(1, 6, dtype=torch.bool)}
+        result = collate_single([sample])
+        for key in sample:
+            self.assertIs(result[key], sample[key])
+        with self.assertRaises(NotImplementedError):
+            collate_single([sample, sample])
+
+    def test_fusion_gradient(self):
+        draft = XiaomiEagleDraft(16, 32, 32, 4, 2, 8, 1e-6,
+                                low_layer=0, mid_layer=1, high_layer=2, rotary_emb=ToyRotary())
+        states = tuple(torch.randn(1, 6, 16) for _ in range(3))
+        e = torch.randn(1, 6, 16)
+        loss, *_ = rollout_loss(draft, draft.initial_feature(states), e,
+                               torch.randn(1, 6, 32), torch.ones(1, 6, dtype=torch.bool),
+                               None, 3, .8, 0, torch.zeros_like(e[:, :1]))
+        loss.backward()
+        self.assertGreater(draft.fusion.proj.weight.grad.abs().sum().item(), 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

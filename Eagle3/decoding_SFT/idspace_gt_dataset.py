@@ -97,7 +97,8 @@ class IDSpaceGroundTruthDataset(Dataset):
             full_messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
         )
         encoded = self.processor(
-            text=[full_template], images=[image], return_tensors="pt", padding=True
+            text=[full_template], images=[image], return_tensors="pt",
+            padding=False, truncation=False, add_special_tokens=False
         )
         image.close()
 
@@ -111,19 +112,16 @@ class IDSpaceGroundTruthDataset(Dataset):
 
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
         assistant_mask[answer_start:answer_end] = True
-        # Keep image_grid_thw as [num_images, 3]. Only tensors with a
-        # leading batch dimension are unbatched here; Qwen3.5 expects
-        # image_grid_thw to remain rank-2 in get_image_features().
-        # Keep processor tensors unbatched except image_grid_thw, whose
-        # processor batch shape [num_images, 3] is already the model shape.
-        # The training loop adds the batch dimension to the rank-1 tensors.
-        encoded = {
-            key: (value if key == "image_grid_thw" else value.squeeze(0))
-            for key, value in encoded.items()
-            if torch.is_tensor(value)
-        }
+        # Preserve ALL native processor ranks, including [4,1,T] positions,
+        # [N,3] grids and [P,C] pixel patches. The batch-size-one collator is identity.
+        if encoded["input_ids"].ndim != 2 or encoded["input_ids"].shape[0] != 1:
+            raise ValueError("processor must return input_ids [1,T]")
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is not None and not bool(attention_mask.all()):
+            raise ValueError("batch-size-one training expects no padded tokens")
+        encoded = {key: value for key, value in encoded.items() if torch.is_tensor(value)}
         encoded.update({
-            "assistant_mask": assistant_mask,
+            "assistant_mask": assistant_mask.unsqueeze(0),
             "sample_index": index,
             "image_path": str(image_path),
             "target": row["target"],
@@ -135,15 +133,4 @@ def collate_single(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate one multimodal sample and restore model batch dimensions."""
     if len(batch) != 1:
         raise NotImplementedError("multimodal collation currently supports batch_size=1 only")
-    sample = batch[0]
-    batched = {}
-    for key, value in sample.items():
-        if not torch.is_tensor(value):
-            batched[key] = value
-        elif key in {"image_grid_thw", "pixel_values"}:
-            # Qwen3.5 processor expects image_grid_thw [num_images, 3] and
-            # pixel_values [num_patches, channels] for a single image.
-            batched[key] = value
-        else:
-            batched[key] = value.unsqueeze(0)
-    return batched
+    return batch[0]
