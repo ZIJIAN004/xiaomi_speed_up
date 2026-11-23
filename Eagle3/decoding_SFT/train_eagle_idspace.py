@@ -7,6 +7,7 @@ import json
 import math
 import time
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +23,8 @@ def parse_args():
     p.add_argument("--train-jsonl", type=Path, default=None)
     p.add_argument("--image-root", type=Path, default=None)
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--draft-vocab", type=Path, default=None,
+                   help="draft_vocab.pt from build_draft_vocab.py; omit for full target vocabulary")
     p.add_argument("--toy", action="store_true", help="run a tiny synthetic forward/backward test without loading Xiaomi")
     p.add_argument("--toy-device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--max-samples", type=int, default=0)
@@ -87,12 +90,38 @@ def shift_left(tensor, pad=None):
     return torch.cat((tensor[:, 1:], tail), dim=1)
 
 
-def rollout_loss(draft, feature, embeddings, teacher_logits, assistant_mask,
-                 position_ids, steps, decay, top_k, pad_embedding):
+class TeacherTargets(NamedTuple):
+    logits: torch.Tensor            # [B, T, draft_vocab], target logits restricted to draft_ids
+    in_vocab: torch.Tensor          # [B, T] bool, t2d[argmax of full target logits]
+    topk_ids: Optional[torch.Tensor]  # [B, T, k] target-space ids, None when gating is off
+
+
+@torch.no_grad()
+def prepare_teacher(target_logits, draft_ids, t2d, top_k):
+    """Reduce full-vocab target logits ONCE, before the rollout.
+
+    Official EAGLE-3: teacher = softmax(target_logits[..., t2d]) and positions
+    whose full-vocab teacher argmax is outside the draft vocab are masked.
+    The caller can then free the [B, T, V] tensor.
+    """
+    target_logits = target_logits.detach()
+    if top_k > target_logits.shape[-1]:
+        raise ValueError("--top-k exceeds vocabulary size")
+    topk_ids = target_logits.topk(top_k, dim=-1).indices if top_k > 0 else None
+    in_vocab = t2d.to(target_logits.device)[target_logits.argmax(dim=-1)]
+    logits = target_logits.index_select(-1, draft_ids.to(target_logits.device))
+    return TeacherTargets(logits, in_vocab, topk_ids)
+
+
+def rollout_loss(draft, feature, embeddings, teacher, assistant_mask,
+                 position_ids, steps, decay, pad_embedding):
     """Official TTT alignment: h[t] + e[t+r+1] predicts token[t+r+2]."""
     current_embeds = shift_left(embeddings, pad_embedding)
-    teacher_logits = shift_left(teacher_logits)
-    # Teacher logits[t+1] predict token[t+2]; mask is on the predicted token.
+    # Teacher index t+1 predicts token[t+2]; logits, in-vocab flags and top-k
+    # ids move together. The assistant mask is on the predicted token.
+    teacher_logits = shift_left(teacher.logits)
+    in_vocab = shift_left(teacher.in_vocab)
+    topk_ids = None if teacher.topk_ids is None else shift_left(teacher.topk_ids)
     mask = shift_left(shift_left(assistant_mask))
     active = torch.ones_like(mask, dtype=torch.bool)
     cache = None
@@ -100,11 +129,15 @@ def rollout_loss(draft, feature, embeddings, teacher_logits, assistant_mask,
     for rollout in range(steps):
         feature, draft_logits, cache = draft.step(
             feature, current_embeds, cache, position_ids=position_ids)
-        total = total + decay ** rollout * distill_loss(teacher_logits, draft_logits, mask, active)
+        loss_mask = mask.to(torch.bool) & in_vocab
+        total = total + decay ** rollout * distill_loss(teacher_logits, draft_logits, loss_mask, active)
         # Current loss is retained; only subsequent rounds are gated out.
-        active = update_topk_active(teacher_logits, draft_logits, mask, active, top_k)
+        active = update_topk_active(topk_ids, draft_logits, mask, active, draft.draft_ids)
         current_embeds = shift_left(current_embeds, pad_embedding)
         teacher_logits = shift_left(teacher_logits)
+        in_vocab = shift_left(in_vocab)
+        if topk_ids is not None:
+            topk_ids = shift_left(topk_ids)
         mask = shift_left(mask)
     return total, feature, draft_logits, cache, active
 
@@ -119,14 +152,12 @@ def distill_loss(target_logits, draft_logits, mask, active=None):
     return (token_loss * mask).mean()  # official EAGLE reduction over B x T
 
 
-def update_topk_active(target_logits, draft_logits, assistant_mask, active, top_k):
-    if top_k <= 0:
+def update_topk_active(target_topk_ids, draft_logits, assistant_mask, active, draft_ids):
+    """Gate on the draft's proposal, compared in TARGET token-id space."""
+    if target_topk_ids is None:
         return active
-    if top_k > target_logits.shape[-1]:
-        raise ValueError("--top-k exceeds vocabulary size")
-    target_topk = target_logits.detach().topk(top_k, dim=-1).indices
-    draft_token = draft_logits.detach().argmax(dim=-1, keepdim=True)
-    reliable = (target_topk == draft_token).any(dim=-1)
+    draft_token = draft_ids.to(draft_logits.device)[draft_logits.detach().argmax(dim=-1)]
+    reliable = (target_topk_ids == draft_token.unsqueeze(-1)).any(dim=-1)
     valid = assistant_mask.to(reliable.device, torch.bool)
     return active & (~valid | reliable)
 
@@ -139,9 +170,11 @@ def run_toy(args):
     hidden, vocab, intermediate = 32, 128, 64
     from toy_rotary import ToyRotary
     rotary = ToyRotary()
+    draft_ids = torch.randperm(vocab)[:vocab // 2].sort().values  # exercise the reduced-vocab path
     draft = XiaomiEagleDraft(
         hidden, vocab, intermediate, 4, 2, 8, 1e-6,
         low_layer=1, mid_layer=3, high_layer=5, rollout_steps=3, rotary_emb=rotary,
+        draft_ids=draft_ids,
     ).to(device)
     optimizer = torch.optim.AdamW(draft.parameters(), lr=1e-3)
     batch, seq = 1, 8
@@ -152,9 +185,10 @@ def run_toy(args):
     assistant_mask = torch.zeros(batch, seq, dtype=torch.bool, device=device)
     assistant_mask[:, 3:] = True
     positions = torch.arange(seq, device=device).view(1, 1, -1).expand(3, batch, -1)
+    teacher = prepare_teacher(target_logits, draft.draft_ids, draft.t2d, args.top_k)
     total, feature, draft_logits, cache, active = rollout_loss(
-        draft, feature, embeddings, target_logits, assistant_mask,
-        positions, 3, 0.8, args.top_k, torch.zeros_like(embeddings[:, :1]))
+        draft, feature, embeddings, teacher, assistant_mask,
+        positions, 3, 0.8, torch.zeros_like(embeddings[:, :1]))
     optimizer.zero_grad(set_to_none=True)
     total.backward()
     grad_params = [name for name, p in draft.named_parameters() if p.grad is not None and torch.isfinite(p.grad).all()]
@@ -165,6 +199,7 @@ def run_toy(args):
         "status": "ok", "device": str(device), "loss": float(total.item()),
         "feature_shape": list(feature.shape), "draft_logits_shape": list(draft_logits.shape),
         "cache_rollouts": len(cache), "active_positions": int(active.sum()),
+        "draft_vocab_size": int(draft.draft_lm_head.out_features),
         "draft_parameters_with_finite_grad": len(grad_params),
         "top_k": args.top_k,
     }, ensure_ascii=False))
@@ -210,11 +245,17 @@ def main():
 
     dataset = IDSpaceGroundTruthDataset(args.train_jsonl, args.image_root, processor, args.max_samples)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_single)
+    draft_ids = None
+    if args.draft_vocab is not None:
+        if not args.draft_vocab.is_file():
+            raise FileNotFoundError(args.draft_vocab)
+        draft_ids = torch.load(args.draft_vocab, map_location="cpu")["draft_ids"]
     draft = XiaomiEagleDraft(
         hidden, vocab, intermediate, heads, kv_heads, head_dim, eps,
         args.low_layer, args.mid_layer, args.high_layer, args.rollout_steps,
-        rotary_emb=target.model.language_model.rotary_emb,
+        rotary_emb=target.model.language_model.rotary_emb, draft_ids=draft_ids,
     ).to(device, dtype=next(target.parameters()).dtype)
+    draft_vocab = draft.draft_lm_head.out_features
     optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -236,6 +277,7 @@ def main():
                 "learning_rate": args.learning_rate, "low_layer": args.low_layer,
                 "mid_layer": args.mid_layer, "high_layer": args.high_layer,
                 "top_k": args.top_k, "hidden_size": hidden, "vocab_size": vocab,
+                "draft_vocab": str(args.draft_vocab), "draft_vocab_size": draft_vocab,
                 "device": str(device), "dataset_size": len(dataset),
             },
         )
@@ -253,14 +295,21 @@ def main():
                 raise ValueError("expanded multimodal sequence plus rollout exceeds target position capacity")
             with torch.no_grad():
                 target_out, multimodal_embeds, position_ids = target_forward_with_context(target, batch)
-                target_logits = target_out.logits
+                target_hidden_states = target_out.hidden_states
+                teacher = prepare_teacher(target_out.logits, draft.draft_ids, draft.t2d, args.top_k)
+                del target_out  # release the [1, T, V] full-vocab logits before the rollout
                 # Official padding shifts token IDs and appends ID 0, then embeds.
                 pad_embedding = target.get_input_embeddings()(torch.zeros_like(batch["input_ids"][:, :1]))
+                # teacher.in_vocab[t] is about the token at t+1; mask on that token.
+                predicted = batch["assistant_mask"][:, 1:].to(torch.bool)
+                in_vocab_hits = int((teacher.in_vocab[:, :-1] & predicted).sum().item())
+                in_vocab_ratio = in_vocab_hits / max(int(predicted.sum().item()), 1)
             # Fusion is TRAINABLE: it must not be inside the target no_grad block.
-            feature = draft.initial_feature(target_out.hidden_states)
+            feature = draft.initial_feature(target_hidden_states)
+            del target_hidden_states
             total, feature, draft_logits, cache, active = rollout_loss(
-                draft, feature, multimodal_embeds, target_logits, batch["assistant_mask"],
-                position_ids, args.rollout_steps, args.rollout_decay, args.top_k, pad_embedding)
+                draft, feature, multimodal_embeds, teacher, batch["assistant_mask"],
+                position_ids, args.rollout_steps, args.rollout_decay, pad_embedding)
             total.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=1.0)
             optimizer.step()
@@ -280,6 +329,7 @@ def main():
                 "train/global_step": global_step,
                 "train/rollout_steps": args.rollout_steps,
                 "train/assistant_tokens": assistant_tokens,
+                "train/teacher_argmax_in_draft_vocab": in_vocab_ratio,
                 "train/active_positions_after_gate": active_positions,
                 "train/active_ratio_after_gate": active_positions / max(int(active.numel()), 1),
                 "perf/step_time_sec": elapsed / global_step,

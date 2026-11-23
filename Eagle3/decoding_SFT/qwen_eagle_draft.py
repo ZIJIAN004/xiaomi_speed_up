@@ -155,16 +155,35 @@ class XiaomiEagleDraft(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, intermediate_size: int,
                  num_heads: int, num_kv_heads: int, head_dim: int, rms_eps: float,
                  low_layer: int = 1, mid_layer: int = 12, high_layer: int = 24,
-                 rollout_steps: int = 7, *, rotary_emb: nn.Module):
+                 rollout_steps: int = 7, *, rotary_emb: nn.Module,
+                 draft_ids: Optional[torch.Tensor] = None):
         super().__init__()
         self.rollout_steps = rollout_steps
         self.fusion = FeatureFusion(hidden_size, low_layer, mid_layer, high_layer)
         self.block = DraftBlock(hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, rms_eps, rotary_emb)
         self.output_norm = Qwen35RMSNorm(hidden_size, rms_eps)
-        self.draft_lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        # Official EAGLE-3 reduced vocabulary: draft logit i is target token
+        # draft_ids[i]; t2d marks target ids the draft can propose.
+        if draft_ids is None:
+            draft_ids = torch.arange(vocab_size)
+        draft_ids = torch.as_tensor(draft_ids, dtype=torch.long)
+        if draft_ids.ndim != 1 or not len(draft_ids):
+            raise ValueError("draft_ids must be a non-empty 1-D tensor")
+        if not bool((draft_ids[1:] > draft_ids[:-1]).all()):
+            raise ValueError("draft_ids must be strictly ascending (sorted, unique)")
+        if int(draft_ids[0]) < 0 or int(draft_ids[-1]) >= vocab_size:
+            raise ValueError("draft_ids fall outside the target vocabulary")
+        t2d = torch.zeros(vocab_size, dtype=torch.bool)
+        t2d[draft_ids] = True
+        self.register_buffer("draft_ids", draft_ids)
+        self.register_buffer("t2d", t2d)
+        self.draft_lm_head = nn.Linear(hidden_size, len(draft_ids), bias=False)
 
     def initial_feature(self, target_hidden_states):
         return self.fusion(tuple(target_hidden_states))
+
+    def to_target_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        return self.draft_ids[draft_token_ids]
 
     def step(self, feature, embedding, cache=None, position_ids=None):
         feature, cache = self.block(feature, embedding, cache, position_ids=position_ids)

@@ -12,7 +12,9 @@ from torch import nn
 from qwen_eagle_draft import DraftAttention, XiaomiEagleDraft
 from toy_rotary import ToyRotary
 from idspace_gt_dataset import collate_single
-from train_eagle_idspace import rollout_loss, shift_left, target_forward_with_context, update_topk_active
+from train_eagle_idspace import (TeacherTargets, prepare_teacher, rollout_loss, shift_left,
+                                 target_forward_with_context, update_topk_active)
+from build_draft_vocab import choose_size
 
 
 class TrainingTests(unittest.TestCase):
@@ -90,6 +92,7 @@ class TrainingTests(unittest.TestCase):
 
     def test_rollout_alignment(self):
         class RecordingDraft:
+            draft_ids = torch.arange(3)
             def __init__(self):
                 self.embeddings = []
             def step(self, feature, embedding, cache, position_ids):
@@ -103,8 +106,9 @@ class TrainingTests(unittest.TestCase):
         def loss(t, d, m, active):
             seen.append((t.clone(), m.clone()))
             return d.sum() * 0
+        targets = TeacherTargets(teacher, torch.ones(1, 6, dtype=torch.bool), None)
         with patch('train_eagle_idspace.distill_loss', loss):
-            rollout_loss(draft, embeddings, embeddings, teacher, mask, None, 3, .8, 0,
+            rollout_loss(draft, embeddings, embeddings, targets, mask, None, 3, .8,
                          torch.full((1, 1, 1), -1.))
         for depth in range(3):
             self.assertEqual(draft.embeddings[depth][0, 0, 0].item(), depth + 1)
@@ -124,12 +128,47 @@ class TrainingTests(unittest.TestCase):
 
     def test_gate_is_cumulative(self):
         teacher = torch.tensor([[[4., 0.], [4., 0.]]])
+        topk = teacher.topk(1, dim=-1).indices
+        ids = torch.arange(2)
         wrong = teacher.flip(-1)
         active = torch.ones(1, 2, dtype=torch.bool)
-        active = update_topk_active(teacher, wrong, active, active, 1)
+        active = update_topk_active(topk, wrong, active, active, ids)
         self.assertFalse(active.any())
-        active = update_topk_active(teacher, teacher, torch.ones_like(active), active, 1)
+        active = update_topk_active(topk, teacher, torch.ones_like(active), active, ids)
         self.assertFalse(active.any())
+
+    def test_gate_compares_in_target_id_space(self):
+        # Draft logit 0 is target id 5; target top-1 is id 5 -> reliable.
+        topk = torch.tensor([[[5]]])
+        draft_logits = torch.tensor([[[3., 0.]]])
+        active = torch.ones(1, 1, dtype=torch.bool)
+        kept = update_topk_active(topk, draft_logits, active, active, torch.tensor([5, 9]))
+        self.assertTrue(kept.all())
+
+    def test_reduced_vocab_teacher_and_mask(self):
+        logits = torch.tensor([[[0., 1., 5., 2.], [9., 1., 0., 2.]]])
+        ids = torch.tensor([1, 2])
+        t2d = torch.tensor([False, True, True, False])
+        teacher = prepare_teacher(logits, ids, t2d, 0)
+        torch.testing.assert_close(teacher.logits, logits[..., [1, 2]])
+        # Position 1's full-vocab argmax (id 0) is outside the draft vocab.
+        self.assertEqual(teacher.in_vocab.tolist(), [[True, False]])
+        self.assertIsNone(teacher.topk_ids)
+        draft = XiaomiEagleDraft(16, 4, 32, 4, 2, 8, 1e-6, low_layer=0, mid_layer=1,
+                                 high_layer=2, rotary_emb=ToyRotary(), draft_ids=ids)
+        self.assertEqual(draft.draft_lm_head.out_features, 2)
+        self.assertEqual(draft.t2d.tolist(), t2d.tolist())
+        self.assertEqual(draft.to(dtype=torch.bfloat16).draft_ids.dtype, torch.long)
+        with self.assertRaises(ValueError):
+            XiaomiEagleDraft(16, 4, 32, 4, 2, 8, 1e-6, rotary_emb=ToyRotary(),
+                             draft_ids=torch.tensor([2, 1]))
+
+    def test_vocab_size_choice(self):
+        ranked = [50, 30, 10, 5, 3, 2]  # total 100
+        self.assertEqual(choose_size(ranked, 0.9, 1, 100), 3)
+        self.assertEqual(choose_size(ranked, 0.9, 4, 100), 4)
+        self.assertEqual(choose_size(ranked, 0.9, 128, 100), 6)  # capped by distinct tokens
+        self.assertEqual(choose_size(ranked, 1.0, 1, 2), 2)       # capped by max size
 
     def test_native_context_capture_and_hook_cleanup(self):
         class Text(nn.Module):
@@ -167,9 +206,10 @@ class TrainingTests(unittest.TestCase):
                                 low_layer=0, mid_layer=1, high_layer=2, rotary_emb=ToyRotary())
         states = tuple(torch.randn(1, 6, 16) for _ in range(3))
         e = torch.randn(1, 6, 16)
+        teacher = prepare_teacher(torch.randn(1, 6, 32), draft.draft_ids, draft.t2d, 0)
         loss, *_ = rollout_loss(draft, draft.initial_feature(states), e,
-                               torch.randn(1, 6, 32), torch.ones(1, 6, dtype=torch.bool),
-                               None, 3, .8, 0, torch.zeros_like(e[:, :1]))
+                               teacher, torch.ones(1, 6, dtype=torch.bool),
+                               None, 3, .8, torch.zeros_like(e[:, :1]))
         loss.backward()
         self.assertGreater(draft.fusion.proj.weight.grad.abs().sum().item(), 0)
 

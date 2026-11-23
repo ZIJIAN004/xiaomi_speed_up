@@ -59,6 +59,18 @@ L = Σᵢ 0.8ⁱ · CE(target_distribution, draft_logitsᵢ)
 
 Only the ground-truth assistant answer span contributes to the loss. The prompt, image context, and chat-template boundary tokens remain context. Masked CE is averaged over batch × sequence, matching official EAGLE-3 reduction.
 
+## Reduced draft vocabulary (official EAGLE-3 d2t/t2d)
+
+A full 248320-way draft head costs about as much as the target head, which is a large share of a 0.8B target step. `build_draft_vocab.py` counts the tokenized ground-truth answers (the exact loss tokens) and picks the smallest frequency-ranked vocabulary reaching `--coverage` (default 0.999), rounded to 128 and capped at 32000. It also reports coverage on a held-out 10% of rows.
+
+```bash
+python Eagle3/decoding_SFT/build_draft_vocab.py \
+  --train-jsonl <train.jsonl> --tokenizer <model dir> --output-dir <dir>
+python Eagle3/decoding_SFT/train_eagle_idspace.py ... --draft-vocab <dir>/draft_vocab.pt
+```
+
+With `--draft-vocab`, the draft head outputs only `draft_ids`. The teacher is `softmax(target_logits[..., draft_ids])`, and positions whose full-vocab teacher argmax is outside the draft vocabulary are masked, as in the official `t2d` position mask. Full logits are reduced once per sample and freed before the rollout. `draft_ids` and `t2d` are saved in the checkpoint for inference-time id mapping. W&B logs `train/teacher_argmax_in_draft_vocab`.
+
 ## Native multimodal context and training cache
 
 The target language-model pre-hook captures its actual post-vision `inputs_embeds` and native `position_ids` in one target forward. Missing native context is an error, not a silent fallback. Draft RoPE is copied from the loaded target rotary module, including its checkpoint configuration and partial rotary dimension. Its floating buffers retain their original precision when draft weights are cast. Four-plane positions drop only the leading text plane for rotary computation.
