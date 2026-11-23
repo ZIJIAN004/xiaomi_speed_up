@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-# Wait for the selected GPU (default GPU 1) to have >21 GiB free, then run both evaluations sequentially.
+# Wait for the selected GPU (default GPU 1) to have more than FREE_THRESHOLD_MIB free (default 21 GiB), then run both evaluations sequentially.
 # A failure in one benchmark is recorded but does not prevent the other.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPEED_UP_PYTHON="${SPEED_UP_PYTHON:-/home/mr_jiang/miniforge3/envs/speed_up/bin/python}"
@@ -14,8 +14,8 @@ OMNI_OUTPUT="${OMNI_OUTPUT:-$RUN_ROOT/omnidocbench_v15}"
 IDSPACE_OUTPUT="${IDSPACE_OUTPUT:-$RUN_ROOT/idspace_validation}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/benchmark/data}"
 OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
-IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl}"
-IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/qkr/runs/idspace_e3/prepared/images}"
+IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl}"
+IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/Lora/runs/idspace_e3/prepared/images}"
 LOG_ROOT="$RUN_ROOT/logs"
 mkdir -p "$LOG_ROOT"
 
@@ -83,7 +83,7 @@ if ! validate_paths; then
   exit 2
 fi
 
-log "Waiting for GPU $GPU_ID free memory > ${FREE_THRESHOLD_MIB} MiB (21 GiB), checking every ${INTERVAL_SECONDS}s"
+log "Waiting for GPU $GPU_ID free memory > ${FREE_THRESHOLD_MIB} MiB, checking every ${INTERVAL_SECONDS}s"
 while :; do
   free_mib="$(query_free_mib)"
   if [[ "$free_mib" =~ ^[0-9]+$ ]]; then

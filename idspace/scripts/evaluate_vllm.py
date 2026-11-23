@@ -84,16 +84,16 @@ def make_benchmark_manifest(rows, image_root: Path, output: Path):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path,
-                        default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared"),
-                        help="IDSpace prepared directory (default: /home/mr_jiang/qkr/runs/idspace_e3/prepared)")
+                        default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared"),
+                        help="IDSpace prepared directory (default: /home/mr_jiang/Lora/runs/idspace_e3/prepared)")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="New benchmark result directory")
     parser.add_argument("--split", default="validation", choices=("train", "validation", "test"))
     parser.add_argument("--input-jsonl", type=Path,
-                        default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl"),
-                        help="Input JSONL (default: /home/mr_jiang/qkr/runs/idspace_e3/prepared/validation.jsonl)")
+                        default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl"),
+                        help="Input JSONL (default: /home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl)")
     parser.add_argument("--image-root", type=Path,
-                        default=Path("/home/mr_jiang/qkr/runs/idspace_e3/prepared/images"),
+                        default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared/images"),
                         help="Root directory for image paths from JSONL")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
