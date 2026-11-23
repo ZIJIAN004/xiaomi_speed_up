@@ -118,6 +118,7 @@ log "OmniDocBench finished with status $omni_status; continuing regardless"
 log "Starting IDSpace validation"
 (
   cd "$PROJECT_ROOT" || exit 1
+  PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SPEED_UP_PYTHON" idspace/scripts/evaluate_vllm.py \
     --input-jsonl "$IDSPACE_JSONL" \
     --image-root "$IDSPACE_IMAGE_ROOT" \

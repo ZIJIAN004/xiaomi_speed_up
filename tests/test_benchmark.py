@@ -628,7 +628,8 @@ class RequestIntegrationTests(unittest.TestCase):
     def args():
         return SimpleNamespace(served_model_name="test", workers=8, max_tokens=None,
                                no_logprobs=False, retry_presence_penalty=1.5,
-                               base_url="http://127.0.0.1:26000", request_timeout=10, profile_max_iterations=64)
+                               base_url="http://127.0.0.1:26000", request_timeout=10, warmup_request_timeout=10,
+                               profile_max_iterations=64)
 
     def test_request_keeps_usage_and_does_not_send_fixed_cap(self):
         from PIL import Image

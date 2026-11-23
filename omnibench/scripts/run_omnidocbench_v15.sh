@@ -28,7 +28,7 @@ ARGS=(--dataset "$OMNIDOC_ROOT" --model "$MODEL_PATH" --output "$RESULT_ROOT" --
       --profile-max-iterations "${PROFILE_MAX_ITERATIONS:-64}"
       --gpu-memory-utilization "${GPU_MEM_UTIL:-0.90}" --max-model-len "${MAX_MODEL_LEN:-16384}"
       --dtype "${DTYPE:-auto}" --monitor-interval "${MONITOR_INTERVAL:-1}"
-      --request-timeout "${REQUEST_TIMEOUT:-600}"
+      --request-timeout "${REQUEST_TIMEOUT:-600}" --warmup-request-timeout "${WARMUP_REQUEST_TIMEOUT:-1800}"
       --output-retention "${OUTPUT_RETENTION:-sampled}" --retain-samples "${RETAIN_SAMPLES:-10}"
       --retain-worst "${RETAIN_WORST:-10}" --retention-seed "${RETENTION_SEED:-42}")
 [[ -z "${MAX_TOKENS:-}" ]] || ARGS+=(--max-tokens "$MAX_TOKENS")

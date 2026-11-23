@@ -567,6 +567,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-model-len", type=int, default=16384)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--request-timeout", type=float, default=600)
+    # Eager-mode first requests pay one-time kernel compilation, so warmup gets a longer per-request limit.
+    parser.add_argument("--warmup-request-timeout", type=float, default=1800)
     parser.add_argument("--monitor-interval", type=float, default=1)
     parser.add_argument("--dcgm-url", help="localhost DCGM exporter /metrics URL; optional hardware counters")
     parser.add_argument("--gpu-cost-per-hour", type=float, help="optional reserved-GPU price in a declared currency/hour")
@@ -591,6 +593,8 @@ def parse_args(argv=None):
         parser.error("retention sample counts must be nonnegative")
     if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 1355 or args.monitor_interval <= 0:
         parser.error("workers>=1, warmup>=3, representatives=3..1355 and monitor-interval>0 required")
+    if args.request_timeout <= 0 or args.warmup_request_timeout <= 0:
+        parser.error("request-timeout and warmup-request-timeout must be positive")
     if args.profile_max_iterations < 1:
         parser.error("profile-max-iterations must be positive; unbounded representative traces are not enabled")
     if args.max_tokens is not None and args.max_tokens < 1:
@@ -713,8 +717,10 @@ def main(args=None):
     run_start = run_end = None
     with Monitor(output / "monitor", args.base_url, args.gpu, args.server_pid, args.monitor_interval, args.dcgm_url) as monitor:
         monitor.phase = "warmup"
+        warmup_args = copy(args)
+        warmup_args.request_timeout = args.warmup_request_timeout
         for i in range(args.warmup):
-            r = request_one(samples[i % len(samples)], args, output, "warmup", attempt=i)
+            r = request_one(samples[i % len(samples)], warmup_args, output, "warmup", attempt=i)
             warmups.append(r)
             print(f"warmup {i + 1}/{args.warmup}: success={r['success']}", flush=True)
         dump_json(output / "warmup.json", warmups)
