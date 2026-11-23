@@ -33,7 +33,7 @@ class TrainingTests(unittest.TestCase):
         cache = None
         for depth in range(3):
             x = torch.randn(b, t, 32, requires_grad=True)
-            result, cache = attn(x, cache, positions)
+            result, cache = attn(x, cache, positions + depth)  # caller supplies round positions
             raw, gate = attn.q_proj(x).view(b, t, 4, 16).chunk(2, -1)
             q = attn.q_norm(raw).transpose(1, 2)
             cos, sin = attn.rotary_emb(x, positions + depth)
@@ -225,6 +225,29 @@ class TrainingTests(unittest.TestCase):
         # ids are argmax[1]=5 (hit) and argmax[2]=7 (miss).
         self.assertEqual((stats.hits, stats.totals), ([1], [2]))
 
+    def test_rollout_positions_follow_native_mrope(self):
+        class PositionDraft:
+            draft_ids = torch.arange(2)
+            def __init__(self):
+                self.seen = []
+            def step(self, feature, embedding, cache, position_ids):
+                self.seen.append(position_ids.clone())
+                return feature, torch.zeros(1, 5, 2), (cache or []) + [{}]
+        # [3, B, T]: columns 0-1 image patches (distinct t/h/w), then text 5,6,7.
+        native = torch.tensor([[[3, 3, 5, 6, 7]], [[3, 4, 5, 6, 7]], [[3, 3, 5, 6, 7]]])
+        teacher = TeacherTargets(torch.zeros(1, 5, 2), torch.zeros(1, 5, dtype=torch.long),
+                                 torch.ones(1, 5, dtype=torch.bool), None)
+        draft, e = PositionDraft(), torch.zeros(1, 5, 1)
+        rollout_loss(draft, e, e, teacher, torch.ones(1, 5, dtype=torch.bool), native, 3, .8,
+                     torch.zeros(1, 1, 1))
+        torch.testing.assert_close(draft.seen[0], native)
+        # Round 1, last image column takes the true text position 5 on every
+        # plane (base + 1 would give image-derived [4, 5, 4]).
+        self.assertEqual(draft.seen[1][:, 0, 1].tolist(), [5, 5, 5])
+        # Text columns: identical to official base + depth.
+        torch.testing.assert_close(draft.seen[2][..., 2], native[..., 2] + 2)
+        self.assertEqual(draft.seen[2][:, 0, 4].tolist(), [9, 9, 9])  # tail extrapolation
+
     def test_estimated_accept_length(self):
         self.assertAlmostEqual(estimated_accept_length([0.5, 0.5]), 0.5 + 0.25)
         self.assertEqual(estimated_accept_length([1.0, 1.0, 0.0, 1.0]), 2.0)
@@ -243,11 +266,11 @@ class TrainingTests(unittest.TestCase):
 
     def test_checkpoint_write_is_atomic_replace(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "last.pt"
+            path = Path(tmp) / "best.pt"
             save_checkpoint(path, {"epoch": 0})
             save_checkpoint(path, {"epoch": 1})
             self.assertEqual(torch.load(path)["epoch"], 1)
-            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["last.pt"])
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["best.pt"])
 
     def test_vocab_size_choice(self):
         ranked = [50, 30, 10, 5, 3, 2]  # total 100

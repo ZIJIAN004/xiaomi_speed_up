@@ -35,9 +35,8 @@ def parse_args():
                    help="seeds Python, PyTorch, the DataLoader shuffle and the train/val split")
     p.add_argument("--val-fraction", type=float, default=0.05,
                    help="fixed seeded fraction of --train-jsonl rows held out for validation; 0 disables")
-    p.add_argument("--resume", type=Path, default=None, help="last.pt/best.pt/epoch_N.pt to continue from")
-    p.add_argument("--keep-epoch-checkpoints", action="store_true",
-                   help="also keep epoch_N.pt every epoch (each holds weights + optimizer state)")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="best.pt to continue from; training restarts after the saved epoch")
     p.add_argument("--rollout-steps", type=int, default=7)
     p.add_argument("--rollout-decay", type=float, default=0.8)
     p.add_argument("--epochs", type=int, default=1)
@@ -133,6 +132,17 @@ def shift_left(tensor, pad=None):
     return torch.cat((tensor[:, 1:], tail), dim=1)
 
 
+def shift_positions(position_ids):
+    """Round r+1 positions: column t takes the native position of column t+1.
+
+    Official TTT adds rollout depth (base + r). For text, native M-RoPE positions
+    grow by one per token on every plane, so this is identical. Across an
+    image -> text boundary it yields the true text position instead of an image
+    patch position + r. Tail columns (masked padding) extrapolate by +1.
+    """
+    return torch.cat((position_ids[..., 1:], position_ids[..., -1:] + 1), dim=-1)
+
+
 class TeacherTargets(NamedTuple):
     logits: torch.Tensor            # [B, T, draft_vocab], target logits restricted to draft_ids
     argmax_ids: torch.Tensor        # [B, T] long, target-space argmax of full target logits
@@ -182,6 +192,9 @@ def rollout_loss(draft, feature, embeddings, teacher, assistant_mask,
     topk_ids = None if teacher.topk_ids is None else shift_left(teacher.topk_ids)
     mask = shift_left(shift_left(assistant_mask))
     active = torch.ones_like(mask, dtype=torch.bool)
+    if position_ids is None:  # text-only/toy callers: plain 0..T-1 positions
+        bsz, seq = assistant_mask.shape
+        position_ids = torch.arange(seq, device=assistant_mask.device).view(1, -1).expand(bsz, -1)
     cache = None
     total = feature.new_zeros((), dtype=torch.float32)
     stats = RolloutStats([], [], [])
@@ -202,6 +215,7 @@ def rollout_loss(draft, feature, embeddings, teacher, assistant_mask,
         current_embeds = shift_left(current_embeds, pad_embedding)
         teacher_logits = shift_left(teacher_logits)
         argmax_ids = shift_left(argmax_ids)
+        position_ids = shift_positions(position_ids)
         in_vocab = shift_left(in_vocab)
         if topk_ids is not None:
             topk_ids = shift_left(topk_ids)
@@ -587,18 +601,23 @@ def main():
                          f"val_ploss={val_metrics[f'val/ploss_{i}']:.4f}")
             print(line, flush=True)
 
-        improved = bool(val_metrics) and val_metrics["val/est_accept_len"] > best
-        if improved:
-            best = val_metrics["val/est_accept_len"]
-        payload = checkpoint_payload(draft, optimizer, scheduler, loader_generator, epoch,
-                                     optimizer_step, global_step, best, args, draft_config, val_metrics)
-        save_checkpoint(args.output_dir / "last.pt", payload)
-        if improved:
-            save_checkpoint(args.output_dir / "best.pt", payload)
-        if args.keep_epoch_checkpoints:
-            save_checkpoint(args.output_dir / f"epoch_{epoch}.pt", payload)
-        print(f"epoch={epoch} saved last.pt" + (f" and best.pt (val est_accept_len={best:.4f})" if improved else ""),
-              flush=True)
+        # Save ONLY when validation improves. Without a validation split there is
+        # nothing to compare, so the final epoch is saved once instead.
+        if val_metrics:
+            if val_metrics["val/est_accept_len"] > best:
+                best = val_metrics["val/est_accept_len"]
+                save_checkpoint(args.output_dir / "best.pt", checkpoint_payload(
+                    draft, optimizer, scheduler, loader_generator, epoch, optimizer_step,
+                    global_step, best, args, draft_config, val_metrics))
+                print(f"epoch={epoch} saved best.pt (val est_accept_len={best:.4f})", flush=True)
+            else:
+                print(f"epoch={epoch} no improvement (val est_accept_len="
+                      f"{val_metrics['val/est_accept_len']:.4f} <= best {best:.4f}); not saved", flush=True)
+        elif epoch == args.epochs - 1:
+            save_checkpoint(args.output_dir / "final.pt", checkpoint_payload(
+                draft, optimizer, scheduler, loader_generator, epoch, optimizer_step,
+                global_step, best, args, draft_config, val_metrics))
+            print(f"epoch={epoch} no validation split; saved final.pt", flush=True)
     if wandb is not None:
         wandb.finish()
 

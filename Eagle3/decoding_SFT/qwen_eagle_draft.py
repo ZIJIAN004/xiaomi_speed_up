@@ -94,8 +94,9 @@ class DraftAttention(nn.Module):
         for previous in history:
             if previous["k"].shape != k.shape or previous["v"].shape != v.shape:
                 raise ValueError("training rollout cache requires unchanged batch/sequence shapes")
-        # Official TTT uses base positions + rollout depth, not token-cache length.
-        cos, sin = self.rotary_emb(x, position_ids + len(history))
+        # The caller supplies this round's positions (native positions shifted by
+        # rollout depth, see train_eagle_idspace.shift_positions); not cache length.
+        cos, sin = self.rotary_emb(x, position_ids)
         rotary_dim = cos.shape[-1]
         if rotary_dim > self.head_dim or rotary_dim % 2:
             raise ValueError("native rotary dimension must be even and <= head_dim")

@@ -114,9 +114,10 @@ class IDSpaceGroundTruthDataset(Dataset):
             image = source.convert("RGB")
             image.load()
 
+        # Same order as inference (benchmark/run_benchmark.py): text, then image.
         user_messages = [{"role": "user", "content": [
-            {"type": "image", "image": image},
             {"type": "text", "text": PROMPT},
+            {"type": "image", "image": image},
         ]}]
         full_messages = user_messages + [{"role": "assistant", "content": answer}]
         full_template = self.processor.apply_chat_template(

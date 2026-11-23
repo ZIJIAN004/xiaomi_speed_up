@@ -123,9 +123,10 @@ def serialize_target(target: Any) -> str:
 
 
 def make_messages(image: Image.Image, answer: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Same order as inference (benchmark/run_benchmark.py): text, then image.
     user = [{"role": "user", "content": [
-        {"type": "image", "image": image},
         {"type": "text", "text": PROMPT},
+        {"type": "image", "image": image},
     ]}]
     full = user + [{"role": "assistant", "content": answer}]
     return user, full
