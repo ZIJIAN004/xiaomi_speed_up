@@ -22,13 +22,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 from collections import Counter
 from pathlib import Path
 
 import torch
 
-from idspace_gt_dataset import end_of_turn_id, serialize_target
+from idspace_gt_dataset import end_of_turn_id, serialize_target, split_train_val
 
 REPORT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32000)
 
@@ -42,9 +41,9 @@ def parse_args():
                    help="target frequency-weighted coverage of answer tokens")
     p.add_argument("--max-size", type=int, default=32000, help="official EAGLE-3 draft vocab size")
     p.add_argument("--round-to", type=int, default=128)
-    p.add_argument("--holdout-fraction", type=float, default=0.1,
-                   help="rows held out to report coverage on answers not used for selection")
-    p.add_argument("--seed", type=int, default=0)
+    # Must match train_eagle_idspace.py so validation rows never shape the vocab.
+    p.add_argument("--val-fraction", type=float, default=0.05)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--trust-remote-code", action="store_true")
     return p.parse_args()
@@ -54,21 +53,20 @@ def load_answer_ids(path: Path, tokenizer, max_samples: int):
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if max_samples:
         rows = rows[:max_samples]
+    # One entry per row (None for unusable rows) so split indices stay aligned.
     sequences, failures = [], Counter()
     eot = end_of_turn_id(tokenizer)  # supervised after every answer, see idspace_gt_dataset
     for row in rows:
         target = row.get("target")
-        if not isinstance(target, dict):
+        ids = tokenizer(serialize_target(target), add_special_tokens=False).input_ids             if isinstance(target, dict) else None
+        if ids is None:
             failures["target_not_object"] += 1
-            continue
-        ids = tokenizer(serialize_target(target), add_special_tokens=False).input_ids
-        if not ids:
+        elif not ids:
             failures["empty_answer"] += 1
-            continue
-        sequences.append(ids + [eot])
-    if not sequences:
+        sequences.append(ids + [eot] if ids else None)
+    if not any(sequences):
         raise ValueError(f"no usable answers in {path}: {dict(failures)}")
-    return len(rows), sequences, failures
+    return sequences, failures
 
 
 def choose_size(ranked_counts: list[int], coverage: float, round_to: int, max_size: int) -> int:
@@ -90,26 +88,24 @@ def coverage_of(ids: set[int], counter: Counter) -> float:
 
 def main():
     args = parse_args()
-    if not 0 < args.coverage <= 1 or not 0 <= args.holdout_fraction < 1:
-        raise ValueError("--coverage must be in (0, 1]; --holdout-fraction in [0, 1)")
+    if not 0 < args.coverage <= 1:
+        raise ValueError("--coverage must be in (0, 1]")
     if args.max_size < 1 or args.round_to < 1:
         raise ValueError("--max-size and --round-to must be positive")
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    rows, sequences, failures = load_answer_ids(args.train_jsonl, tokenizer, args.max_samples)
+    sequences, failures = load_answer_ids(args.train_jsonl, tokenizer, args.max_samples)
 
-    # Selection uses the split-off train part; the held-out part estimates
-    # coverage on unseen answers (new names/numbers). Final vocab uses all rows.
-    order = list(range(len(sequences)))
-    random.Random(args.seed).shuffle(order)
-    n_holdout = int(len(order) * args.holdout_fraction)
-    holdout = Counter(t for i in order[:n_holdout] for t in sequences[i])
-    fit = Counter(t for i in order[n_holdout:] for t in sequences[i])
-    full = Counter(t for ids in sequences for t in ids)
+    # Vocab is chosen on the TRAINING split only; the validation split (same
+    # seeded split as training) measures coverage on unseen answers.
+    train_idx, val_idx = split_train_val(len(sequences), args.val_fraction, args.seed)
+    full = Counter(t for i in train_idx if sequences[i] for t in sequences[i])
+    val = Counter(t for i in val_idx if sequences[i] for t in sequences[i])
+    usable = sum(1 for i in train_idx if sequences[i])
+    if not full:
+        raise ValueError("training split has no usable answers")
 
-    fit_size = choose_size([c for _, c in fit.most_common()], args.coverage, args.round_to, args.max_size)
-    fit_vocab = {t for t, _ in fit.most_common(fit_size)}
     size = choose_size([c for _, c in full.most_common()], args.coverage, args.round_to, args.max_size)
     draft_ids = torch.tensor(sorted(t for t, _ in full.most_common(size)), dtype=torch.long)
     chosen = set(draft_ids.tolist())
@@ -122,24 +118,26 @@ def main():
     report = {
         "train_jsonl": str(args.train_jsonl),
         "tokenizer": str(args.tokenizer),
-        "rows": rows,
-        "usable_answers": len(sequences),
+        "rows": len(sequences),
+        "train_rows": len(train_idx),
+        "val_rows": len(val_idx),
+        "val_fraction": args.val_fraction,
+        "seed": args.seed,
+        "usable_train_answers": usable,
         "failures": dict(failures),
-        "answer_tokens": total_tokens,
-        "mean_answer_tokens": total_tokens / len(sequences),
+        "train_answer_tokens": total_tokens,
+        "mean_answer_tokens": total_tokens / usable,
         "distinct_tokens": len(full),
         "coverage_target": args.coverage,
         "chosen_size": size,
         "chosen_train_coverage": coverage_of(chosen, full),
-        "holdout_rows": n_holdout,
-        "holdout_size_selected_without_holdout": fit_size,
-        "holdout_coverage": coverage_of(fit_vocab, holdout) if n_holdout else None,
+        "val_coverage": coverage_of(chosen, val) if val else None,
         "train_coverage_by_size": curve,
         "max_draft_id": int(draft_ids.max()),
         "top_tokens": [{"id": t, "count": c, "text": tokenizer.decode([t])} for t, c in full.most_common(50)],
     }
-    if report["holdout_coverage"] is not None and report["holdout_coverage"] < args.coverage - 0.005:
-        report["warning"] = "held-out coverage is well below target: answers contain many unseen tokens"
+    if report["val_coverage"] is not None and report["val_coverage"] < args.coverage - 0.005:
+        report["warning"] = "validation coverage is well below target: answers contain many unseen tokens"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -151,8 +149,9 @@ def main():
     (args.output_dir / "draft_vocab_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({k: report[k] for k in (
-        "usable_answers", "answer_tokens", "distinct_tokens", "chosen_size",
-        "chosen_train_coverage", "holdout_coverage", "train_coverage_by_size")}, ensure_ascii=False, indent=2))
+        "rows", "train_rows", "val_rows", "usable_train_answers", "mean_answer_tokens",
+        "distinct_tokens", "chosen_size", "chosen_train_coverage", "val_coverage",
+        "train_coverage_by_size")}, ensure_ascii=False, indent=2))
     if "warning" in report:
         print("WARNING:", report["warning"])
 

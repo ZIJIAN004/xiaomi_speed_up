@@ -6,14 +6,16 @@ import argparse
 import contextlib
 import json
 import math
+import os
+import random
 import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from idspace_gt_dataset import IDSpaceGroundTruthDataset, collate_single
+from idspace_gt_dataset import IDSpaceGroundTruthDataset, collate_single, split_train_val
 from qwen_eagle_draft import XiaomiEagleDraft
 
 
@@ -29,6 +31,13 @@ def parse_args():
     p.add_argument("--toy", action="store_true", help="run a tiny synthetic forward/backward test without loading Xiaomi")
     p.add_argument("--toy-device", choices=("cpu", "cuda"), default="cpu")
     p.add_argument("--max-samples", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42,
+                   help="seeds Python, PyTorch, the DataLoader shuffle and the train/val split")
+    p.add_argument("--val-fraction", type=float, default=0.05,
+                   help="fixed seeded fraction of --train-jsonl rows held out for validation; 0 disables")
+    p.add_argument("--resume", type=Path, default=None, help="last.pt/best.pt/epoch_N.pt to continue from")
+    p.add_argument("--keep-epoch-checkpoints", action="store_true",
+                   help="also keep epoch_N.pt every epoch (each holds weights + optimizer state)")
     p.add_argument("--rollout-steps", type=int, default=7)
     p.add_argument("--rollout-decay", type=float, default=0.8)
     p.add_argument("--epochs", type=int, default=1)
@@ -63,6 +72,22 @@ def warmup_decay_factor(step, warmup_steps, total_steps):
     if step < warmup_steps:
         return math.log(step + 1) / math.log(warmup_steps)
     return max(0.0, (total_steps - step) / max(total_steps - warmup_steps, 1))
+
+
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)  # also seeds every CUDA device
+    return torch.Generator().manual_seed(seed)  # for DataLoader shuffling
+
+
+def round_metrics(prefix, losses, hits, totals):
+    """Official-style per-round logs: {prefix}/ploss_i and {prefix}/acc_i."""
+    metrics = {}
+    for i, (loss, hit, total) in enumerate(zip(losses, hits, totals)):
+        metrics[f"{prefix}/ploss_{i}"] = float(loss)
+        if total:
+            metrics[f"{prefix}/acc_{i}"] = hit / total
+    return metrics
 
 
 def freeze(model):
@@ -110,7 +135,8 @@ def shift_left(tensor, pad=None):
 
 class TeacherTargets(NamedTuple):
     logits: torch.Tensor            # [B, T, draft_vocab], target logits restricted to draft_ids
-    in_vocab: torch.Tensor          # [B, T] bool, t2d[argmax of full target logits]
+    argmax_ids: torch.Tensor        # [B, T] long, target-space argmax of full target logits
+    in_vocab: torch.Tensor          # [B, T] bool, t2d[argmax_ids]
     topk_ids: Optional[torch.Tensor]  # [B, T, k] target-space ids, None when gating is off
 
 
@@ -126,9 +152,22 @@ def prepare_teacher(target_logits, draft_ids, t2d, top_k):
     if top_k > target_logits.shape[-1]:
         raise ValueError("--top-k exceeds vocabulary size")
     topk_ids = target_logits.topk(top_k, dim=-1).indices if top_k > 0 else None
-    in_vocab = t2d.to(target_logits.device)[target_logits.argmax(dim=-1)]
+    argmax_ids = target_logits.argmax(dim=-1)
+    in_vocab = t2d.to(target_logits.device)[argmax_ids]
     logits = target_logits.index_select(-1, draft_ids.to(target_logits.device))
-    return TeacherTargets(logits, in_vocab, topk_ids)
+    return TeacherTargets(logits, argmax_ids, in_vocab, topk_ids)
+
+
+class RolloutStats(NamedTuple):
+    """Per-round values, official EAGLE-3 ``ploss_i`` / ``acc_i``.
+
+    acc_i = draft greedy token == target greedy token (target-id space) over
+    the round's assistant positions. Out-of-draft-vocab targets count as misses,
+    matching the official loss_mask denominator. Ungated by --top-k.
+    """
+    losses: list            # detached scalar tensors, one per round
+    hits: list              # int correct positions per round
+    totals: list            # int supervised positions per round
 
 
 def rollout_loss(draft, feature, embeddings, teacher, assistant_mask,
@@ -138,26 +177,36 @@ def rollout_loss(draft, feature, embeddings, teacher, assistant_mask,
     # Teacher index t+1 predicts token[t+2]; logits, in-vocab flags and top-k
     # ids move together. The assistant mask is on the predicted token.
     teacher_logits = shift_left(teacher.logits)
+    argmax_ids = shift_left(teacher.argmax_ids)
     in_vocab = shift_left(teacher.in_vocab)
     topk_ids = None if teacher.topk_ids is None else shift_left(teacher.topk_ids)
     mask = shift_left(shift_left(assistant_mask))
     active = torch.ones_like(mask, dtype=torch.bool)
     cache = None
     total = feature.new_zeros((), dtype=torch.float32)
+    stats = RolloutStats([], [], [])
     for rollout in range(steps):
         feature, draft_logits, cache = draft.step(
             feature, current_embeds, cache, position_ids=position_ids)
         loss_mask = mask.to(torch.bool) & in_vocab
-        total = total + decay ** rollout * distill_loss(teacher_logits, draft_logits, loss_mask, active)
+        round_loss = distill_loss(teacher_logits, draft_logits, loss_mask, active)
+        total = total + decay ** rollout * round_loss
+        with torch.no_grad():
+            supervised = mask.to(torch.bool)
+            proposal = draft.draft_ids.to(draft_logits.device)[draft_logits.argmax(dim=-1)]
+            stats.losses.append(round_loss.detach())
+            stats.hits.append(int(((proposal == argmax_ids) & supervised).sum()))
+            stats.totals.append(int(supervised.sum()))
         # Current loss is retained; only subsequent rounds are gated out.
         active = update_topk_active(topk_ids, draft_logits, mask, active, draft.draft_ids)
         current_embeds = shift_left(current_embeds, pad_embedding)
         teacher_logits = shift_left(teacher_logits)
+        argmax_ids = shift_left(argmax_ids)
         in_vocab = shift_left(in_vocab)
         if topk_ids is not None:
             topk_ids = shift_left(topk_ids)
         mask = shift_left(mask)
-    return total, feature, draft_logits, cache, active
+    return total, feature, draft_logits, cache, active, stats
 
 
 def distill_loss(target_logits, draft_logits, mask, active=None):
@@ -184,7 +233,7 @@ def run_toy(args):
     device = torch.device(args.toy_device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--toy-device cuda requested but CUDA is unavailable")
-    torch.manual_seed(7)
+    set_seed(args.seed)
     hidden, vocab, intermediate = 32, 128, 64
     from toy_rotary import ToyRotary
     rotary = ToyRotary()
@@ -204,7 +253,7 @@ def run_toy(args):
     assistant_mask[:, 3:] = True
     positions = torch.arange(seq, device=device).view(1, 1, -1).expand(3, batch, -1)
     teacher = prepare_teacher(target_logits, draft.draft_ids, draft.t2d, args.top_k)
-    total, feature, draft_logits, cache, active = rollout_loss(
+    total, feature, draft_logits, cache, active, stats = rollout_loss(
         draft, feature, embeddings, teacher, assistant_mask,
         positions, 3, 0.8, torch.zeros_like(embeddings[:, :1]))
     optimizer.zero_grad(set_to_none=True)
@@ -218,9 +267,108 @@ def run_toy(args):
         "feature_shape": list(feature.shape), "draft_logits_shape": list(draft_logits.shape),
         "cache_rollouts": len(cache), "active_positions": int(active.sum()),
         "draft_vocab_size": int(draft.draft_lm_head.out_features),
+        **round_metrics("toy", stats.losses, stats.hits, stats.totals),
         "draft_parameters_with_finite_grad": len(grad_params),
         "top_k": args.top_k,
     }, ensure_ascii=False))
+
+
+def estimated_accept_length(accs):
+    """Teacher-forced chain estimate: sum_k prod_{i<=k} acc_i (excludes the bonus token)."""
+    length, survive = 0.0, 1.0
+    for acc in accs:
+        survive *= acc
+        length += survive
+    return length
+
+
+def sample_rollout(target, draft, batch, args, capacity, autocast):
+    """Frozen target forward + draft TTT rollout for one batch-size-one sample."""
+    if capacity and batch["input_ids"].shape[1] + args.rollout_steps - 1 > capacity:
+        raise ValueError("expanded multimodal sequence plus rollout exceeds target position capacity")
+    with torch.no_grad():
+        target_out, multimodal_embeds, position_ids = target_forward_with_context(target, batch)
+        target_hidden_states = target_out.hidden_states
+        teacher = prepare_teacher(target_out.logits, draft.draft_ids, draft.t2d, args.top_k)
+        del target_out  # release the [1, T, V] full-vocab logits before the rollout
+        # Official padding shifts token IDs and appends ID 0, then embeds.
+        pad_embedding = target.get_input_embeddings()(torch.zeros_like(batch["input_ids"][:, :1]))
+        # teacher.in_vocab[t] is about the token at t+1; mask on that token.
+        predicted = batch["assistant_mask"][:, 1:].to(torch.bool)
+        in_vocab_hits = int((teacher.in_vocab[:, :-1] & predicted).sum().item())
+        in_vocab_ratio = in_vocab_hits / max(int(predicted.sum().item()), 1)
+    # Fusion is TRAINABLE: it must not be inside the target no_grad block.
+    with autocast():
+        feature = draft.initial_feature(target_hidden_states)
+        del target_hidden_states
+        total, _, _, _, active, stats = rollout_loss(
+            draft, feature, multimodal_embeds, teacher, batch["assistant_mask"],
+            position_ids, args.rollout_steps, args.rollout_decay, pad_embedding)
+    return total, active, stats, in_vocab_ratio
+
+
+@torch.no_grad()
+def evaluate(target, draft, loader, args, capacity, autocast, device):
+    was_training = draft.training
+    draft.eval()
+    loss_sums = [0.0] * args.rollout_steps
+    hits = [0] * args.rollout_steps
+    totals = [0] * args.rollout_steps
+    for raw in loader:
+        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
+        _, _, stats, _ = sample_rollout(target, draft, batch, args, capacity, autocast)
+        for i in range(args.rollout_steps):
+            loss_sums[i] += float(stats.losses[i])
+            hits[i] += stats.hits[i]
+            totals[i] += stats.totals[i]
+    draft.train(was_training)
+    losses = [value / max(len(loader), 1) for value in loss_sums]
+    accs = [h / t if t else 0.0 for h, t in zip(hits, totals)]
+    metrics = round_metrics("val", losses, hits, totals)
+    metrics["val/loss"] = sum(args.rollout_decay ** i * value for i, value in enumerate(losses))
+    metrics["val/est_accept_len"] = estimated_accept_length(accs)
+    return metrics
+
+
+def save_checkpoint(path, payload):
+    """Atomic write: a crash mid-save never corrupts the previous checkpoint."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def checkpoint_payload(draft, optimizer, scheduler, generator, epoch, optimizer_step,
+                       global_step, best, args, draft_config, val_metrics):
+    return {
+        "draft": draft.state_dict(),
+        "draft_config": draft_config,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,  # last COMPLETED epoch
+        "optimizer_step": optimizer_step,
+        "global_step": global_step,
+        "best_est_accept_len": best,
+        "val_metrics": val_metrics,
+        "rng": {"python": random.getstate(), "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all(), "loader": generator.get_state()},
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    }
+
+
+def resolve_split(dataset_len, args):
+    """Fixed seeded train/validation split, recorded and verified on resume."""
+    train_idx, val_idx = split_train_val(dataset_len, args.val_fraction, args.seed)
+    record = {"train_jsonl": str(args.train_jsonl), "max_samples": args.max_samples,
+              "val_fraction": args.val_fraction, "seed": args.seed,
+              "train_indices": train_idx, "val_indices": val_idx}
+    path = args.output_dir / "data_split.json"
+    if path.is_file():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if saved["train_indices"] != train_idx or saved["val_indices"] != val_idx:
+            raise ValueError(f"{path} disagrees with this run's split; use a new --output-dir")
+    else:
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return train_idx, val_idx
 
 
 def main():
@@ -242,11 +390,12 @@ def main():
         raise FileNotFoundError(args.train_jsonl)
     if not args.image_root.is_dir():
         raise FileNotFoundError(args.image_root)
+    if args.resume is not None and not args.resume.is_file():
+        raise FileNotFoundError(args.resume)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.top_k < 0:
-        raise ValueError("--top-k must be nonnegative")
     device = torch.device("cuda:0")
+    loader_generator = set_seed(args.seed)
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.processor or args.model, trust_remote_code=args.trust_remote_code)
@@ -255,23 +404,34 @@ def main():
     ).to(device)
     freeze(target)
     text_config = getattr(target.config, "text_config", target.config)
+    capacity = getattr(text_config, "max_position_embeddings", None)
     hidden = text_config.hidden_size
     vocab = text_config.vocab_size
-    intermediate = text_config.intermediate_size
-    heads = text_config.num_attention_heads
-    kv_heads = text_config.num_key_value_heads
-    head_dim = getattr(text_config, "head_dim", hidden // heads)
-    eps = text_config.rms_norm_eps
+    head_dim = getattr(text_config, "head_dim", hidden // text_config.num_attention_heads)
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset = IDSpaceGroundTruthDataset(args.train_jsonl, args.image_root, processor, args.max_samples)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_single)
+    train_idx, val_idx = resolve_split(len(dataset), args)
+    loader = DataLoader(Subset(dataset, train_idx), batch_size=1, shuffle=True,
+                        collate_fn=collate_single, generator=loader_generator)
+    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=1, shuffle=False,
+                            collate_fn=collate_single) if val_idx else None
     draft_ids = None
     if args.draft_vocab is not None:
         if not args.draft_vocab.is_file():
             raise FileNotFoundError(args.draft_vocab)
         draft_ids = torch.load(args.draft_vocab, map_location="cpu")["draft_ids"]
+    # Everything needed to rebuild the draft at inference without this script's args.
+    draft_config = {
+        "hidden_size": hidden, "vocab_size": vocab, "intermediate_size": text_config.intermediate_size,
+        "num_heads": text_config.num_attention_heads, "num_kv_heads": text_config.num_key_value_heads,
+        "head_dim": head_dim, "rms_eps": text_config.rms_norm_eps,
+        "low_layer": args.low_layer, "mid_layer": args.mid_layer, "high_layer": args.high_layer,
+        "rollout_steps": args.rollout_steps, "target_model": str(args.model),
+    }
     draft = XiaomiEagleDraft(
-        hidden, vocab, intermediate, heads, kv_heads, head_dim, eps,
+        hidden, vocab, text_config.intermediate_size, text_config.num_attention_heads,
+        text_config.num_key_value_heads, head_dim, text_config.rms_norm_eps,
         args.low_layer, args.mid_layer, args.high_layer, args.rollout_steps,
         rotary_emb=target.model.language_model.rotary_emb, draft_ids=draft_ids,
     ).to(device)  # FP32 master weights; compute runs under autocast below
@@ -290,7 +450,27 @@ def main():
     warmup_updates = max(2, round(total_updates * args.warmup_ratio))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda s: warmup_decay_factor(s, warmup_updates, total_updates))
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    start_epoch, optimizer_step, global_step = 0, 0, 0
+    best = float("-inf")
+    if args.resume is not None:
+        # Own checkpoint: Python RNG state needs full unpickling.
+        state = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if state["draft_config"] != draft_config:
+            raise ValueError("resume checkpoint was trained with a different draft configuration")
+        draft.load_state_dict(state["draft"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        random.setstate(state["rng"]["python"])
+        torch.set_rng_state(state["rng"]["torch"])
+        torch.cuda.set_rng_state_all(state["rng"]["cuda"])
+        loader_generator.set_state(state["rng"]["loader"])
+        start_epoch = state["epoch"] + 1
+        optimizer_step, global_step = state["optimizer_step"], state["global_step"]
+        best = state["best_est_accept_len"]
+        print(f"resumed from {args.resume}: next epoch {start_epoch}, optimizer_step {optimizer_step}", flush=True)
+        if start_epoch >= args.epochs:
+            raise ValueError("resume checkpoint already completed --epochs")
 
     wandb = None
     if args.wandb_mode != "disabled":
@@ -305,7 +485,8 @@ def main():
             mode=args.wandb_mode,
             config={
                 "model": str(args.model), "train_jsonl": str(args.train_jsonl),
-                "max_samples": args.max_samples, "epochs": args.epochs,
+                "max_samples": args.max_samples, "epochs": args.epochs, "seed": args.seed,
+                "val_fraction": args.val_fraction, "train_size": len(train_idx), "val_size": len(val_idx),
                 "rollout_steps": args.rollout_steps, "rollout_decay": args.rollout_decay,
                 "learning_rate": args.learning_rate, "warmup_ratio": args.warmup_ratio,
                 "warmup_updates": warmup_updates, "total_updates": total_updates,
@@ -316,45 +497,29 @@ def main():
                 "mid_layer": args.mid_layer, "high_layer": args.high_layer,
                 "top_k": args.top_k, "hidden_size": hidden, "vocab_size": vocab,
                 "draft_vocab": str(args.draft_vocab), "draft_vocab_size": draft_vocab,
-                "device": str(device), "dataset_size": len(dataset),
+                "device": str(device), "resume": str(args.resume),
             },
         )
 
     total_steps = args.epochs * len(loader)
-    global_step = 0
-    optimizer_step = 0
     grad_norm = float("nan")
     run_started = time.perf_counter()
+    run_start_step = global_step
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         draft.train()
+        # Epoch accuracy is micro-averaged over positions; loss over samples.
+        epoch_loss_sums = [0.0] * args.rollout_steps
+        epoch_hits = [0] * args.rollout_steps
+        epoch_totals = [0] * args.rollout_steps
         for step, raw in enumerate(loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
             # The last group of an epoch may be shorter; average over its real size.
             group_start = step - step % args.grad_accum
             group_size = min(args.grad_accum, len(loader) - group_start)
             update_now = step - group_start + 1 == group_size
-            capacity = getattr(text_config, "max_position_embeddings", None)
-            if capacity and batch["input_ids"].shape[1] + args.rollout_steps - 1 > capacity:
-                raise ValueError("expanded multimodal sequence plus rollout exceeds target position capacity")
-            with torch.no_grad():
-                target_out, multimodal_embeds, position_ids = target_forward_with_context(target, batch)
-                target_hidden_states = target_out.hidden_states
-                teacher = prepare_teacher(target_out.logits, draft.draft_ids, draft.t2d, args.top_k)
-                del target_out  # release the [1, T, V] full-vocab logits before the rollout
-                # Official padding shifts token IDs and appends ID 0, then embeds.
-                pad_embedding = target.get_input_embeddings()(torch.zeros_like(batch["input_ids"][:, :1]))
-                # teacher.in_vocab[t] is about the token at t+1; mask on that token.
-                predicted = batch["assistant_mask"][:, 1:].to(torch.bool)
-                in_vocab_hits = int((teacher.in_vocab[:, :-1] & predicted).sum().item())
-                in_vocab_ratio = in_vocab_hits / max(int(predicted.sum().item()), 1)
-            # Fusion is TRAINABLE: it must not be inside the target no_grad block.
-            with autocast():
-                feature = draft.initial_feature(target_hidden_states)
-                del target_hidden_states
-                total, feature, draft_logits, cache, active = rollout_loss(
-                    draft, feature, multimodal_embeds, teacher, batch["assistant_mask"],
-                    position_ids, args.rollout_steps, args.rollout_decay, pad_embedding)
+            total, active, stats, in_vocab_ratio = sample_rollout(
+                target, draft, batch, args, capacity, autocast)
             (total / group_size).backward()
             if update_now:
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=args.grad_clip))
@@ -363,11 +528,14 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
             global_step += 1
+            round_losses = [float(value) for value in stats.losses]
+            for i in range(args.rollout_steps):
+                epoch_loss_sums[i] += round_losses[i]
+                epoch_hits[i] += stats.hits[i]
+                epoch_totals[i] += stats.totals[i]
             elapsed = time.perf_counter() - run_started
-            steps_per_sec = global_step / max(elapsed, 1e-9)
-            remaining_steps = max(total_steps - global_step, 0)
-            eta_sec = remaining_steps / max(steps_per_sec, 1e-9)
-            assistant_tokens = int(batch["assistant_mask"].sum().item())
+            steps_per_sec = (global_step - run_start_step) / max(elapsed, 1e-9)
+            eta_sec = max(total_steps - global_step, 0) / max(steps_per_sec, 1e-9)
             active_positions = int(active.sum().item())
             metrics = {
                 "train/loss": float(total.item()),
@@ -378,11 +546,10 @@ def main():
                 "train/global_step": global_step,
                 "train/optimizer_step": optimizer_step,
                 "train/rollout_steps": args.rollout_steps,
-                "train/assistant_tokens": assistant_tokens,
+                "train/assistant_tokens": int(batch["assistant_mask"].sum().item()),
                 "train/teacher_argmax_in_draft_vocab": in_vocab_ratio,
                 "train/active_positions_after_gate": active_positions,
                 "train/active_ratio_after_gate": active_positions / max(int(active.numel()), 1),
-                "perf/step_time_sec": elapsed / global_step,
                 "perf/steps_per_sec": steps_per_sec,
                 "perf/samples_per_sec": steps_per_sec,
                 "perf/processed_samples": global_step,
@@ -392,16 +559,46 @@ def main():
                 "perf/elapsed_sec": elapsed,
                 "perf/gpu_memory_allocated_gb": torch.cuda.memory_allocated(device) / 1024**3,
                 "perf/gpu_memory_reserved_gb": torch.cuda.memory_reserved(device) / 1024**3,
+                **round_metrics("train", round_losses, stats.hits, stats.totals),
             }
             if wandb is not None and (global_step % args.wandb_log_every == 0 or global_step == total_steps):
                 wandb.log(metrics, step=global_step)
             print(
                 f"epoch={epoch} step={step} global_step={global_step}/{total_steps} "
-                f"loss={total.item():.6f} samples/s={steps_per_sec:.4f} "
-                f"eta={eta_sec/60:.1f}min active={active_positions}/{active.numel()}",
+                f"loss={total.item():.6f} acc0={metrics.get('train/acc_0', float('nan')):.3f} "
+                f"samples/s={steps_per_sec:.4f} eta={eta_sec/60:.1f}min "
+                f"active={active_positions}/{active.numel()}",
                 flush=True,
             )
-        torch.save({"draft": draft.state_dict(), "args": vars(args)}, args.output_dir / f"epoch_{epoch}.pt")
+
+        n = max(len(loader), 1)
+        epoch_metrics = round_metrics("train_epoch", [s / n for s in epoch_loss_sums], epoch_hits, epoch_totals)
+        val_metrics = {}
+        if val_loader is not None:
+            val_metrics = evaluate(target, draft, val_loader, args, capacity, autocast, device)
+        if wandb is not None:
+            wandb.log({**epoch_metrics, **val_metrics, "train/epoch": epoch}, step=global_step)
+        for i in range(args.rollout_steps):
+            line = (f"epoch={epoch} position={i} "
+                    f"train_acc={epoch_metrics.get(f'train_epoch/acc_{i}', float('nan')):.4f} "
+                    f"train_ploss={epoch_metrics[f'train_epoch/ploss_{i}']:.4f}")
+            if val_metrics:
+                line += (f" val_acc={val_metrics.get(f'val/acc_{i}', float('nan')):.4f} "
+                         f"val_ploss={val_metrics[f'val/ploss_{i}']:.4f}")
+            print(line, flush=True)
+
+        improved = bool(val_metrics) and val_metrics["val/est_accept_len"] > best
+        if improved:
+            best = val_metrics["val/est_accept_len"]
+        payload = checkpoint_payload(draft, optimizer, scheduler, loader_generator, epoch,
+                                     optimizer_step, global_step, best, args, draft_config, val_metrics)
+        save_checkpoint(args.output_dir / "last.pt", payload)
+        if improved:
+            save_checkpoint(args.output_dir / "best.pt", payload)
+        if args.keep_epoch_checkpoints:
+            save_checkpoint(args.output_dir / f"epoch_{epoch}.pt", payload)
+        print(f"epoch={epoch} saved last.pt" + (f" and best.pt (val est_accept_len={best:.4f})" if improved else ""),
+              flush=True)
     if wandb is not None:
         wandb.finish()
 

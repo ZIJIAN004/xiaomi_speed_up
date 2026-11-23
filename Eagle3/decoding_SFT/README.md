@@ -61,9 +61,15 @@ Only the ground-truth assistant answer span and its following `<|im_end|>` contr
 
 Optimization follows official EAGLE-3 `ds_config.json`: peak lr 5e-5, DeepSpeed WarmupDecayLR (log warmup over `--warmup-ratio` 1.5% of updates, then linear decay to 0), AdamW betas (0.9, 0.95), weight decay 0, gradient clipping 0.5, gradient accumulation 2. Draft parameters are FP32 master weights; the draft forward runs under bfloat16 autocast. Very short smoke runs spend most updates in warmup (the first update has lr 0). Masked CE is averaged over batch × sequence, matching official EAGLE-3 reduction.
 
+## Validation, metrics and checkpoints
+
+- **Split.** `--val-fraction` (default 0.05) rows of `--train-jsonl` are held out by a fixed `--seed` (default 42) shuffle. The indices are written to `<output-dir>/data_split.json` and verified on every restart. `build_draft_vocab.py` uses the same split with the same defaults, so validation answers never shape the draft vocabulary.
+- **Metrics.** Each sample logs official-style `train/ploss_i` and `train/acc_i` for rollout depth i. `acc_i` is the draft's greedy token compared with the target's greedy token in target-id space; targets outside the draft vocabulary count as misses. Each epoch logs `train_epoch/*` and `val/*` (`val/acc_i`, `val/ploss_i`, `val/loss`). It also logs `val/est_accept_len` = Σₖ Πᵢ≤ₖ accᵢ, a teacher-forced estimate of accepted draft tokens per round, excluding the target's bonus token.
+- **Checkpoints.** Each epoch atomically writes `last.pt`. When `val/est_accept_len` improves, it also writes `best.pt`. Add `--keep-epoch-checkpoints` to keep `epoch_N.pt` as well. A checkpoint holds the draft weights (including `draft_ids`/`t2d`), the `draft_config` needed to rebuild the draft, the optimizer, the scheduler, every RNG state and the args. `--resume last.pt` continues at the next epoch with the identical schedule and shuffle order.
+
 ## Reduced draft vocabulary (official EAGLE-3 d2t/t2d)
 
-A full 248320-way draft head costs about as much as the target head, which is a large share of a 0.8B target step. `build_draft_vocab.py` counts the tokenized ground-truth answers (the exact loss tokens) and picks the smallest frequency-ranked vocabulary reaching `--coverage` (default 0.999), rounded to 128 and capped at 32000. It also reports coverage on a held-out 10% of rows.
+A full 248320-way draft head costs about as much as the target head, which is a large share of a 0.8B target step. `build_draft_vocab.py` counts the tokenized ground-truth answers (the exact loss tokens) and picks the smallest frequency-ranked vocabulary reaching `--coverage` (default 0.999), rounded to 128 and capped at 32000. It also reports coverage on the validation split.
 
 ```bash
 python Eagle3/decoding_SFT/build_draft_vocab.py \

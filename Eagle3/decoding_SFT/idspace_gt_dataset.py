@@ -7,6 +7,7 @@ returns processor tensors plus the exact assistant-answer span.
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,21 @@ def end_of_turn_id(tokenizer: Any) -> int:
 
 def serialize_target(target: dict[str, Any]) -> str:
     return json.dumps(target, ensure_ascii=False, separators=(",", ":"))
+
+
+def split_train_val(num_rows: int, val_fraction: float, seed: int) -> tuple[list[int], list[int]]:
+    """Fixed seeded row split shared by training and draft-vocab discovery.
+
+    Indices refer to rows after ``max_samples`` truncation, before any filtering.
+    """
+    if not 0 <= val_fraction < 1:
+        raise ValueError("val_fraction must be in [0, 1)")
+    order = list(range(num_rows))
+    random.Random(seed).shuffle(order)
+    n_val = max(1, round(num_rows * val_fraction)) if val_fraction > 0 else 0
+    if n_val >= num_rows:
+        raise ValueError(f"validation split ({n_val}) leaves no training rows out of {num_rows}")
+    return sorted(order[n_val:]), sorted(order[:n_val])
 
 
 def find_subsequence(sequence: list[int], needle: list[int]) -> list[int]:

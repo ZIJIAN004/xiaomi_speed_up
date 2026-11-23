@@ -13,8 +13,10 @@ from torch import nn
 
 from qwen_eagle_draft import DraftAttention, XiaomiEagleDraft
 from toy_rotary import ToyRotary
-from idspace_gt_dataset import IDSpaceGroundTruthDataset, collate_single, serialize_target
-from train_eagle_idspace import (TeacherTargets, prepare_teacher, rollout_loss, shift_left,
+from idspace_gt_dataset import (IDSpaceGroundTruthDataset, collate_single, serialize_target,
+                                split_train_val)
+from train_eagle_idspace import (TeacherTargets, estimated_accept_length, prepare_teacher,
+                                 rollout_loss, save_checkpoint, shift_left,
                                  target_forward_with_context, update_topk_active,
                                  warmup_decay_factor)
 from build_draft_vocab import choose_size
@@ -109,7 +111,8 @@ class TrainingTests(unittest.TestCase):
         def loss(t, d, m, active):
             seen.append((t.clone(), m.clone()))
             return d.sum() * 0
-        targets = TeacherTargets(teacher, torch.ones(1, 6, dtype=torch.bool), None)
+        targets = TeacherTargets(teacher, torch.zeros(1, 6, dtype=torch.long),
+                                 torch.ones(1, 6, dtype=torch.bool), None)
         with patch('train_eagle_idspace.distill_loss', loss):
             rollout_loss(draft, embeddings, embeddings, targets, mask, None, 3, .8,
                          torch.full((1, 1, 1), -1.))
@@ -205,6 +208,46 @@ class TrainingTests(unittest.TestCase):
         mask = sample["assistant_mask"][0].tolist()
         n = len(answer)
         self.assertEqual(mask, [False, False] + [True] * n + [True, False])
+
+    def test_round_accuracy_in_target_id_space(self):
+        class ConstantDraft:
+            draft_ids = torch.tensor([2, 5])
+            def step(self, feature, embedding, cache, position_ids):
+                # Draft index 1 everywhere -> proposes target id 5.
+                return feature, torch.tensor([[[0., 1.]] * 4]), (cache or []) + [{}]
+        argmax_ids = torch.tensor([[9, 5, 7, 5]])
+        teacher = TeacherTargets(torch.zeros(1, 4, 2), argmax_ids,
+                                 torch.ones(1, 4, dtype=torch.bool), None)
+        e = torch.zeros(1, 4, 1)
+        *_, stats = rollout_loss(ConstantDraft(), e, e, teacher, torch.ones(1, 4, dtype=torch.bool),
+                                 None, 1, .8, torch.zeros(1, 1, 1))
+        # Round 0: positions 0,1 supervised (mask shifted twice); their teacher
+        # ids are argmax[1]=5 (hit) and argmax[2]=7 (miss).
+        self.assertEqual((stats.hits, stats.totals), ([1], [2]))
+
+    def test_estimated_accept_length(self):
+        self.assertAlmostEqual(estimated_accept_length([0.5, 0.5]), 0.5 + 0.25)
+        self.assertEqual(estimated_accept_length([1.0, 1.0, 0.0, 1.0]), 2.0)
+
+    def test_train_val_split_is_fixed_and_disjoint(self):
+        train, val = split_train_val(100, 0.05, 42)
+        self.assertEqual((len(train), len(val)), (95, 5))
+        self.assertFalse(set(train) & set(val))
+        self.assertEqual(sorted(train + val), list(range(100)))
+        self.assertEqual(split_train_val(100, 0.05, 42), (train, val))
+        self.assertNotEqual(split_train_val(100, 0.05, 43)[1], val)
+        self.assertEqual(split_train_val(10, 0.0, 42), (list(range(10)), []))
+        self.assertEqual(len(split_train_val(10, 0.01, 42)[1]), 1)  # non-zero fraction keeps >= 1
+        with self.assertRaises(ValueError):
+            split_train_val(1, 0.5, 42)
+
+    def test_checkpoint_write_is_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "last.pt"
+            save_checkpoint(path, {"epoch": 0})
+            save_checkpoint(path, {"epoch": 1})
+            self.assertEqual(torch.load(path)["epoch"], 1)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["last.pt"])
 
     def test_vocab_size_choice(self):
         ranked = [50, 30, 10, 5, 3, 2]  # total 100
