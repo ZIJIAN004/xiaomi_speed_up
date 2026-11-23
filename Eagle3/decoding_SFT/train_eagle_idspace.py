@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import time
@@ -31,7 +32,14 @@ def parse_args():
     p.add_argument("--rollout-steps", type=int, default=7)
     p.add_argument("--rollout-decay", type=float, default=0.8)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--learning-rate", type=float, default=1e-4)
+    # Defaults follow official EAGLE-3 traineagle3/ds_config.json: peak lr 5e-5,
+    # WarmupDecayLR (log warmup, linear decay to 0), AdamW betas (0.9, 0.95),
+    # weight decay 0, gradient clipping 0.5, gradient accumulation 2.
+    p.add_argument("--learning-rate", type=float, default=5e-5)
+    p.add_argument("--warmup-ratio", type=float, default=0.015,
+                   help="warmup fraction of optimizer steps (official 12000/800000)")
+    p.add_argument("--grad-accum", type=int, default=2)
+    p.add_argument("--grad-clip", type=float, default=0.5)
     p.add_argument("--low-layer", type=int, default=1)
     p.add_argument("--mid-layer", type=int, default=12)
     p.add_argument("--high-layer", type=int, default=24)
@@ -45,6 +53,16 @@ def parse_args():
     p.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     p.add_argument("--wandb-log-every", type=int, default=1)
     return p.parse_args()
+
+
+def warmup_decay_factor(step, warmup_steps, total_steps):
+    """DeepSpeed WarmupDecayLR with its default log warmup, min lr 0.
+
+    ``step`` counts completed optimizer steps (LambdaLR convention).
+    """
+    if step < warmup_steps:
+        return math.log(step + 1) / math.log(warmup_steps)
+    return max(0.0, (total_steps - step) / max(total_steps - warmup_steps, 1))
 
 
 def freeze(model):
@@ -209,6 +227,8 @@ def main():
     args = parse_args()
     if args.rollout_steps < 1 or args.epochs < 1 or args.wandb_log_every < 1 or args.top_k < 0:
         raise ValueError("rollout-steps, epochs, wandb-log-every must be positive; top-k must be nonnegative")
+    if args.grad_accum < 1 or args.grad_clip <= 0 or not 0 <= args.warmup_ratio < 1:
+        raise ValueError("grad-accum >= 1, grad-clip > 0 and warmup-ratio in [0, 1) are required")
     if args.toy:
         run_toy(args)
         return
@@ -254,9 +274,22 @@ def main():
         hidden, vocab, intermediate, heads, kv_heads, head_dim, eps,
         args.low_layer, args.mid_layer, args.high_layer, args.rollout_steps,
         rotary_emb=target.model.language_model.rotary_emb, draft_ids=draft_ids,
-    ).to(device, dtype=next(target.parameters()).dtype)
+    ).to(device)  # FP32 master weights; compute runs under autocast below
     draft_vocab = draft.draft_lm_head.out_features
-    optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate)
+    target_dtype = next(target.parameters()).dtype
+    if target_dtype == torch.bfloat16:
+        autocast = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
+    elif target_dtype == torch.float32:
+        autocast = contextlib.nullcontext
+    else:
+        raise NotImplementedError(f"target dtype {target_dtype} needs a GradScaler; load in bfloat16")
+    optimizer = torch.optim.AdamW(draft.parameters(), lr=args.learning_rate,
+                                  betas=(0.9, 0.95), weight_decay=0.0)
+    updates_per_epoch = math.ceil(len(loader) / args.grad_accum)
+    total_updates = args.epochs * updates_per_epoch
+    warmup_updates = max(2, round(total_updates * args.warmup_ratio))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda s: warmup_decay_factor(s, warmup_updates, total_updates))
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     wandb = None
@@ -274,7 +307,12 @@ def main():
                 "model": str(args.model), "train_jsonl": str(args.train_jsonl),
                 "max_samples": args.max_samples, "epochs": args.epochs,
                 "rollout_steps": args.rollout_steps, "rollout_decay": args.rollout_decay,
-                "learning_rate": args.learning_rate, "low_layer": args.low_layer,
+                "learning_rate": args.learning_rate, "warmup_ratio": args.warmup_ratio,
+                "warmup_updates": warmup_updates, "total_updates": total_updates,
+                "grad_accum": args.grad_accum, "grad_clip": args.grad_clip,
+                "adam_betas": [0.9, 0.95], "weight_decay": 0.0,
+                "draft_param_dtype": "float32", "compute_dtype": str(target_dtype),
+                "low_layer": args.low_layer,
                 "mid_layer": args.mid_layer, "high_layer": args.high_layer,
                 "top_k": args.top_k, "hidden_size": hidden, "vocab_size": vocab,
                 "draft_vocab": str(args.draft_vocab), "draft_vocab_size": draft_vocab,
@@ -284,12 +322,18 @@ def main():
 
     total_steps = args.epochs * len(loader)
     global_step = 0
+    optimizer_step = 0
+    grad_norm = float("nan")
     run_started = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
         draft.train()
         for step, raw in enumerate(loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
-            optimizer.zero_grad(set_to_none=True)
+            # The last group of an epoch may be shorter; average over its real size.
+            group_start = step - step % args.grad_accum
+            group_size = min(args.grad_accum, len(loader) - group_start)
+            update_now = step - group_start + 1 == group_size
             capacity = getattr(text_config, "max_position_embeddings", None)
             if capacity and batch["input_ids"].shape[1] + args.rollout_steps - 1 > capacity:
                 raise ValueError("expanded multimodal sequence plus rollout exceeds target position capacity")
@@ -305,14 +349,19 @@ def main():
                 in_vocab_hits = int((teacher.in_vocab[:, :-1] & predicted).sum().item())
                 in_vocab_ratio = in_vocab_hits / max(int(predicted.sum().item()), 1)
             # Fusion is TRAINABLE: it must not be inside the target no_grad block.
-            feature = draft.initial_feature(target_hidden_states)
-            del target_hidden_states
-            total, feature, draft_logits, cache, active = rollout_loss(
-                draft, feature, multimodal_embeds, teacher, batch["assistant_mask"],
-                position_ids, args.rollout_steps, args.rollout_decay, pad_embedding)
-            total.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=1.0)
-            optimizer.step()
+            with autocast():
+                feature = draft.initial_feature(target_hidden_states)
+                del target_hidden_states
+                total, feature, draft_logits, cache, active = rollout_loss(
+                    draft, feature, multimodal_embeds, teacher, batch["assistant_mask"],
+                    position_ids, args.rollout_steps, args.rollout_decay, pad_embedding)
+            (total / group_size).backward()
+            if update_now:
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(draft.parameters(), max_norm=args.grad_clip))
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_step += 1
             global_step += 1
             elapsed = time.perf_counter() - run_started
             steps_per_sec = global_step / max(elapsed, 1e-9)
@@ -323,10 +372,11 @@ def main():
             metrics = {
                 "train/loss": float(total.item()),
                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
-                "train/grad_norm": float(grad_norm),
+                "train/grad_norm": grad_norm,  # from the latest optimizer update
                 "train/epoch": epoch,
                 "train/step": step,
                 "train/global_step": global_step,
+                "train/optimizer_step": optimizer_step,
                 "train/rollout_steps": args.rollout_steps,
                 "train/assistant_tokens": assistant_tokens,
                 "train/teacher_argmax_in_draft_vocab": in_vocab_ratio,

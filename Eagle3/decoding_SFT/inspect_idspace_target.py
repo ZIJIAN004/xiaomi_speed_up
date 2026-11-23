@@ -221,14 +221,20 @@ def inspect_row(row: dict[str, Any], index: int, processor: Any, model: Any,
             )
         answer_start = answer_matches[0]
         answer_end = answer_start + len(answer_ids)
+        # Same span as training (idspace_gt_dataset): answer + following <|im_end|>.
+        eot = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        eot_follows = answer_end < len(input_ids) and input_ids[answer_end] == eot
+        result["end_of_turn_follows_answer"] = eot_follows
+        if not eot_follows:
+            raise ValueError("ground-truth answer is not followed by <|im_end|>")
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
-        assistant_mask[answer_start:answer_end] = True
+        assistant_mask[answer_start:answer_end + 1] = True
         result["assistant_token_count"] = int(assistant_mask.sum().item())
         result["assistant_start"] = answer_start
         result["assistant_end"] = answer_end
         result["assistant_boundary_tokens_before"] = answer_start - len(user_ids)
-        result["assistant_boundary_tokens_after"] = len(input_ids) - answer_end
-        result["assistant_boundary_note"] = "loss covers exact GT answer span; chat-template assistant boundary tokens remain context"
+        result["assistant_boundary_tokens_after"] = len(input_ids) - answer_end - 1
+        result["assistant_boundary_note"] = "loss covers GT answer span plus <|im_end|>; other chat-template tokens remain context"
 
         model_inputs = {
             key: value.to(device) if hasattr(value, "to") else value

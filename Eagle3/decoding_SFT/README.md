@@ -57,7 +57,9 @@ The first loss is:
 L = Σᵢ 0.8ⁱ · CE(target_distribution, draft_logitsᵢ)
 ```
 
-Only the ground-truth assistant answer span contributes to the loss. The prompt, image context, and chat-template boundary tokens remain context. Masked CE is averaged over batch × sequence, matching official EAGLE-3 reduction.
+Only the ground-truth assistant answer span and its following `<|im_end|>` contribute to the loss, so the draft learns to propose end-of-turn. The prompt, image context, and other chat-template tokens remain context.
+
+Optimization follows official EAGLE-3 `ds_config.json`: peak lr 5e-5, DeepSpeed WarmupDecayLR (log warmup over `--warmup-ratio` 1.5% of updates, then linear decay to 0), AdamW betas (0.9, 0.95), weight decay 0, gradient clipping 0.5, gradient accumulation 2. Draft parameters are FP32 master weights; the draft forward runs under bfloat16 autocast. Very short smoke runs spend most updates in warmup (the first update has lr 0). Masked CE is averaged over batch × sequence, matching official EAGLE-3 reduction.
 
 ## Reduced draft vocabulary (official EAGLE-3 d2t/t2d)
 

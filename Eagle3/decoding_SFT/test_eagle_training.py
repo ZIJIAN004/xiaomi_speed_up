@@ -1,7 +1,9 @@
 """Focused CPU regressions; no checkpoint, data downloads, or CUDA required."""
 import unittest
 import ast
+import json
 import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,9 +13,10 @@ from torch import nn
 
 from qwen_eagle_draft import DraftAttention, XiaomiEagleDraft
 from toy_rotary import ToyRotary
-from idspace_gt_dataset import collate_single
+from idspace_gt_dataset import IDSpaceGroundTruthDataset, collate_single, serialize_target
 from train_eagle_idspace import (TeacherTargets, prepare_teacher, rollout_loss, shift_left,
-                                 target_forward_with_context, update_topk_active)
+                                 target_forward_with_context, update_topk_active,
+                                 warmup_decay_factor)
 from build_draft_vocab import choose_size
 
 
@@ -162,6 +165,46 @@ class TrainingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             XiaomiEagleDraft(16, 4, 32, 4, 2, 8, 1e-6, rotary_emb=ToyRotary(),
                              draft_ids=torch.tensor([2, 1]))
+
+    def test_warmup_decay_schedule(self):
+        # DeepSpeed WarmupDecayLR, log warmup over 10 of 110 updates.
+        self.assertEqual(warmup_decay_factor(0, 10, 110), 0.0)
+        self.assertAlmostEqual(warmup_decay_factor(9, 10, 110), 1.0)
+        self.assertAlmostEqual(warmup_decay_factor(10, 10, 110), 1.0)
+        self.assertAlmostEqual(warmup_decay_factor(60, 10, 110), 0.5)
+        self.assertEqual(warmup_decay_factor(110, 10, 110), 0.0)
+        self.assertEqual(warmup_decay_factor(500, 10, 110), 0.0)
+
+    def test_dataset_mask_includes_end_of_turn(self):
+        from PIL import Image
+        answer = serialize_target({"name": "A"})
+        vocab = {ch: i + 10 for i, ch in enumerate(sorted(set(answer)))}
+        eot, newline = 3, 4
+
+        class Tok:
+            unk_token_id = 0
+            def convert_tokens_to_ids(self, token):
+                return eot if token == "<|im_end|>" else 0
+            def __call__(self, text, add_special_tokens=False):
+                return SimpleNamespace(input_ids=[vocab[ch] for ch in text])
+
+        class Proc:
+            tokenizer = Tok()
+            def apply_chat_template(self, messages, **kwargs):
+                return "rendered"
+            def __call__(self, **kwargs):
+                ids = [1, 2] + self.tokenizer(answer).input_ids + [eot, newline]
+                return {"input_ids": torch.tensor([ids]),
+                        "attention_mask": torch.ones(1, len(ids), dtype=torch.long)}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Image.new("RGB", (4, 4)).save(Path(tmp) / "a.png")
+            rows = Path(tmp) / "train.jsonl"
+            rows.write_text(json.dumps({"image": "a.png", "target": {"name": "A"}}) + "\n", encoding="utf-8")
+            sample = IDSpaceGroundTruthDataset(rows, tmp, Proc())[0]
+        mask = sample["assistant_mask"][0].tolist()
+        n = len(answer)
+        self.assertEqual(mask, [False, False] + [True] * n + [True, False])
 
     def test_vocab_size_choice(self):
         ranked = [50, 30, 10, 5, 3, 2]  # total 100

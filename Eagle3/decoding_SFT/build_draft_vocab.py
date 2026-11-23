@@ -2,8 +2,8 @@
 """Discover the EAGLE-3 draft vocabulary from IDSpace training answers.
 
 Counts exactly the tokens the draft is trained to predict: the ground-truth
-assistant answer, serialized and tokenized the same way as
-``idspace_gt_dataset.py``. Images are not needed. The size is chosen
+assistant answer plus its ``<|im_end|>``, serialized and tokenized the same
+way as ``idspace_gt_dataset.py``. Images are not needed. The size is chosen
 automatically as the smallest frequency-ranked prefix that reaches
 ``--coverage``, rounded up to ``--round-to`` and capped by ``--max-size``.
 
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 
-from idspace_gt_dataset import serialize_target
+from idspace_gt_dataset import end_of_turn_id, serialize_target
 
 REPORT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32000)
 
@@ -55,6 +55,7 @@ def load_answer_ids(path: Path, tokenizer, max_samples: int):
     if max_samples:
         rows = rows[:max_samples]
     sequences, failures = [], Counter()
+    eot = end_of_turn_id(tokenizer)  # supervised after every answer, see idspace_gt_dataset
     for row in rows:
         target = row.get("target")
         if not isinstance(target, dict):
@@ -64,7 +65,7 @@ def load_answer_ids(path: Path, tokenizer, max_samples: int):
         if not ids:
             failures["empty_answer"] += 1
             continue
-        sequences.append(ids)
+        sequences.append(ids + [eot])
     if not sequences:
         raise ValueError(f"no usable answers in {path}: {dict(failures)}")
     return len(rows), sequences, failures

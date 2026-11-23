@@ -41,6 +41,16 @@ Required fields:
 }"""
 
 
+END_OF_TURN = "<|im_end|>"
+
+
+def end_of_turn_id(tokenizer: Any) -> int:
+    token_id = tokenizer.convert_tokens_to_ids(END_OF_TURN)
+    if token_id is None or token_id == tokenizer.unk_token_id:
+        raise ValueError(f"tokenizer has no {END_OF_TURN} token")
+    return int(token_id)
+
+
 def serialize_target(target: dict[str, Any]) -> str:
     return json.dumps(target, ensure_ascii=False, separators=(",", ":"))
 
@@ -109,9 +119,14 @@ class IDSpaceGroundTruthDataset(Dataset):
             raise ValueError(f"sample {index}: ground-truth answer span matches={len(matches)}")
         answer_start = matches[0]
         answer_end = answer_start + len(answer_ids)
+        # The end-of-turn token is supervised too, so the draft learns to
+        # propose it instead of wasting the final rollout of every answer.
+        eot = end_of_turn_id(self.processor.tokenizer)
+        if answer_end >= len(input_ids) or input_ids[answer_end] != eot:
+            raise ValueError(f"sample {index}: answer is not followed by {END_OF_TURN}")
 
         assistant_mask = torch.zeros(len(input_ids), dtype=torch.bool)
-        assistant_mask[answer_start:answer_end] = True
+        assistant_mask[answer_start:answer_end + 1] = True
         # Preserve ALL native processor ranks, including [4,1,T] positions,
         # [N,3] grids and [P,C] pixel patches. The batch-size-one collator is identity.
         if encoded["input_ids"].ndim != 2 or encoded["input_ids"].shape[0] != 1:
