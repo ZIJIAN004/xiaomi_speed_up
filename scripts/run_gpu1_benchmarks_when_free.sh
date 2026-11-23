@@ -23,6 +23,11 @@ log() {
   printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "$LOG_ROOT/orchestrator.log"
 }
 
+# WSL powers off when the last wsl.exe client exits, killing tmux with it. Hold the
+# distro until this script exits; the keep-alive ends on its own after that.
+source "$PROJECT_ROOT/scripts/wsl_keepalive.sh"
+log "$(start_wsl_keepalive "$$" 2>&1)"
+
 query_free_mib() {
   nvidia-smi -i "$GPU_ID" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
     | tr -d '[:space:]' | head -n 1
