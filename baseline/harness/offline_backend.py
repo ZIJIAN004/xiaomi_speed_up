@@ -84,6 +84,10 @@ class OfflineBackend:
             raise TimeoutError("offline engine operation timed out; cancellation initiated")
 
     async def _initialize(self):
+        # Set here, the one place every offline entry point (run_benchmark, run_offline, OmniDocBench) passes
+        # through, before install() and before the engine process is spawned (it inherits the environment).
+        from baseline.harness.processor_audit import MAX_IMAGE_SIDE
+        os.environ["VLLM_BENCHMARK_MAX_IMAGE_SIDE"] = str(MAX_IMAGE_SIDE)
         from baseline.harness.server_processor import install
         install()
         from transformers import AutoProcessor
@@ -114,6 +118,8 @@ class OfflineBackend:
             speculative_config=json.loads(self.args.speculative_config) if self.args.speculative_config else None,
             worker_extension_cls="baseline.harness.worker_extension.BenchmarkWorkerExtension",
             profiler_config=ProfilerConfig(**config), disable_log_stats=False, **self.engine_kwargs))
+        from baseline.harness.minicpm_image_bound import require_patched
+        require_patched(self.args.model)
         parallel = self.engine.vllm_config.parallel_config
         if any(getattr(parallel, name) != 1 for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")):
             raise RuntimeError("offline benchmark requires actual TP=PP=DP=1")

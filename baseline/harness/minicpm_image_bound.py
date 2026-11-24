@@ -73,6 +73,21 @@ def max_image_tokens(processor, downsample_mode, max_side, use_cache=True):
     return best, argmax
 
 
+def require_patched(model_dir):
+    """Fail fast if a MiniCPM-OCR engine was built without the bound (requests would be rejected mid-run)."""
+    from baseline.harness.model_profiles import model_type
+    try:
+        if model_type(model_dir) != "minicpm_ocr":
+            return
+    except (OSError, ValueError, KeyError):
+        return
+    import importlib
+    info_cls = importlib.import_module("vllm.model_executor.models.minicpm_ocr").MiniCPMOcrProcessingInfo
+    if not getattr(info_cls.get_max_image_tokens, "_benchmark_bound", False):
+        raise RuntimeError("MiniCPM-OCR max-image-token bound was not installed; vLLM would reject pages above its "
+                           "2544-token estimate. Check VLLM_BENCHMARK_MAX_IMAGE_SIDE and server_processor.install().")
+
+
 def patch_vllm_minicpm_ocr(module, emit=None):
     """Raise MiniCPM-OCR's get_max_image_tokens to the exact bound (never lower it). Opt-in via env var."""
     max_side = os.environ.get("VLLM_BENCHMARK_MAX_IMAGE_SIDE")

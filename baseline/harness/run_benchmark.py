@@ -724,9 +724,6 @@ def main(args=None):
                 args.server_processor_dir = args.output.resolve().parent / (args.output.name + "_processor_raw")
             args.server_processor_dir.mkdir(parents=True, exist_ok=True)
             os.environ["VLLM_BENCHMARK_PROCESSOR_DIR"] = str(args.server_processor_dir.resolve())
-            # Encoder-cache sizing uses the exact visual-token bound for images within the client's side cap.
-            from baseline.harness.processor_audit import MAX_IMAGE_SIDE
-            os.environ["VLLM_BENCHMARK_MAX_IMAGE_SIDE"] = str(MAX_IMAGE_SIDE)
             args.server_pid = os.getpid()
             with OfflineBackend(args):
                 return main(args)
