@@ -538,6 +538,13 @@ def collect_run(run_dir, small_kernel_us=10):
         latency_rows.append({"metric": stage + "_kernel_work_ms", "phase": "profile",
                              "scope": "sum correlated GPU kernel time per representative; NOT wall latency",
                              **stats(per_sample_work)})
+        if stage in ("decode", "draft"):
+            per_token = [work / p["profile_window_decode_tokens"] if work is not None and p.get("profile_window_decode_tokens") else None
+                         for work, p in zip(per_sample_work, profiles)]
+            latency_rows.append({"metric": stage + "_kernel_ms_per_token", "phase": "profile",
+                                 "scope": "kernel work in the bounded profiler window / tokens produced by the decode steps inside it; "
+                                          "comparable with and without speculative decoding (see profile_window_token_source)",
+                                 **stats(per_token)})
     for field in [stage + "_time_ms" for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft")] + ["gpu_ttft_ms", "tpot_ms", "runner_prefill_step_time_ms", "runner_decode_step_time_ms"]:
         latency_rows.append({"metric": field, "phase": "profile", "scope": "representative current-stream CUDA Events; step fields inclusive, model stages exclusive",
                              **stats([r.get(field) for r in profiles])})

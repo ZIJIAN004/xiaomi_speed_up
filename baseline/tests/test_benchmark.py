@@ -1149,6 +1149,23 @@ def fake_checkpoint(root, model_type, **preprocessor):
     return root
 
 
+class ProfileWindowTokenTests(unittest.TestCase):
+    def test_window_tokens_with_and_without_speculation(self):
+        from baseline.harness.run_benchmark import profile_window_tokens
+        stages = {"runner_prefill": {"count": 3}, "runner_decode": {"count": 498}}
+        plain = profile_window_tokens(stages, 64, False, {}, {})
+        self.assertEqual((plain["profile_window_decode_steps"], plain["profile_window_decode_tokens"]), (61, 61.0))
+        self.assertTrue(plain["profile_window_token_source"].startswith("exact"))
+        spec = profile_window_tokens({"runner_prefill": {"count": 3}, "runner_decode": {"count": 40}}, 64, True,
+                                     {"drafts": 100, "accepted_tokens": 500}, {"drafts": 140, "accepted_tokens": 740})
+        self.assertEqual(spec["profile_window_decode_steps"], 40)  # request ended inside the window
+        self.assertAlmostEqual(spec["profile_request_mean_acceptance_length"], 7.0)
+        self.assertAlmostEqual(spec["profile_window_decode_tokens"], 280.0)
+        missing = profile_window_tokens(stages, 64, True, {"drafts": 5}, {"drafts": 5})
+        self.assertIsNone(missing["profile_window_decode_tokens"])
+        self.assertIsNone(profile_window_tokens({}, 64, False, {}, {})["profile_window_decode_steps"])
+
+
 class ModelProfileTests(unittest.TestCase):
     def test_routing_preprocessing_and_speculative_permission(self):
         from baseline.harness.model_profiles import check_speculative_config, preprocessor_settings, profile_for

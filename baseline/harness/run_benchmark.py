@@ -421,6 +421,54 @@ def safe_rpc(args, method, *values):
         return {"status": "unavailable", "reason": str(exc)}
 
 
+def spec_counter_totals(args):
+    """Engine-wide speculative-decoding counters (drafts / draft_tokens / accepted_tokens); {} if unavailable."""
+    from baseline.harness.collect_results import SPEC_COUNTERS, read_prometheus
+    try:
+        values = read_prometheus(get_url(args.base_url + "/metrics"))
+    except Exception:
+        return {}
+    totals = {}
+    for (name, _labels), value in values.items():
+        if name in SPEC_COUNTERS:
+            totals[SPEC_COUNTERS[name]] = totals.get(SPEC_COUNTERS[name], 0) + value
+    return totals
+
+
+def profile_window_tokens(stages, max_iterations, speculative, spec_before, spec_after):
+    """Tokens produced by the decode steps inside the bounded profiler window.
+
+    The profiler records the first max_iterations runner steps; CUDA Events cover the whole request.
+    Window decode steps = min(request decode steps, max_iterations - prefill steps). Without speculation each
+    decode step emits exactly one token. With speculation a step emits 1 + accepted drafts; the window uses this
+    request's mean acceptance length (counter delta over the request; one request is profiled at a time).
+    """
+    decode = stages.get("runner_decode", {}).get("count")
+    prefill = stages.get("runner_prefill", {}).get("count") or 0
+    result = {"profile_window_decode_steps": None, "profile_window_tokens_per_decode_step": None,
+              "profile_window_decode_tokens": None, "profile_window_token_source": None}
+    if decode is None:
+        result["profile_window_token_source"] = "unavailable: no runner_decode CUDA events"
+        return result
+    steps = min(decode, max(max_iterations - prefill, 0))
+    result["profile_window_decode_steps"] = steps
+    if not speculative:
+        per_step, source = 1.0, "exact: one token per decode step without speculative decoding"
+    else:
+        drafts = spec_after.get("drafts", 0) - spec_before.get("drafts", 0)
+        accepted = spec_after.get("accepted_tokens", 0) - spec_before.get("accepted_tokens", 0)
+        result.update(profile_request_spec_drafts=drafts, profile_request_spec_accepted_tokens=accepted)
+        if drafts <= 0:
+            result["profile_window_token_source"] = "unavailable: no spec_decode counter delta for this request"
+            return result
+        per_step = 1 + accepted / drafts
+        result["profile_request_mean_acceptance_length"] = per_step
+        source = "estimate: window decode steps x this request's mean acceptance length (request-level spec counters)"
+    result.update(profile_window_tokens_per_decode_step=per_step, profile_window_decode_tokens=steps * per_step,
+                  profile_window_token_source=source)
+    return result
+
+
 def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
     records = []
     monitor.phase = "profile_setup"
@@ -445,6 +493,8 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
             event_begin = safe_rpc(args, "benchmark_event_timing", "true")
             memory_before = safe_rpc(args, "benchmark_snapshot", "true")
             started = False
+            speculative = bool(getattr(args, "speculative_config", None))
+            spec_before = spec_counter_totals(args) if speculative else {}
             record = {"sample_id": sample["sample_id"], "phase": "profile", "success": False}
             try:
                 bounds = limit.get("results", [])
@@ -487,6 +537,8 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
                 record["model_only_generated_tokens_per_second"] = n * 1000 / model_ms if n and model_ms > 0 and all(stage in event_stats["stages"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")) else None
                 for stage in ("prefill", "decode"):
                     record["runner_" + stage + "_step_time_ms"] = event_stats["stages"].get("runner_" + stage, {}).get("inclusive_ms")
+                record.update(profile_window_tokens(event_stats["stages"], args.profile_max_iterations, speculative,
+                                                   spec_before, spec_counter_totals(args) if speculative else {}))
                 record["model_only_throughput_scope"] = "representative with profiler, sum exclusive observed model GPU stream spans; not steady throughput"
                 record["worker_memory_before"] = memory_before
                 record["worker_memory_after"] = safe_rpc(args, "benchmark_snapshot", "false")
