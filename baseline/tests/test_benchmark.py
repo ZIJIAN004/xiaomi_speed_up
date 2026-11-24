@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -1255,3 +1256,45 @@ class ModelProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MiniCPMImageBoundTests(unittest.TestCase):
+    def test_bound_is_exhaustive_max_and_never_lowers_vllm_estimate(self):
+        import types
+        from baseline.harness import minicpm_image_bound as bound
+
+        class Processor:  # each side counts as ceil(side / 2) units; no slicing
+            scale_resolution, patch_size, max_slice_nums = 4, 1, 1
+            def get_sliced_grid(self, size, slices, s):
+                return None
+            def find_best_resize(self, size, s, p, downsample_mode, allow_upscale=False):
+                return -(-size[0] // 2) * 2, -(-size[1] // 2) * 2
+
+        self.assertEqual(bound.max_image_tokens(Processor(), "4x", 5, use_cache=False), (9, (5, 5)))
+        for estimate, expected in ((3, 9), (50, 50)):
+            class Info:
+                def get_max_image_tokens(self, estimate=estimate):
+                    return estimate
+                def get_image_processor(self):
+                    return Processor()
+            module = types.SimpleNamespace(MiniCPMOcrProcessingInfo=Info)
+            events = []
+            with patch.dict(os.environ, {"VLLM_BENCHMARK_MAX_IMAGE_SIDE": "5"}), \
+                    patch.object(bound, "CACHE", Path(tempfile.mkdtemp()) / "bound.json"):
+                bound.patch_vllm_minicpm_ocr(module, events.append)
+                self.assertEqual(Info().get_max_image_tokens(), expected)
+                self.assertEqual(Info().get_max_image_tokens(), expected)  # cached path
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["exact_bound"], 9)
+
+    def test_patch_is_opt_in(self):
+        import types
+        from baseline.harness.minicpm_image_bound import patch_vllm_minicpm_ocr
+
+        class Info:
+            def get_max_image_tokens(self):
+                return 7
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_BENCHMARK_MAX_IMAGE_SIDE", None)
+            patch_vllm_minicpm_ocr(types.SimpleNamespace(MiniCPMOcrProcessingInfo=Info))
+        self.assertEqual(Info().get_max_image_tokens(), 7)

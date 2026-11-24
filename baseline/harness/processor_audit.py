@@ -15,6 +15,10 @@ PROMPT = (
 )
 
 
+# Longer-side cap applied to every request image (both models). minicpm_image_bound relies on it.
+MAX_IMAGE_SIDE = 2048
+
+
 def prepare_image(path, bbox_2d=None):
     from PIL import Image
     start = time.perf_counter()
@@ -37,8 +41,8 @@ def prepare_image(path, bbox_2d=None):
         image = cropped
     crop_ms = (time.perf_counter() - crop_start) * 1000 if bbox_2d is not None else None
     original = image.size
-    if max(image.size) > 2048:
-        image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+    if max(image.size) > MAX_IMAGE_SIDE:
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
     prep_end = time.perf_counter()
     return image, {"source_page_width": page_size[0], "source_page_height": page_size[1],
                    "region_crop_time_ms": crop_ms, "region_crop_scope": "nested within preprocess_time_ms",

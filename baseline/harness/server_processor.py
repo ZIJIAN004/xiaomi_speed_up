@@ -107,6 +107,9 @@ def wrap_method(cls, name, kind):
 
 
 def instrument_module(module):
+    if module.__name__ == "vllm.model_executor.models.minicpm_ocr":
+        from baseline.harness.minicpm_image_bound import patch_vllm_minicpm_ocr
+        patch_vllm_minicpm_ocr(module, emit)
     if os.environ.get("VLLM_BENCHMARK_STARTUP_DIR"):
         from baseline.harness.http_startup_probe import MODULES, instrument
         if module.__name__ in MODULES:
