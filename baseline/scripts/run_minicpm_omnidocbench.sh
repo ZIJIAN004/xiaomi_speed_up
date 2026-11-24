@@ -8,7 +8,7 @@ set -u
 # Inference runs in the minicpm_ocr env (routed by model_type), scoring in the omnidocbench_v15 env.
 #
 # Usage (inside WSL, ideally in tmux):  bash baseline/scripts/run_minicpm_omnidocbench.sh
-#   RUNS="A" / RUNS="B" runs only one of them; NUM_SPECULATIVE_TOKENS changes k for B.
+#   Default runs only A (DSpark off). RUNS="A B" or RUNS="B" adds the DSpark run; NUM_SPECULATIVE_TOKENS changes k for B.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/minicpm-ocr-1.0/model}"
 DRAFT_PATH="${DRAFT_PATH:-/home/mr_jiang/models/minicpm-ocr-1.0/dspark}"
@@ -18,7 +18,7 @@ OMNIDOC_EVAL_PYTHON="${OMNIDOC_EVAL_PYTHON:-/home/mr_jiang/miniforge3/envs/omnid
 GPU_ID="${GPU_ID:-1}"
 FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-22528}"  # 22 GiB
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
-RUNS="${RUNS:-A B}"
+RUNS="${RUNS:-A}"  # default: plain decoding only; RUNS="A B" or "B" adds DSpark
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/minicpm_serial_$(date +%Y%m%d_%H%M%S)}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/data}"
 OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
