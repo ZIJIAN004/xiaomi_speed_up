@@ -133,6 +133,12 @@ def build_datasets(args, processor):
     return Subset(dataset, train_idx), val
 
 
+def cuda_time() -> float:
+    """Wall time after all queued CUDA work finished (stage timing, not kernel timing)."""
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
 class Pipeline:
     """Loaded target + draft + loss settings; one call = one sample's loss and metrics."""
 
@@ -163,13 +169,17 @@ class Pipeline:
     def sample(self, raw):
         inputs = {k: v.to(self.device) for k, v in raw["inputs"].items()}
         loss_mask = raw["loss_mask"].to(self.device)
+        t0 = cuda_time()
         features = self.extractor(inputs)
+        t1 = cuda_time()
         batch = draft_inputs(features, inputs["input_ids"], loss_mask)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, loss, metrics = self.model(**batch, **self.call_kwargs)
+        t2 = cuda_time()
         anchors = int(loss_mask[:, :-self.model.block_size].sum())
         return loss, metrics, {"seq_len": inputs["input_ids"].shape[1], "valid_anchors": anchors,
-                               "anchors_truncated": anchors > self.max_anchors}
+                               "anchors_truncated": anchors > self.max_anchors,
+                               "t_target": t1 - t0, "t_draft_fwd": t2 - t1}
 
 
 @torch.no_grad()
@@ -310,13 +320,19 @@ def main(argv=None):
     started, start_global = time.perf_counter(), global_step
     for epoch in range(start_epoch, args.epochs):
         window: dict[str, float] = {}
+        timing: dict[str, float] = {}  # per-sample stage seconds since the last log line
         epoch_sums: dict[str, float] = {}
         truncated = 0
         for step, raw in enumerate(loader):
             group_start = step - step % args.grad_accum
             group_size = min(args.grad_accum, len(loader) - group_start)
             loss, metrics, info = pipe.sample(raw)
+            t_bwd = cuda_time()
             (loss / group_size).backward()
+            info["t_draft_bwd"] = cuda_time() - t_bwd
+            for key in ("t_target", "t_draft_fwd", "t_draft_bwd"):
+                timing[key] = timing.get(key, 0.0) + info[key]
+            timing["n"] = timing.get("n", 0) + 1
             accumulate_metrics(window, metrics)
             accumulate_metrics(epoch_sums, metrics)
             truncated += int(info["anchors_truncated"])
@@ -333,15 +349,22 @@ def main(argv=None):
                                    "train/epoch": epoch, "perf/samples_per_sec":
                                    (global_step - start_global) / max(time.perf_counter() - started, 1e-9),
                                    "perf/gpu_mem_gb": torch.cuda.max_memory_allocated(device) / 1024**3})
+                    n_timed = max(timing.get("n", 0), 1)
+                    logged.update({f"perf/{k}_ms": 1000 * timing.get(k, 0.0) / n_timed
+                                   for k in ("t_target", "t_draft_fwd", "t_draft_bwd")})
                     print(f"epoch={epoch} opt_step={opt_step}/{total_updates} "
                           f"loss={logged.get('train/loss', float('nan')):.4f} "
                           f"eal={logged.get('train/eal', float('nan')):.3f} "
                           f"accept_len={logged.get('train/accept_len', float('nan')):.3f} "
                           f"lr={logged['train/lr']:.2e} grad_norm={grad_norm:.3f} "
-                          f"samples/s={logged['perf/samples_per_sec']:.2f}", flush=True)
+                          f"samples/s={logged['perf/samples_per_sec']:.2f} "
+                          f"ms/sample target={logged['perf/t_target_ms']:.0f} "
+                          f"draft_fwd={logged['perf/t_draft_fwd_ms']:.0f} "
+                          f"draft_bwd={logged['perf/t_draft_bwd_ms']:.0f} "
+                          f"mem={logged['perf/gpu_mem_gb']:.1f}GB", flush=True)
                     if wandb is not None:
                         wandb.log(logged, step=global_step)
-                    window = {}
+                    window, timing = {}, {}
                 if args.max_steps and opt_step >= args.max_steps:
                     stop = True
                     break

@@ -7,10 +7,11 @@ set -euo pipefail
 #   bash specdec/dspark/run_dspark.sh eval    # official draft on the fine-tuned target (no training)
 #   bash specdec/dspark/run_dspark.sh train   # warm-start from the official draft on the fine-tuned target
 #   bash specdec/dspark/run_dspark.sh smoke   # train for 2 optimizer steps on 64 samples
+#   bash specdec/dspark/run_dspark.sh lengths # token-length stats (processor only, CPU)
 #
 # Extra arguments after the mode go to the Python script, e.g. `train --epochs 3`.
 # Runs in the foreground with a WSL keepalive; wrap it in tmux for long runs.
-MODE="${1:?usage: run_dspark.sh check|eval|train|smoke [extra args]}"; shift
+MODE="${1:?usage: run_dspark.sh check|eval|train|smoke|lengths [extra args]}"; shift
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PY="${PY:-/home/mr_jiang/miniforge3/envs/minicpm_ocr/bin/python}"
 MODEL_ROOT="${MODEL_ROOT:-/home/mr_jiang/models/minicpm-ocr-1.0}"
@@ -52,6 +53,8 @@ case "$MODE" in
     "$PY" specdec/dspark/train_dspark.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --init-draft "$OFFICIAL_DRAFT" \
       "${DATA_ARGS[@]}" --output-dir "$OUT" --max-samples 64 --grad-accum 4 --max-steps 2 --epochs 1 \
       --eval-limit 8 --log-every 1 "$@" 2>&1 | tee "$OUT/smoke.log" ;;
+  lengths)
+    "$PY" specdec/dspark/measure_lengths.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --train-jsonl "$TRAIN_JSONL"       --val-jsonl "$VAL_JSONL" --image-root "$DATA_DIR" --output "$OUT/lengths.json" "$@" 2>&1 | tee "$OUT/lengths.log" ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv | tee "$OUT/gpu_after.csv"

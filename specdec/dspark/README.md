@@ -59,6 +59,7 @@ Validation reports DSpark's own metrics:
 - `train_dspark.py` trains, evaluates (`--eval-only`) and checkpoints. Resume with `--resume <run>/last/trainer_state.pt`.
 - `check_alignment.py` is the gate run before training (below).
 - `run_dspark.sh` is the launcher for `check`, `eval`, `train` and `smoke`. It uses GPU 1 by default, refuses GPU 0, keeps WSL alive and logs to `runs/dspark/<run>/`.
+- `measure_lengths.py` reports token lengths from the processor only: sequence, image and answer tokens, anchor positions against `--max-anchors`, and the size an offline feature cache would take.
 - `test_dspark_pipeline.py` holds CPU checks on tiny configs: vocab maps, bit-exact load/save round trip, hooks against manual residuals, the position guard, a forward/backward step that touches only trainable tensors, and the loss mask.
 
 ## Order of runs
@@ -80,7 +81,9 @@ PYTHONPATH=$PWD $PY baseline/idspace/scripts/evaluate_vllm.py --split validation
   --model /home/mr_jiang/models/minicpm-ocr-1.0/model --output runs/dspark/vllm_official_draft \
   --speculative-config '{"method":"dspark","model":"/home/mr_jiang/models/minicpm-ocr-1.0/dspark","num_speculative_tokens":15}'
 
-# 2. Smoke test: 2 optimizer steps (compile, memory, checkpoint layout)
+# 2. Data lengths (CPU), then a smoke test: 2 optimizer steps (compile, memory, checkpoint layout).
+#    The smoke log prints ms/sample for target forward, draft forward and draft backward.
+bash specdec/dspark/run_dspark.sh lengths
 bash specdec/dspark/run_dspark.sh smoke
 
 # 3. Official draft on the fine-tuned target (how much did fine-tuning cost?)
