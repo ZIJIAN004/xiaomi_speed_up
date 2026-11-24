@@ -50,12 +50,18 @@ pip_install -c "$CONSTRAINTS" aiohttp click "datasets>=4.0.0,<=5.1.0" httpx hugg
   "tqdm>=4.66.3,<=4.70.1" "typer>=0.12.0" "hs-connectors>0.8.0,<=0.10.0a93"
 # Qwen3.5-style linear-attention kernels for HF forward during draft training (fla is Triton-only).
 pip_install "flash-linear-attention"
-# causal-conv1d compiles CUDA code when no matching wheel exists and there is no system nvcc here;
-# it only speeds up HF training forward, so a failure is logged and does not stop the setup.
+# causal-conv1d (fused short conv for HF Qwen3.5 linear-attention layers; the torch fallback also ignores
+# packed-sequence boundaries). No prebuilt wheel for torch 2.14/cu13, and the host has no system CUDA,
+# so build it against the pip-installed CUDA 13 toolkit that vLLM already pulls in (nvidia/cu13).
 if "$PY" -c "import causal_conv1d" 2>/dev/null; then
   log "causal-conv1d already installed"
-elif ! pip_install causal-conv1d; then
-  log "WARNING: causal-conv1d not installed (see pip.log); HF training forward falls back to torch conv"
+else
+  pip_install ninja packaging setuptools wheel
+  CU13="$("$PY" -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13"))')"
+  if ! CUDA_HOME="$CU13" PATH="$CU13/bin:$PATH" TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}" \
+       CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS="${MAX_JOBS:-8}" pip_install --no-build-isolation causal-conv1d; then
+    log "WARNING: causal-conv1d build failed (see pip.log); HF training forward falls back to torch conv"
+  fi
 fi
 
 log "Version / import checks"
