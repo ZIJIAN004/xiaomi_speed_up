@@ -11,7 +11,7 @@ The environment is `envs/setup_minicpm_ocr_env.sh`: vLLM 0.34.0, transformers 5.
 ## Pipeline
 
 ```text
-IDSpace train.jsonl + image (serving resize: longest side ≤ 2048)
+IDSpace train.jsonl + image (serving resize: longest side ≤ 2048), user turn = [image, prompt]
     ↓  MiniCPM processor, native chat template, enable_thinking=False
 Frozen fine-tuned MiniCPM-OCR (HF, bf16, batch size 1)
     ├── forward hooks: output of layers[k-1] for k in [3,7,11,15,19]   → hidden_states [1,T,5·1024]
@@ -55,7 +55,7 @@ Validation reports DSpark's own metrics:
 ## Files
 
 - `minicpm_dspark.py` covers official config to speculators config, official weights in and out, verifier attachment, the target feature hooks, and metric reduction.
-- `idspace_minicpm_dataset.py` renders IDSpace samples as served (prompt, text→image order, resize) and builds the shifted loss mask. It reuses the EAGLE-3 IDSpace loader and seeded split.
+- `idspace_minicpm_dataset.py` renders IDSpace samples as served (prompt, image→text order, resize) and builds the shifted loss mask. It reuses the EAGLE-3 IDSpace loader and seeded split.
 - `train_dspark.py` trains, evaluates (`--eval-only`) and checkpoints. Resume with `--resume <run>/last/trainer_state.pt`.
 - `check_alignment.py` is the gate run before training (below).
 - `run_dspark.sh` is the launcher for `check`, `eval`, `train` and `smoke`. It uses GPU 1 by default, refuses GPU 0, keeps WSL alive and logs to `runs/dspark/<run>/`.
@@ -95,6 +95,6 @@ FT_MODEL=... bash specdec/dspark/run_dspark.sh train --wandb-mode offline
 ## Known limits
 
 - **Off-policy gate.** The gate uses IDSpace ground truth as the answer. The original model's own outputs differ in format, so offline `eal` and vLLM's acceptance length are expected to be close, not identical. After fine-tuning, the target's outputs approach the ground truth and the gap should shrink. Training on the target's own greedy outputs is the speculators default (response regeneration). It would need an answers file, which is not implemented here.
-- **Prompt must match serving.** The default is the IDSpace prompt from `specdec/eagle3/idspace_gt_dataset.py`. If the fine-tuned model is served with another prompt or image order, pass `--prompt-file` / `--image-first`.
+- **Prompt must match serving.** The default is the IDSpace prompt from `specdec/eagle3/idspace_gt_dataset.py`. If the fine-tuned model is served with another prompt or image order, pass `--prompt-file` / `--text-first`. The default order is image then text, as in the official MiniCPM-OCR vLLM examples and ms-swift fine-tuning data.
 - **CUDA only.** Training needs CUDA: flex attention and the fused Triton losses are compiled. `--no-compile` is for debugging only. The unit tests run on CPU through the eager attention and eager loss paths.
 - **Not yet run on the server.** As of this commit nothing has been run on the server: not the unit tests, not the gate, not a training run.

@@ -8,6 +8,9 @@ things are specific to DSpark:
   and the closing ``<|im_end|>``). With ``sample_from_anchor=True`` slot k of an
   anchor block at p predicts token p+k+1 from the target distribution at p+k,
   and speculators masks that slot with ``loss_mask[p+k]``.
+* The user turn is image then text, as in the official MiniCPM-OCR vLLM
+  examples ("Place the image before the text") and ms-swift fine-tuning data
+  ("<image>Extract the ...").
 * The image goes through the serving-side resize (longest side capped at 2048,
   LANCZOS; ``baseline/harness/processor_audit.py:40``) before the processor, so
   image token counts match what vLLM sees.
@@ -45,7 +48,7 @@ def serving_resize(image: Image.Image) -> Image.Image:
 
 class IDSpaceMiniCPMDataset(IDSpaceGroundTruthDataset):
     def __init__(self, jsonl_path, image_root, processor, prompt: str = IDSPACE_PROMPT,
-                 image_first: bool = False, max_samples: int = 0):
+                 image_first: bool = True, max_samples: int = 0):
         super().__init__(jsonl_path, image_root, processor, max_samples)
         self.prompt = prompt
         self.image_first = image_first

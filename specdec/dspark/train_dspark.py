@@ -46,7 +46,8 @@ def parse_args(argv=None):
     p.add_argument("--prompt-file", type=Path, default=None,
                    help="user prompt text; must be the prompt the target is served with "
                         "(default: the IDSpace prompt of specdec/eagle3/idspace_gt_dataset.py)")
-    p.add_argument("--image-first", action="store_true", help="image before text in the user turn")
+    p.add_argument("--text-first", action="store_true",
+                   help="text before image in the user turn (default: image first, the official MiniCPM-OCR order)")
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--val-jsonl", type=Path, default=None,
                    help="separate validation file (e.g. IDSpace validation.jsonl, the benchmark set); "
@@ -123,10 +124,10 @@ def build_datasets(args, processor):
     """(train subset, validation dataset or None) for the IDSpace files in args."""
     prompt = args.prompt_file.read_text(encoding="utf-8").strip() if args.prompt_file else IDSPACE_PROMPT
     dataset = IDSpaceMiniCPMDataset(args.train_jsonl, args.image_root, processor, prompt,
-                                    args.image_first, args.max_samples)
+                                    not args.text_first, args.max_samples)
     train_idx, val_idx = resolve_split(len(dataset), args)
     if args.val_jsonl:
-        val = IDSpaceMiniCPMDataset(args.val_jsonl, args.image_root, processor, prompt, args.image_first)
+        val = IDSpaceMiniCPMDataset(args.val_jsonl, args.image_root, processor, prompt, not args.text_first)
     else:
         val = Subset(dataset, val_idx) if val_idx else None
     return Subset(dataset, train_idx), val
