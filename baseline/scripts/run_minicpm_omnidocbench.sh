@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -u
 
-# MiniCPM-OCR 1.0 on OmniDocBench v1.5, same task and settings as the Xiaomi-OCR-0 baseline:
-#   A) plain decoding            B) DSpark speculative decoding (official draft, k=15)
-# Runs A then B serially on one GPU. Before EACH run it waits until the GPU has more than
-# FREE_THRESHOLD_MIB free (default 22 GiB). A failure in one run is recorded and does not stop the other.
-# Inference runs in the minicpm_ocr env (routed by model_type), scoring in the omnidocbench_v15 env.
+# MiniCPM-OCR 1.0, same tasks and settings as the Xiaomi-OCR-0 baseline:
+#   A)  OmniDocBench v1.5, plain decoding     B)  OmniDocBench v1.5, DSpark (official draft, k=15)
+#   IA) IDSpace validation, plain decoding    IB) IDSpace validation, DSpark
+# Runs the selected items serially on one GPU, in the order given. Before EACH run it waits until the GPU has
+# more than FREE_THRESHOLD_MIB free (default 22 GiB). A failure in one run is recorded and does not stop the rest.
+# Inference runs in the minicpm_ocr env (routed by model_type); OmniDocBench scoring in the omnidocbench_v15 env.
 #
-# Usage (inside WSL, ideally in tmux):  bash baseline/scripts/run_minicpm_omnidocbench.sh
-#   Default runs only A (DSpark off). RUNS="A B" or RUNS="B" adds the DSpark run; NUM_SPECULATIVE_TOKENS changes k for B.
+# Usage (inside WSL, ideally in tmux):  RUNS="A B IA IB" bash baseline/scripts/run_minicpm_omnidocbench.sh
+#   Default RUNS="A" (DSpark off). NUM_SPECULATIVE_TOKENS changes k for B / IB.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/minicpm-ocr-1.0/model}"
 DRAFT_PATH="${DRAFT_PATH:-/home/mr_jiang/models/minicpm-ocr-1.0/dspark}"
@@ -22,6 +23,8 @@ RUNS="${RUNS:-A}"  # default: plain decoding only; RUNS="A B" or "B" adds DSpark
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/minicpm_serial_$(date +%Y%m%d_%H%M%S)}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/data}"
 OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
+IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl}"
+IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/Lora/runs/idspace_e3/prepared}"  # JSONL image paths start with images/
 SPEC_CONFIG="{\"method\":\"dspark\",\"model\":\"$DRAFT_PATH\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS}"
 LOG_ROOT="$RUN_ROOT/logs"
 [[ ! -e "$RUN_ROOT/status.json" ]] || { echo "Run root already used: $RUN_ROOT" >&2; exit 2; }
@@ -43,6 +46,9 @@ failed=0
 [[ -x "$OMNIDOC_EVAL_PYTHON" ]] && r=ok || r=no; check "$r" "evaluator python $OMNIDOC_EVAL_PYTHON"
 [[ -d "$OMNIDOC_ROOT/images" && -f "$OMNIDOC_ROOT/OmniDocBench.json" ]] && r=ok || r=no; check "$r" "OmniDocBench data $OMNIDOC_ROOT"
 [[ -f "$OMNIDOC_EVALUATOR_ROOT/pdf_validation.py" ]] && r=ok || r=no; check "$r" "evaluator $OMNIDOC_EVALUATOR_ROOT"
+if [[ " $RUNS " == *" IA "* || " $RUNS " == *" IB "* ]]; then
+  [[ -f "$IDSPACE_JSONL" && -d "$IDSPACE_IMAGE_ROOT/images" ]] && r=ok || r=no; check "$r" "IDSpace data $IDSPACE_JSONL"
+fi
 model_type=$(cd "$PROJECT_ROOT" && python3 -m baseline.harness.model_profiles "$MODEL_PATH" model_type 2>/dev/null)
 [[ "$model_type" == minicpm_ocr ]] && r=ok || r=no; check "$r" "model_type=minicpm_ocr (got '${model_type}')"
 if (( failed )); then
@@ -85,13 +91,29 @@ run_one() {  # run_one <name> <speculative config or empty>
   return "$status"
 }
 
+run_idspace() {  # run_idspace <name> <speculative config or empty>
+  local name="$1" spec="$2" status=0
+  wait_for_gpu
+  log "Starting run $name -> $RUN_ROOT/$name"
+  (
+    cd "$PROJECT_ROOT" || exit 1
+    spec_args=()
+    [[ -n "$spec" ]] && spec_args=(--speculative-config "$spec")
+    PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"     "$MINICPM_PYTHON" baseline/idspace/scripts/evaluate_vllm.py       --input-jsonl "$IDSPACE_JSONL" --image-root "$IDSPACE_IMAGE_ROOT"       --model "$MODEL_PATH" --output "$RUN_ROOT/$name" --split validation       --workers 8 --gpu "$GPU_ID" --warmup "${IDSPACE_WARMUP:-5}"       --representatives "${IDSPACE_REPRESENTATIVES:-50}" --output-retention all "${spec_args[@]}"
+  ) >"$LOG_ROOT/$name.log" 2>&1 || status=$?
+  log "Run $name finished with status $status"
+  return "$status"
+}
+
 declare -A status=()
 for run in $RUNS; do
   case "$run" in
     A) run_one A_plain "" && status[A_plain]=0 || status[A_plain]=$? ;;
     B) run_one B_dspark_k${NUM_SPECULATIVE_TOKENS} "$SPEC_CONFIG" && status[B_dspark_k${NUM_SPECULATIVE_TOKENS}]=0 \
          || status[B_dspark_k${NUM_SPECULATIVE_TOKENS}]=$? ;;
-    *) log "Unknown run '$run' (use A and/or B)"; status[$run]=2 ;;
+    IA) run_idspace IA_idspace_plain "" && status[IA_idspace_plain]=0 || status[IA_idspace_plain]=$? ;;
+    IB) run_idspace IB_idspace_dspark_k${NUM_SPECULATIVE_TOKENS} "$SPEC_CONFIG"           && status[IB_idspace_dspark_k${NUM_SPECULATIVE_TOKENS}]=0 || status[IB_idspace_dspark_k${NUM_SPECULATIVE_TOKENS}]=$? ;;
+    *) log "Unknown run '$run' (use A, B, IA, IB)"; status[$run]=2 ;;
   esac
 done
 

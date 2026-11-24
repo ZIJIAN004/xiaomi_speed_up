@@ -136,7 +136,7 @@ def main() -> int:
 
     argv = [
         "--manifest", str(benchmark_manifest), "--output", str(args.output / "inference"),
-        "--model", str(args.model), "--served-model-name", "Xiaomi-OCR-0",
+        "--model", str(args.model),  # served name resolves from the checkpoint's model profile
         "--backend", "offline", "--gpu", args.gpu, "--workers", str(args.workers),
         "--warmup", str(args.warmup), "--representatives", str(min(args.representatives, len(samples))),
         "--max-model-len", str(args.max_model_len),
