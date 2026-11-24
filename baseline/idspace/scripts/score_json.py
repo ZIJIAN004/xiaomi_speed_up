@@ -23,6 +23,12 @@ ASKED_FIELDS = (
     "personal_identification_number", "document_number", "issue_date", "expiry_date", "place_of_issue",
 )
 DATE_FIELDS = {"date_of_birth", "issue_date", "expiry_date"}
+# Not scored for now: labels use a fixed vocabulary the prompt never states (document_type is always
+# "identity_card"; issuing_country is an ISO3 code), so the model copies card text (ESPAÑA, Identity Card)
+# and exact match measures format, not reading. The country breakdown below uses the manifest's
+# "country" metadata, not this field, so per-country statistics are unaffected.
+UNSCORED_FIELDS = {"document_type", "issuing_country"}
+SCORED_FIELDS = tuple(field for field in ASKED_FIELDS if field not in UNSCORED_FIELDS)
 
 
 def parse_json(text: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -123,7 +129,7 @@ def main() -> int:
         text = prediction_path.read_text(encoding="utf-8") if prediction_path.is_file() else ""
         prediction, error = parse_json(text)
         # Score only requested fields that have a real label; a null label is not a scoreable target.
-        fields = [field for field in ASKED_FIELDS if norm(target.get(field)) not in (None, "")]
+        fields = [field for field in SCORED_FIELDS if norm(target.get(field)) not in (None, "")]
         results = {}
         correct = 0
         for field in fields:
@@ -164,7 +170,8 @@ def main() -> int:
             for group, values in grouped.items()
         },
         "per_sample": per_sample,
-        "metric_definition": "JSON parsing strips an optional markdown fence, unwraps a single-object list [{...}], and accepts the first JSON object; only the 12 prompt-requested fields with a non-null label are scored (null labels and never-requested label keys are excluded); dates are normalized day-first to YYYY-MM-DD on both sides; other values use exact equality after string trim; missing fields are incorrect; extra prediction fields do not affect field_accuracy but prevent object_exact_match. Each subgroup reports sample-level JSON validity/exact match, micro field accuracy, and per-field accuracy.",
+        "unscored_fields": sorted(UNSCORED_FIELDS),
+        "metric_definition": "JSON parsing strips an optional markdown fence, unwraps a single-object list [{...}], and accepts the first JSON object; only the prompt-requested fields with a non-null label are scored (null labels and never-requested label keys are excluded); document_type and issuing_country are not scored because labels use a vocabulary the prompt does not state; by_group.country comes from manifest metadata, independent of issuing_country; dates are normalized day-first to YYYY-MM-DD on both sides; other values use exact equality after string trim; missing fields are incorrect; extra prediction fields do not affect field_accuracy but prevent object_exact_match. Each subgroup reports sample-level JSON validity/exact match, micro field accuracy, and per-field accuracy.",
     }
     args.output.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
