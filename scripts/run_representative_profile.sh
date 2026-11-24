@@ -57,7 +57,7 @@ status=0
   --manifest "$RESULT_ROOT/page_manifest.jsonl" --output "$RESULT_ROOT/inference" \
   --model "$MODEL_PATH" --gpu "$GPU_ID" --workers 8 \
   --warmup "${WARMUP:-5}" --representatives "$COUNT" \
-  --profile-max-iterations "${PROFILE_MAX_ITERATIONS:-64}" \
+  --profile-max-iterations "${PROFILE_MAX_ITERATIONS:-64}" --retain-raw-traces "${RETAIN_RAW_TRACES:-5}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.90}" --max-model-len "${MAX_MODEL_LEN:-16384}" \
   --dtype "${DTYPE:-auto}" --monitor-interval "${MONITOR_INTERVAL:-1}" \
   --request-timeout "${REQUEST_TIMEOUT:-600}" --warmup-request-timeout "${WARMUP_REQUEST_TIMEOUT:-1800}" \

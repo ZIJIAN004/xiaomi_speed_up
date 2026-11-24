@@ -88,7 +88,34 @@ def analyze_events(events, small_kernel_us=10):
     for (_, corr), owner in correlations.items():
         if owner is not None:
             correlations_by_id[corr].append(owner)
+    # Launch-time fallback: CUDA Graph replay kernels have no External-id path to a CPU op, but each
+    # kernel's runtime launch (cudaGraphLaunch/cudaLaunchKernel) is reachable by correlation id and is
+    # issued on the host inside the benchmark stage range of the step that launched it.
+    launches_by_corr = defaultdict(list)
+    for event in runtime:
+        corr = arg_value(event, "correlation", "Correlation id")
+        if corr is not None:
+            launches_by_corr[str(corr)].append(event)
+    stage_ranges = defaultdict(list)
+    for e in cpu:
+        stage = e.get("name", "").split("::", 1)[1] if e.get("name", "").startswith("benchmark::") else None
+        stage = STAGE_ALIASES.get(stage, stage)
+        if stage in STAGE_NAMES:
+            stage_ranges[(e.get("pid"), e.get("tid"))].append((e["ts"], e["ts"] + e["dur"], stage))
+
+    def launch_stage(kernel):
+        corr = arg_value(kernel, "correlation", "Correlation id")
+        launches = launches_by_corr.get(str(corr), []) if corr is not None else []
+        if len(launches) != 1:
+            return None
+        launch = launches[0]
+        # Deepest (shortest) enclosing stage range on the launching thread.
+        enclosing = [r for r in stage_ranges.get((launch.get("pid"), launch.get("tid")), [])
+                     if r[0] <= launch["ts"] <= r[1]]
+        return min(enclosing, key=lambda r: r[1] - r[0])[2] if enclosing else None
+
     stage_us = defaultdict(float)
+    stage_method = {"external_id_chain": 0, "launch_time_range": 0, "unattributed": 0}
     correlated = 0
     operator_correlated = 0
     for kernel in kernels:
@@ -103,6 +130,10 @@ def analyze_events(events, small_kernel_us=10):
             possible = correlations_by_id.get(str(corr), []) if corr is not None else []
             owner = possible[0] if len(possible) == 1 else None
         if owner is None:
+            label = launch_stage(kernel)
+            stage_method["launch_time_range" if label else "unattributed"] += 1
+            if label:
+                stage_us[label] += kernel["dur"]
             continue
         correlated += 1
         chain = []
@@ -124,6 +155,11 @@ def analyze_events(events, small_kernel_us=10):
                       if e.get("name", "").startswith("benchmark::")
                       and (e["name"].split("::", 1)[1] in STAGE_NAMES
                            or e["name"].split("::", 1)[1] in STAGE_ALIASES)), None)
+        if label:
+            stage_method["external_id_chain"] += 1
+        else:
+            label = launch_stage(kernel)
+            stage_method["launch_time_range" if label else "unattributed"] += 1
         if label:
             stage_us[label] += kernel["dur"]
     if not operator_correlated:
@@ -197,7 +233,10 @@ def analyze_events(events, small_kernel_us=10):
               "stage_time_semantics": "sum of correlated GPU kernel durations; exclusive deepest-stage attribution, not stage wall latency",
               "observed_stage_ranges": sorted(observed_stages),
               "unattributed_kernel_time_ms": (sum(durations) - sum(stage_us.values())) / 1000 if kernels else None,
-              "stage_attribution_note": "runner_prefill/runner_decode aliases are normalized to prefill/decode; stage kernel work remains correlation-limited",
+              "stage_kernel_attribution_counts": stage_method,
+              "stage_attribution_note": ("runner_prefill/runner_decode aliases are normalized to prefill/decode; kernels without an "
+                                         "External-id chain (CUDA Graph replay) are attributed by the stage range enclosing their "
+                                         "host launch; operator tables remain External-id limited"),
               "trace_peak_allocated_bytes": max(allocated) if allocated else None,
               "trace_peak_reserved_bytes": max(reserved) if reserved else None,
               "profile_memory_events": len(allocations),

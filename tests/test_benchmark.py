@@ -215,6 +215,26 @@ class TraceTests(unittest.TestCase):
         self.assertIsNone(result["stage_kernel_time_ms"]["prefill"])
         self.assertIsNone(result["gpu_active_time_ms"])
 
+    def test_graph_replay_kernels_follow_launch_into_stage_range(self):
+        # Graph replay: one cudaGraphLaunch without External id launches several kernels.
+        events = [
+            dict(ph="X", cat="user_annotation", name="benchmark::runner_decode", ts=0, dur=100, pid=1, tid=1),
+            dict(ph="X", cat="cuda_runtime", name="cudaGraphLaunch", ts=10, dur=5, pid=1, tid=1, args={"correlation": 7}),
+            dict(ph="X", cat="kernel", name="gemm", ts=20, dur=30, pid=0, tid=7, args={"correlation": 7}),
+            dict(ph="X", cat="kernel", name="attn", ts=50, dur=20, pid=0, tid=7, args={"correlation": 7}),
+            # Launched after the step range closed: must stay unattributed.
+            dict(ph="X", cat="cuda_runtime", name="cudaLaunchKernel", ts=150, dur=5, pid=1, tid=1, args={"correlation": 8}),
+            dict(ph="X", cat="kernel", name="copy", ts=160, dur=10, pid=0, tid=7, args={"correlation": 8}),
+            # A launch on another thread is not inside this thread's range.
+            dict(ph="X", cat="cuda_runtime", name="cudaLaunchKernel", ts=20, dur=5, pid=1, tid=2, args={"correlation": 9}),
+            dict(ph="X", cat="kernel", name="other", ts=30, dur=10, pid=0, tid=7, args={"correlation": 9}),
+        ]
+        result, _ = analyze_events(events)
+        self.assertEqual(result["stage_kernel_time_ms"]["decode"], .05)
+        self.assertEqual(result["stage_kernel_attribution_counts"],
+                         {"external_id_chain": 0, "launch_time_range": 2, "unattributed": 2})
+        self.assertEqual(result["correlated_kernel_count"], 0)
+
 
 class ServerProcessorTests(unittest.TestCase):
     def test_nested_real_methods_preserve_results_and_skip_super_double_count(self):
