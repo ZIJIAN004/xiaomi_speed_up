@@ -37,7 +37,7 @@ best/ and last/ in the official layout (same keys, shapes, dtypes and config.jso
 
 ### Hyperparameters
 
-Defaults come from speculators. From `TrainerConfig`: AdamW, weight decay 0.01, linear schedule with 1% warmup, gradient clipping 1.0, bf16 autocast over fp32 master weights. From `examples/train/dspark_qwen3_0_6b_sharegpt_online.sh`: lr 3e-4, 5 epochs, loss `{"ce":0.1,"tv":0.9}`, confidence α 1.0, decay γ 4.0.
+Defaults come from speculators. From `TrainerConfig`: AdamW, weight decay 0.01, linear schedule with 1% warmup, gradient clipping 1.0, bf16 autocast over fp32 master weights. From `examples/train/dspark_qwen3_0_6b_sharegpt_online.sh`: lr 3e-4, loss `{"ce":0.1,"tv":0.9}`, confidence α 1.0, decay γ 4.0. The example trains 5 epochs on ShareGPT; here the default is 3 (`--epochs`), because the draft is warm-started and IDSpace answers share one fixed JSON schema. If validation `eal` still rises in epoch 3, rerun with `--epochs 5` (the linear schedule depends on the total).
 
 Two values are adapted to batch-size-one multimodal samples:
 

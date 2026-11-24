@@ -60,7 +60,7 @@ def parse_args(argv=None):
     p.add_argument("--eval-limit", type=int, default=0, help="cap on evaluated samples (0 = all)")
     # Optimisation defaults: speculators TrainerConfig (AdamW wd 0.01, linear schedule,
     # clip 1.0) and the DSpark example script (lr 3e-4, ce 0.1 + tv 0.9, alpha 1.0).
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-ratio", type=float, default=0.01)
