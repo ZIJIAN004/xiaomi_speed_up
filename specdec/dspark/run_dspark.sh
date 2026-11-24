@@ -54,7 +54,8 @@ case "$MODE" in
       "${DATA_ARGS[@]}" --output-dir "$OUT" --max-samples 64 --grad-accum 4 --max-steps 2 --epochs 1 \
       --eval-limit 8 --log-every 1 "$@" 2>&1 | tee "$OUT/smoke.log" ;;
   lengths)
-    "$PY" specdec/dspark/measure_lengths.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --train-jsonl "$TRAIN_JSONL"       --val-jsonl "$VAL_JSONL" --image-root "$DATA_DIR" --output "$OUT/lengths.json" "$@" 2>&1 | tee "$OUT/lengths.log" ;;
+    "$PY" specdec/dspark/measure_lengths.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --train-jsonl "$TRAIN_JSONL" \
+      --val-jsonl "$VAL_JSONL" --image-root "$DATA_DIR" --output "$OUT/lengths.json" "$@" 2>&1 | tee "$OUT/lengths.log" ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv | tee "$OUT/gpu_after.csv"

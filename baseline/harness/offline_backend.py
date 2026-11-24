@@ -100,6 +100,8 @@ class OfflineBackend:
         if "ignore_frontend" in fields:
             config["ignore_frontend"] = True
         self.processor = AutoProcessor.from_pretrained(self.args.model, trust_remote_code=self.args.trust_remote_code)
+        from baseline.harness.model_profiles import image_first
+        self.image_first = image_first(self.args.model)  # each model's official message order; prompt text unchanged
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
             model=self.args.model, served_model_name=self.args.served_model_name,
             tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1,
@@ -120,6 +122,7 @@ class OfflineBackend:
                          "scheduler_max_num_seqs": self.engine.vllm_config.scheduler_config.max_num_seqs,
                          "padding_side": tokenizer.padding_side, "max_model_len": self.args.max_model_len,
                          "prompt_policy": "native AutoProcessor template; tokenize=False, enable_thinking=False; engine expands image placeholders; add_special_tokens=False",
+                         "message_order": "image, text" if self.image_first else "text, image",
                          "eos_token_id": tokenizer.eos_token_id,
                          "generation_limit_policy": "max_tokens=None uses installed InputProcessor remaining context; no default 16-token cap"}
 
@@ -130,7 +133,9 @@ class OfflineBackend:
         from vllm import SamplingParams
         from vllm.sampling_params import RequestOutputKind
         from baseline.harness.processor_audit import PROMPT
-        messages = [{"role": "user", "content": [{"type": "text", "text": getattr(args, "request_prompt", PROMPT)}, {"type": "image", "image": image}]}]
+        from baseline.harness.model_profiles import user_content
+        messages = [{"role": "user", "content": user_content(getattr(args, "request_prompt", PROMPT), image,
+                                                             getattr(self, "image_first", False))}]
         begin = time.perf_counter()
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         template_ms = (time.perf_counter()-begin)*1000

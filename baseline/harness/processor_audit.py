@@ -62,6 +62,8 @@ class ProcessorAudit:
         self.config = AutoConfig.from_pretrained(model, trust_remote_code=trust_remote_code)
         self.tokenizer = self.processor.tokenizer
         self.model = model
+        from baseline.harness.model_profiles import image_first
+        self.image_first = image_first(model)  # must match the order offline_backend sends
 
     def describe(self):
         return {"model": self.model, "processor_class": type(self.processor).__name__,
@@ -75,8 +77,8 @@ class ProcessorAudit:
 
     def inspect(self, image, prompt=PROMPT):
         start = time.perf_counter()
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt},
-                                                    {"type": "image", "image": image}]}]
+        from baseline.harness.model_profiles import user_content
+        messages = [{"role": "user", "content": user_content(prompt, image, getattr(self, "image_first", False))}]
         template = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         inputs = self.processor(text=[template], images=[image], return_tensors="pt")

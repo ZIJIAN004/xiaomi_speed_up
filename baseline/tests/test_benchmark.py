@@ -1179,6 +1179,12 @@ class ModelProfileTests(unittest.TestCase):
             self.assertEqual(preprocessor_settings(minicpm, profile),
                              {"downsample_mode": "4x", "max_slice_nums": 9, "scale_resolution": 448})
             self.assertTrue(profile_for(xiaomi)["python"].endswith("envs/speed_up/bin/python"))
+            from baseline.harness.model_profiles import image_first, user_content
+            self.assertTrue(image_first(minicpm))
+            self.assertFalse(image_first(xiaomi))
+            self.assertFalse(image_first(Path(directory) / "missing"))
+            self.assertEqual([c["type"] for c in user_content("p", "img", image_first(minicpm))], ["image", "text"])
+            self.assertEqual([c["type"] for c in user_content("p", "img", image_first(xiaomi))], ["text", "image"])
             check_speculative_config(profile, {"method": "dspark", "model": "d"})
             with self.assertRaisesRegex(ValueError, "not enabled"):
                 check_speculative_config(profile_for(xiaomi), {"method": "dspark"})

@@ -22,6 +22,8 @@ PROFILES = {
         "vision_encoder_modules": ["visual", "model.visual"],
         "projector_modules": ["visual.merger", "model.visual.merger"],
         "speculative_methods": [],
+        # Official request order (evaluation_pipeline/e2e_img2md.py): prompt text, then image.
+        "image_first": False,
         # Image-processor settings copied into config.json for every run.
         "preprocessor_keys": ["patch_size", "merge_size", "temporal_patch_size", "size", "min_pixels", "max_pixels"],
     },
@@ -35,6 +37,9 @@ PROFILES = {
         "vision_encoder_modules": [],
         "projector_modules": ["merger", "model.merger"],
         "speculative_methods": ["dspark"],
+        # Official order (docs/vllm_deploy_en.md "Place the image before the text", SDK dialects.py); the
+        # official DSpark draft and our DSpark training data use it too.
+        "image_first": True,
         "preprocessor_keys": ["downsample_mode", "slice_mode", "max_slice_nums", "scale_resolution", "patch_size"],
     },
 }
@@ -60,6 +65,19 @@ def preprocessor_settings(model_dir, profile) -> dict:
             data = json.loads(path.read_text(encoding="utf-8"))
             found.update({k: data[k] for k in profile["preprocessor_keys"] if k in data})
     return found
+
+
+def image_first(model_dir) -> bool:
+    """Message order for this checkpoint; text-first (the Xiaomi baseline order) when no profile applies."""
+    try:
+        return bool(profile_for(model_dir).get("image_first", False))
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def user_content(prompt, image, first_image) -> list:
+    text, picture = {"type": "text", "text": prompt}, {"type": "image", "image": image}
+    return [picture, text] if first_image else [text, picture]
 
 
 def check_speculative_config(profile, speculative_config) -> None:
