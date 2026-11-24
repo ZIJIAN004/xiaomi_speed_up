@@ -576,6 +576,8 @@ def parse_args(argv=None):
     parser.add_argument("--server-processor-dir", type=Path, help="actual server processor JSONL directory from launcher")
     parser.add_argument("--profiler-dir", type=Path)
     parser.add_argument("--profile-max-iterations", type=int, default=64)
+    # Raw traces are ~36 MB each; keep this many seeded-random profiled pages, reduce the rest to statistics.
+    parser.add_argument("--retain-raw-traces", type=int, default=5)
     parser.add_argument("--module-map", default="{}")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--skip-processor-audit", action="store_true")
@@ -589,7 +591,7 @@ def parse_args(argv=None):
     parser.add_argument("--retention-seed", type=int, default=42)
     args = parser.parse_args(argv)
     args.enforce_eager = True
-    if args.retain_samples < 0 or args.retain_worst < 0:
+    if args.retain_samples < 0 or args.retain_worst < 0 or args.retain_raw_traces < 0:
         parser.error("retention sample counts must be nonnegative")
     if args.workers < 1 or args.warmup < 3 or not 3 <= args.representatives <= 1355 or args.monitor_interval <= 0:
         parser.error("workers>=1, warmup>=3, representatives=3..1355 and monitor-interval>0 required")

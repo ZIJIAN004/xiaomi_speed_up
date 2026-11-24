@@ -378,6 +378,27 @@ class TraceStorageTests(unittest.TestCase):
             self.assertEqual(len(list((moved / "profiler_raw").iterdir())), 1)
             self.assertEqual(result[0]["trace_file"], relative)
 
+    def test_pruned_traces_keep_statistics_across_recollection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            profiles = []
+            for i, sid in enumerate(("a", "b", "c")):
+                dump_json(run / f"raw/{sid}.json", {"traceEvents": [
+                    {"ph": "X", "cat": "kernel", "name": "k", "ts": 0, "dur": 10 + i}]})
+                profiles.append({"sample_id": sid, "trace_files": [f"raw/{sid}.json"]})
+            first = collect_traces(run, profiles, keep_raw=1, seed=42)
+            kept = [p["sample_id"] for p in profiles if p["raw_trace_retained"]]
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(sorted(f.stem for f in (run / "raw").iterdir()), kept)
+            reference = json.loads((run / "trace_representative.ref.json").read_text())
+            self.assertTrue((run / reference["trace_file"]).is_file())
+            first_kernels = (run / "kernel_top50.csv").read_text()
+            # A second collect_run pass reads extracted statistics for the deleted traces.
+            second = collect_traces(run, profiles, keep_raw=1, seed=42)
+            self.assertEqual([r["kernel_count"] for r in second], [r["kernel_count"] for r in first])
+            self.assertFalse(any("error" in r for r in second))
+            self.assertEqual((run / "kernel_top50.csv").read_text(), first_kernels)
+
     def test_old_absolute_trace_paths_remain_readable(self):
         with tempfile.TemporaryDirectory() as folder:
             run = Path(folder)

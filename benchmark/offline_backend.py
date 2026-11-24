@@ -91,7 +91,8 @@ class OfflineBackend:
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.config import ProfilerConfig
         config = {"profiler": "torch", "torch_profiler_dir": str(self.args.profiler_dir),
-                  "torch_profiler_with_stack": True, "torch_profiler_record_shapes": True,
+                  # Python stacks are not used by trace_analysis and dominate trace size/export time.
+                  "torch_profiler_with_stack": False, "torch_profiler_record_shapes": True,
                   "torch_profiler_with_memory": True, "torch_profiler_with_flops": True}
         fields = set(getattr(ProfilerConfig, "__dataclass_fields__", {})) | set(getattr(ProfilerConfig, "__annotations__", {}))
         if "max_iterations" in fields:

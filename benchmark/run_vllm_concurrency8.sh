@@ -65,7 +65,7 @@ import json, sys
 from vllm.config import ProfilerConfig
 fields = set(getattr(ProfilerConfig, "__dataclass_fields__", {})) | set(getattr(ProfilerConfig, "__annotations__", {}))
 config = {"profiler": "torch", "torch_profiler_dir": sys.argv[1],
-          "torch_profiler_with_stack": True, "torch_profiler_record_shapes": True,
+          "torch_profiler_with_stack": False, "torch_profiler_record_shapes": True,
           "torch_profiler_with_memory": True, "torch_profiler_with_flops": True}
 if "max_iterations" in fields:
     config["max_iterations"] = int(sys.argv[2])

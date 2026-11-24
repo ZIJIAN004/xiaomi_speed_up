@@ -126,7 +126,7 @@ class BenchmarkWorkerExtension:
             profile.export_chrome_trace(str(trace_path))
         self.profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=True, profile_memory=True, with_stack=True, with_flops=True,
+            record_shapes=True, profile_memory=True, with_stack=False, with_flops=True,
             schedule=torch.profiler.schedule(wait=0, warmup=0, active=steps, repeat=1), on_trace_ready=save)
         # Kineto permits one export. If vLLM requests another name on stop,
         # relocate/re-encode the canonical payload rather than keeping copies.

@@ -206,14 +206,51 @@ def analyze_events(events, small_kernel_us=10):
     return result, sorted(operators.values(), key=lambda r: r["self_cuda_time_total_ms"] or 0, reverse=True)
 
 
-def collect_traces(run_dir, profile_records, small_kernel_us=10):
+def _stats_cache_path(run_dir, trace_path):
+    return run_dir / "trace_stats" / (trace_path.name + ".stats.json.gz")
+
+
+def _analyze_trace(run_dir, path, small_kernel_us):
+    """Return (data, operators, kernels); raw trace first, else stats extracted before it was pruned."""
+    if path.is_file():
+        events = load_trace(path)
+        data, operators = analyze_events(events, small_kernel_us)
+        kernels = defaultdict(list)
+        for event in events:
+            if event.get("ph") == "X" and event.get("cat") == "kernel":
+                kernels[event["name"]].append(event["dur"])
+        return data, operators, dict(kernels)
+    cache = _stats_cache_path(run_dir, path)
+    if not cache.is_file():
+        raise OSError(f"trace missing and no extracted statistics: {path}")
+    with gzip.open(cache, "rt", encoding="utf-8") as f:
+        payload = json.load(f)
+    return payload["data"], payload["operators"], payload["kernels"]
+
+
+def select_retained_traces(profile_records, keep, seed):
+    """Seeded random sample IDs whose raw traces are kept; None keeps every trace."""
+    if keep is None:
+        return None
+    import random
+    ids = sorted({r["sample_id"] for r in profile_records if r.get("trace_files")})
+    return set(random.Random(seed).sample(ids, min(keep, len(ids))))
+
+
+def collect_traces(run_dir, profile_records, small_kernel_us=10, keep_raw=None, seed=42):
+    # keep_raw: number of profiled samples whose raw traces stay on disk; the rest are reduced to
+    # extracted statistics (trace_stats/) after analysis. None keeps all raw traces.
     results = []
     all_operators = defaultdict(list)
     kernel_durations = defaultdict(list)
     representative = None
+    retained = select_retained_traces(profile_records, keep_raw, seed)
     for record in profile_records:
         # Analyze each worker trace independently: external IDs are not unique across processes/files.
         sample_results = []
+        keep_this = retained is None or record["sample_id"] in retained
+        if retained is not None and record.get("trace_files"):
+            record["raw_trace_retained"] = keep_this
         for file in record.get("trace_files", []):
             path = Path(file)
             if not path.is_absolute():
@@ -221,11 +258,16 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
             if not (path.name.endswith(".json") or path.name.endswith(".json.gz")):
                 continue
             try:
-                events = load_trace(path)
-                data, operators = analyze_events(events, small_kernel_us)
-                for event in events:
-                    if event.get("ph") == "X" and event.get("cat") == "kernel":
-                        kernel_durations[event["name"]].append(event["dur"])
+                data, operators, kernels = _analyze_trace(run_dir, path, small_kernel_us)
+                if not keep_this and path.is_file():
+                    cache = _stats_cache_path(run_dir, path)
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    with gzip.open(cache, "wt", encoding="utf-8") as f:
+                        json.dump({"trace_file": str(file), "data": data, "operators": operators,
+                                   "kernels": kernels}, f)
+                    path.unlink()
+                for name, durations in kernels.items():
+                    kernel_durations[name].extend(durations)
                 if not data["kernel_count"] and not operators:
                     continue
                 data.update(sample_id=record["sample_id"], trace_file=str(file), phase="profile",
@@ -235,7 +277,7 @@ def collect_traces(run_dir, profile_records, small_kernel_us=10):
                 sample_results.append(data)
                 for row in operators:
                     all_operators[row["operator_name"]].append(row)
-                if representative is None and data["kernel_count"]:
+                if representative is None and data["kernel_count"] and path.is_file():
                     representative = str(file)
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 results.append({"sample_id": record["sample_id"], "trace_file": str(path), "error": str(exc)})

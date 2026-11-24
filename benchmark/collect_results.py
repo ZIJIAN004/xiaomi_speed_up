@@ -300,7 +300,9 @@ def collect_run(run_dir, small_kernel_us=10):
     profiles = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else []
     from benchmark.processor_results import collect_processor_calls
     processor_status = collect_processor_calls(run_dir, config, records, warmups, profiles)
-    traces = collect_traces(run_dir, profiles, small_kernel_us)
+    # Runs recorded before raw-trace pruning existed have no setting and keep every trace.
+    traces = collect_traces(run_dir, profiles, small_kernel_us,
+                            keep_raw=config.get("retain_raw_traces"), seed=config.get("retention_seed", 42))
     dump_json(run_dir / "profile_metrics.json", profiles)
     monitor_path = run_dir / "monitor" / "system_samples.jsonl"
     archive_path = run_dir / "monitor" / "scalars.zip"
