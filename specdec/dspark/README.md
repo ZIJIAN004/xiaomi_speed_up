@@ -82,7 +82,8 @@ PYTHONPATH=$PWD $PY baseline/idspace/scripts/evaluate_vllm.py --split validation
   --speculative-config '{"method":"dspark","model":"/home/mr_jiang/models/minicpm-ocr-1.0/dspark","num_speculative_tokens":15}'
 
 # 2. Data lengths (CPU), then a smoke test: 2 optimizer steps (compile, memory, checkpoint layout).
-#    The smoke log prints ms/sample for target forward, draft forward and draft backward.
+#    smoke passes --profile-stages, so its log prints ms/sample for target forward, draft forward
+#    and draft backward. The flag is off by default because it adds CUDA syncs.
 bash specdec/dspark/run_dspark.sh lengths
 bash specdec/dspark/run_dspark.sh smoke
 

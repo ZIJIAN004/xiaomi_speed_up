@@ -6,7 +6,7 @@ set -euo pipefail
 #   bash specdec/dspark/run_dspark.sh check   # alignment gate: ORIGINAL model + official draft
 #   bash specdec/dspark/run_dspark.sh eval    # official draft on the fine-tuned target (no training)
 #   bash specdec/dspark/run_dspark.sh train   # warm-start from the official draft on the fine-tuned target
-#   bash specdec/dspark/run_dspark.sh smoke   # train for 2 optimizer steps on 64 samples
+#   bash specdec/dspark/run_dspark.sh smoke   # train for 2 optimizer steps on 64 samples (with --profile-stages)
 #   bash specdec/dspark/run_dspark.sh lengths # token-length stats (processor only, CPU)
 #
 # Extra arguments after the mode go to the Python script, e.g. `train --epochs 3`.
@@ -52,7 +52,7 @@ case "$MODE" in
   smoke)
     "$PY" specdec/dspark/train_dspark.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --init-draft "$OFFICIAL_DRAFT" \
       "${DATA_ARGS[@]}" --output-dir "$OUT" --max-samples 64 --grad-accum 4 --max-steps 2 --epochs 1 \
-      --eval-limit 8 --log-every 1 "$@" 2>&1 | tee "$OUT/smoke.log" ;;
+      --eval-limit 8 --log-every 1 --profile-stages "$@" 2>&1 | tee "$OUT/smoke.log" ;;
   lengths)
     "$PY" specdec/dspark/measure_lengths.py --model "${SMOKE_MODEL:-$BASE_MODEL}" --train-jsonl "$TRAIN_JSONL" \
       --val-jsonl "$VAL_JSONL" --image-root "$DATA_DIR" --output "$OUT/lengths.json" "$@" 2>&1 | tee "$OUT/lengths.log" ;;

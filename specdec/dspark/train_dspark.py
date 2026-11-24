@@ -84,6 +84,9 @@ def parse_args(argv=None):
                         "accept_len = rejection-sampling expectation")
     p.add_argument("--full-target-forward", action="store_true",
                    help="run the full target (with LM head) instead of its base model for features")
+    p.add_argument("--profile-stages", action="store_true",
+                   help="log ms/sample of target forward, draft forward and draft backward; adds "
+                        "three CUDA syncs per sample, so keep it off for real training")
     p.add_argument("--no-compile", action="store_true", help="disable torch.compile (debugging; slow)")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--wandb-project", default="minicpm-ocr-dspark")
@@ -133,8 +136,13 @@ def build_datasets(args, processor):
     return Subset(dataset, train_idx), val
 
 
-def cuda_time() -> float:
-    """Wall time after all queued CUDA work finished (stage timing, not kernel timing)."""
+def cuda_time(enabled: bool = True) -> float:
+    """Wall time after all queued CUDA work finished (stage timing, not kernel timing).
+
+    Disabled: returns 0 without synchronizing, so the stage times are simply zero.
+    """
+    if not enabled:
+        return 0.0
     torch.cuda.synchronize()
     return time.perf_counter()
 
@@ -165,17 +173,18 @@ class Pipeline:
             confidence_head_alpha=args.confidence_head_alpha)
         self.call_kwargs = train_kwargs
         self.max_anchors = args.max_anchors
+        self.profile = args.profile_stages
 
     def sample(self, raw):
         inputs = {k: v.to(self.device) for k, v in raw["inputs"].items()}
         loss_mask = raw["loss_mask"].to(self.device)
-        t0 = cuda_time()
+        t0 = cuda_time(self.profile)
         features = self.extractor(inputs)
-        t1 = cuda_time()
+        t1 = cuda_time(self.profile)
         batch = draft_inputs(features, inputs["input_ids"], loss_mask)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, loss, metrics = self.model(**batch, **self.call_kwargs)
-        t2 = cuda_time()
+        t2 = cuda_time(self.profile)
         anchors = int(loss_mask[:, :-self.model.block_size].sum())
         return loss, metrics, {"seq_len": inputs["input_ids"].shape[1], "valid_anchors": anchors,
                                "anchors_truncated": anchors > self.max_anchors,
@@ -327,9 +336,9 @@ def main(argv=None):
             group_start = step - step % args.grad_accum
             group_size = min(args.grad_accum, len(loader) - group_start)
             loss, metrics, info = pipe.sample(raw)
-            t_bwd = cuda_time()
+            t_bwd = cuda_time(args.profile_stages)
             (loss / group_size).backward()
-            info["t_draft_bwd"] = cuda_time() - t_bwd
+            info["t_draft_bwd"] = cuda_time(args.profile_stages) - t_bwd
             for key in ("t_target", "t_draft_fwd", "t_draft_bwd"):
                 timing[key] = timing.get(key, 0.0) + info[key]
             timing["n"] = timing.get("n", 0) + 1
@@ -349,19 +358,21 @@ def main(argv=None):
                                    "train/epoch": epoch, "perf/samples_per_sec":
                                    (global_step - start_global) / max(time.perf_counter() - started, 1e-9),
                                    "perf/gpu_mem_gb": torch.cuda.max_memory_allocated(device) / 1024**3})
-                    n_timed = max(timing.get("n", 0), 1)
-                    logged.update({f"perf/{k}_ms": 1000 * timing.get(k, 0.0) / n_timed
-                                   for k in ("t_target", "t_draft_fwd", "t_draft_bwd")})
+                    if args.profile_stages:
+                        n_timed = max(timing.get("n", 0), 1)
+                        logged.update({f"perf/{k}_ms": 1000 * timing.get(k, 0.0) / n_timed
+                                       for k in ("t_target", "t_draft_fwd", "t_draft_bwd")})
                     print(f"epoch={epoch} opt_step={opt_step}/{total_updates} "
                           f"loss={logged.get('train/loss', float('nan')):.4f} "
                           f"eal={logged.get('train/eal', float('nan')):.3f} "
                           f"accept_len={logged.get('train/accept_len', float('nan')):.3f} "
                           f"lr={logged['train/lr']:.2e} grad_norm={grad_norm:.3f} "
                           f"samples/s={logged['perf/samples_per_sec']:.2f} "
-                          f"ms/sample target={logged['perf/t_target_ms']:.0f} "
-                          f"draft_fwd={logged['perf/t_draft_fwd_ms']:.0f} "
-                          f"draft_bwd={logged['perf/t_draft_bwd_ms']:.0f} "
                           f"mem={logged['perf/gpu_mem_gb']:.1f}GB", flush=True)
+                    if args.profile_stages:
+                        print(f"  ms/sample target={logged['perf/t_target_ms']:.0f} "
+                              f"draft_fwd={logged['perf/t_draft_fwd_ms']:.0f} "
+                              f"draft_bwd={logged['perf/t_draft_bwd_ms']:.0f}", flush=True)
                     if wandb is not None:
                         wandb.log(logged, step=global_step)
                     window, timing = {}, {}
