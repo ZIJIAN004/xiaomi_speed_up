@@ -108,6 +108,9 @@ def main() -> int:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--skip-processor-audit", action="store_true")
     parser.add_argument("--output-retention", choices=("sampled", "all"), default="all")
+    parser.add_argument("--speculative-config", default=None,
+                        help='JSON vLLM speculative_config passed to the offline benchmark, e.g. '
+                             '{"method":"dspark","model":...,"num_speculative_tokens":15}')
     args = parser.parse_args()
     if args.workers < 1 or args.max_samples < 0 or (args.max_tokens is not None and args.max_tokens < 1):
         parser.error("workers must be positive; max-samples nonnegative; max-tokens positive when provided")
@@ -152,6 +155,8 @@ def main() -> int:
         argv.append("--trust-remote-code")
     if args.skip_processor_audit:
         argv.append("--skip-processor-audit")
+    if args.speculative_config is not None:
+        argv.extend(["--speculative-config", args.speculative_config])
     if args.output_retention == "all":
         argv.extend(["--retain-samples", "0", "--retain-worst", "0"])
     else:
