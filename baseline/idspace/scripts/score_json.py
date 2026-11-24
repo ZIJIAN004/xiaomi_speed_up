@@ -16,6 +16,13 @@ FIELDS = (
     "issue_date", "expiry_date", "place_of_issue",
 )
 GROUPS = ("country", "modality", "template_id")
+# The 12 fields the IDSpace prompt asks for. Labels also carry birthday/card_num/expire_date/issue_authority/
+# personal_num, always null and never requested; scoring them would count "absent == null" as correct.
+ASKED_FIELDS = (
+    "document_type", "issuing_country", "given_name", "surname", "date_of_birth", "gender", "nationality",
+    "personal_identification_number", "document_number", "issue_date", "expiry_date", "place_of_issue",
+)
+DATE_FIELDS = {"date_of_birth", "issue_date", "expiry_date"}
 
 
 def parse_json(text: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -24,6 +31,8 @@ def parse_json(text: str) -> tuple[dict[str, Any] | None, str | None]:
     candidate = re.sub(r"\s*```$", "", candidate)
     try:
         value = json.loads(candidate)
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+            return value[0], None  # model wrapped the single object in a list: [{...}]
         return (value, None) if isinstance(value, dict) else (None, "top-level JSON is not an object")
     except json.JSONDecodeError as first:
         decoder = json.JSONDecoder()
@@ -40,6 +49,15 @@ def parse_json(text: str) -> tuple[dict[str, Any] | None, str | None]:
 
 def norm(value: Any) -> Any:
     return value.strip() if isinstance(value, str) else value
+
+
+def norm_date(value: Any) -> Any:
+    """DD.MM.YYYY / DD-MM-YYYY / DD/MM/YYYY / 'DD MM YYYY' -> YYYY-MM-DD (day-first, as on the IDSpace cards)."""
+    value = norm(value)
+    if not isinstance(value, str):
+        return value
+    match = re.fullmatch(r"(\d{1,2})[.\-/ ](\d{1,2})[.\-/ ](\d{4})", value)
+    return f"{match[3]}-{int(match[2]):02d}-{int(match[1]):02d}" if match else value
 
 
 def new_bucket() -> dict[str, Any]:
@@ -104,12 +122,14 @@ def main() -> int:
         prediction_path = args.predictions / f"{sample_id}.md"
         text = prediction_path.read_text(encoding="utf-8") if prediction_path.is_file() else ""
         prediction, error = parse_json(text)
-        fields = [field for field in FIELDS if field in target]
+        # Score only requested fields that have a real label; a null label is not a scoreable target.
+        fields = [field for field in ASKED_FIELDS if norm(target.get(field)) not in (None, "")]
         results = {}
         correct = 0
         for field in fields:
-            expected = norm(target.get(field))
-            actual = norm(prediction.get(field)) if prediction is not None else None
+            convert = norm_date if field in DATE_FIELDS else norm
+            expected = convert(target.get(field))
+            actual = convert(prediction.get(field)) if prediction is not None else None
             results[field] = actual == expected
             correct += int(results[field])
         record = {
@@ -144,7 +164,7 @@ def main() -> int:
             for group, values in grouped.items()
         },
         "per_sample": per_sample,
-        "metric_definition": "JSON parsing strips an optional markdown fence and accepts the first JSON object; field values use exact equality after string trim; missing fields are incorrect; extra prediction fields do not affect field_accuracy but prevent object_exact_match. Each subgroup reports sample-level JSON validity/exact match, micro field accuracy, and per-field accuracy.",
+        "metric_definition": "JSON parsing strips an optional markdown fence, unwraps a single-object list [{...}], and accepts the first JSON object; only the 12 prompt-requested fields with a non-null label are scored (null labels and never-requested label keys are excluded); dates are normalized day-first to YYYY-MM-DD on both sides; other values use exact equality after string trim; missing fields are incorrect; extra prediction fields do not affect field_accuracy but prevent object_exact_match. Each subgroup reports sample-level JSON validity/exact match, micro field accuracy, and per-field accuracy.",
     }
     args.output.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
