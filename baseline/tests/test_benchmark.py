@@ -1183,6 +1183,9 @@ class ModelProfileTests(unittest.TestCase):
             self.assertTrue(image_first(minicpm))
             self.assertFalse(image_first(xiaomi))
             self.assertFalse(image_first(Path(directory) / "missing"))
+            from baseline.harness.model_profiles import engine_kwargs
+            self.assertEqual(engine_kwargs(minicpm), {"limit_mm_per_prompt": {"video": 0}})
+            self.assertEqual(engine_kwargs(xiaomi), {})
             self.assertEqual([c["type"] for c in user_content("p", "img", image_first(minicpm))], ["image", "text"])
             self.assertEqual([c["type"] for c in user_content("p", "img", image_first(xiaomi))], ["text", "image"])
             check_speculative_config(profile, {"method": "dspark", "model": "d"})

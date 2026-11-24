@@ -100,8 +100,9 @@ class OfflineBackend:
         if "ignore_frontend" in fields:
             config["ignore_frontend"] = True
         self.processor = AutoProcessor.from_pretrained(self.args.model, trust_remote_code=self.args.trust_remote_code)
-        from baseline.harness.model_profiles import image_first
+        from baseline.harness.model_profiles import engine_kwargs, image_first
         self.image_first = image_first(self.args.model)  # each model's official message order; prompt text unchanged
+        self.engine_kwargs = engine_kwargs(self.args.model)
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
             model=self.args.model, served_model_name=self.args.served_model_name,
             tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1,
@@ -112,7 +113,7 @@ class OfflineBackend:
             # Only experimental variable across models: speculative decoding (e.g. DSpark); None = plain decode.
             speculative_config=json.loads(self.args.speculative_config) if self.args.speculative_config else None,
             worker_extension_cls="baseline.harness.worker_extension.BenchmarkWorkerExtension",
-            profiler_config=ProfilerConfig(**config), disable_log_stats=False))
+            profiler_config=ProfilerConfig(**config), disable_log_stats=False, **self.engine_kwargs))
         parallel = self.engine.vllm_config.parallel_config
         if any(getattr(parallel, name) != 1 for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")):
             raise RuntimeError("offline benchmark requires actual TP=PP=DP=1")
@@ -123,6 +124,7 @@ class OfflineBackend:
                          "padding_side": tokenizer.padding_side, "max_model_len": self.args.max_model_len,
                          "prompt_policy": "native AutoProcessor template; tokenize=False, enable_thinking=False; engine expands image placeholders; add_special_tokens=False",
                          "message_order": "image, text" if self.image_first else "text, image",
+                         "model_engine_kwargs": self.engine_kwargs,
                          "eos_token_id": tokenizer.eos_token_id,
                          "generation_limit_policy": "max_tokens=None uses installed InputProcessor remaining context; no default 16-token cap"}
 

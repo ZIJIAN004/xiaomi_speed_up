@@ -40,6 +40,10 @@ PROFILES = {
         # Official order (docs/vllm_deploy_en.md "Place the image before the text", SDK dialects.py); the
         # official DSpark draft and our DSpark training data use it too.
         "image_first": True,
+        # Extra AsyncEngineArgs. video=0 as in the official deploy (docs/vllm_deploy_en.md): it disables the video
+        # startup warmup, whose dummy frames pass disable_small_image_upsize to the transformers 5.22 image
+        # processor and crash engine init. Image limit stays at the vLLM default, as for Xiaomi.
+        "engine_kwargs": {"limit_mm_per_prompt": {"video": 0}},
         "preprocessor_keys": ["downsample_mode", "slice_mode", "max_slice_nums", "scale_resolution", "patch_size"],
     },
 }
@@ -78,6 +82,14 @@ def image_first(model_dir) -> bool:
 def user_content(prompt, image, first_image) -> list:
     text, picture = {"type": "text", "text": prompt}, {"type": "image", "image": image}
     return [picture, text] if first_image else [text, picture]
+
+
+def engine_kwargs(model_dir) -> dict:
+    """Per-model extra engine arguments; none when no profile applies."""
+    try:
+        return dict(profile_for(model_dir).get("engine_kwargs", {}))
+    except (OSError, ValueError, KeyError):
+        return {}
 
 
 def check_speculative_config(profile, speculative_config) -> None:
