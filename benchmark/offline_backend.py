@@ -106,7 +106,7 @@ class OfflineBackend:
             max_model_len=self.args.max_model_len,
             dtype=self.args.dtype, gpu_memory_utilization=self.args.gpu_memory_utilization,
             trust_remote_code=self.args.trust_remote_code, generation_config="vllm",
-            enforce_eager=getattr(self.args, "enforce_eager", True),
+            enforce_eager=False,  # vLLM default: CUDA Graph and torch.compile enabled
             worker_extension_cls="benchmark.worker_extension.BenchmarkWorkerExtension",
             profiler_config=ProfilerConfig(**config), disable_log_stats=False))
         parallel = self.engine.vllm_config.parallel_config
