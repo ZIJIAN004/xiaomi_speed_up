@@ -28,8 +28,11 @@ PROFILES = {
     "minicpm_ocr": {
         "name": "MiniCPM-OCR-1.0",
         "python": f"{ENVS}/minicpm_ocr/bin/python",
-        # vpm = Idefics2 ViT; merger = final 2x2 downsample MLP. vit_merger (the in-ViT merge) is skipped in 4x mode.
-        "vision_encoder_modules": ["vpm", "model.vpm"],
+        # vLLM never calls vpm.forward: get_vision_hidden_states runs vpm.embeddings / vpm.encoder.layers[i] /
+        # post_layernorm piecewise (vit_merger between layers is skipped in 4x mode), then self.merger(...).
+        # So the vision stage wraps that model method; merger (final 2x2 downsample MLP) nests inside it.
+        "vision_encoder_method": "get_vision_hidden_states",
+        "vision_encoder_modules": [],
         "projector_modules": ["merger", "model.merger"],
         "speculative_methods": ["dspark"],
         "preprocessor_keys": ["downsample_mode", "slice_mode", "max_slice_nums", "scale_resolution", "patch_size"],

@@ -120,6 +120,13 @@ class ProcessorAudit:
                           image_grid_width=grid[0][2] if len(grid) == 1 else None,
                           image_patch_count=sum(int(t * h * w) for t, h, w in grid),
                           image_patch_count_source="processor.image_grid_thw product")
+        # MiniCPM-OCR slicing: one (h, w) patch grid per slice (source thumbnail + up to max_slice_nums tiles).
+        sizes = inputs.get("target_sizes")
+        if grid is None and sizes is not None:
+            sizes = sizes.cpu().reshape(-1, 2).tolist()
+            result.update(image_slice_count=len(sizes), image_slice_patch_grids=sizes,
+                          image_patch_count=sum(int(h * w) for h, w in sizes),
+                          image_patch_count_source="processor.target_sizes product summed over slices")
         pixels = inputs.get("pixel_values")
         result["pixel_values_shape"] = list(pixels.shape) if pixels is not None else None
         # Leave resized pixel geometry/padding null: a patch grid does not prove physical pixel padding.
@@ -132,7 +139,8 @@ class ProcessorAudit:
             height, width = grid[0][1] * patch_size, grid[0][2] * patch_size
             result.update(resized_width=width, resized_height=height, resized_pixels=width * height,
                           resized_geometry_source="processor grid times configured patch size; processed canvas, not padding estimate")
-        elif pixels is not None and len(pixels.shape) == 4 and pixels.shape[0] == 1:
+        elif sizes is None and pixels is not None and len(pixels.shape) == 4 and pixels.shape[0] == 1:
+            # Not for sliced inputs: MiniCPM packs all slices into one (1, 3, patch, N) strip.
             height, width = int(pixels.shape[-2]), int(pixels.shape[-1])
             result.update(resized_width=width, resized_height=height, resized_pixels=width * height,
                           resized_geometry_source="actual pixel_values spatial dimensions")

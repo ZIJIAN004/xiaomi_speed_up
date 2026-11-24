@@ -1198,8 +1198,12 @@ class ModelProfileTests(unittest.TestCase):
             checkpoint = fake_checkpoint(Path(directory) / "minicpm", "minicpm_ocr")
             merger = SimpleNamespace(forward=lambda: None)
             vit_merger = SimpleNamespace(forward=lambda: None)
-            vpm = SimpleNamespace(forward=lambda: None)
-            model = SimpleNamespace(forward=lambda: (vpm.forward(), merger.forward()))
+            # Like vLLM: the tower runs piecewise (vpm.forward is never called), then merger.
+            vpm = SimpleNamespace(forward=lambda: self.fail("vpm.forward must not be needed"),
+                                  embeddings=lambda: None)
+            model = SimpleNamespace()
+            model.get_vision_hidden_states = lambda: (vpm.embeddings(), merger.forward())
+            model.forward = lambda: model.get_vision_hidden_states()
             model.named_modules = lambda: [("", model), ("vpm", vpm), ("vit_merger", vit_merger), ("merger", merger)]
             speculator = SimpleNamespace(propose=lambda: "draft")
             runner = SimpleNamespace(model=model, sampler=None, requests={}, speculator=speculator,
@@ -1214,7 +1218,8 @@ class ModelProfileTests(unittest.TestCase):
                 self.assertEqual(speculator.propose(), "draft")
                 worker.benchmark_profile_ranges("false")
         self.assertEqual(result["model_profile"], "MiniCPM-OCR-1.0")
-        self.assertEqual(result["installed"]["vision_encoder"]["module_path"], "vpm")
+        self.assertEqual(result["installed"]["vision_encoder"]["model_method"], "get_vision_hidden_states")
+        self.assertLess(seen.index("benchmark::vision_encoder"), seen.index("benchmark::projector"))
         self.assertEqual(result["installed"]["projector"]["module_path"], "merger")
         self.assertIn("draft", result["installed"])
         for stage in ("vision_encoder", "projector", "draft"):

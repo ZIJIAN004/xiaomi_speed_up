@@ -444,11 +444,13 @@ class BenchmarkWorkerExtension:
         model_path = getattr(getattr(self.model_runner, "model_config", None), "model", None) or \
             getattr(getattr(getattr(self, "vllm_config", None), "model_config", None), "model", None)
         profile_name = None
+        vision_method = None
         if model_path:
             try:
                 from baseline.harness.model_profiles import profile_for
                 profile = profile_for(model_path)
                 profile_name = profile["name"]
+                vision_method = profile.get("vision_encoder_method")
                 candidates["vision_encoder"] = profile["vision_encoder_modules"] + candidates["vision_encoder"]
                 candidates["projector"] = profile["projector_modules"] + candidates["projector"]
             except (OSError, ValueError, KeyError):
@@ -462,6 +464,13 @@ class BenchmarkWorkerExtension:
         installed = {}
         self._benchmark_handles = []
         self._benchmark_wrapped = []
+        if vision_method and "vision_encoder" not in mapping and callable(getattr(model, vision_method, None)):
+            # The model drives its vision tower piecewise, so wrap the method that runs the whole tower.
+            method_original = getattr(model, vision_method)
+            setattr(model, vision_method, make_wrapper(method_original, "vision_encoder"))
+            self._benchmark_wrapped.append((model, vision_method, method_original))
+            installed["vision_encoder"] = {"model_method": vision_method, "class": type(model).__name__}
+            candidates.pop("vision_encoder")
         for stage, names in candidates.items():
             path = mapping.get(stage)
             if path is None:
