@@ -14,13 +14,14 @@ evaluate_report.json
 # Machine-specific MCP client configuration
 skills/xiaomi-ocr/mcp-config.json
 
-# Local benchmark environment and GPU smoke-check artifacts
-scripts/benchmark_interfaces*.json
-scripts/runtime_check_*/
-scripts/startup_check_*/
-
 # User-prepared v1_5 evaluator checkout (separate repository)
 /evaluation_pipeline/OmniDocBench/
 
-# Local benchmark diagnostics and generated traces
-/benchmark/dia/
+# Datasets and every generated run (benchmarks, profiles, smoke checks, env setup logs, diagnostics)
+/data/
+/runs/
+# Pre-restructure locations, kept ignored until moved on each machine
+/benchmark/
+/scripts/runtime_check_*/
+/scripts/startup_check_*/
+/scripts/benchmark_interfaces*.json

@@ -111,7 +111,7 @@ see [Runtime placement and progress](../INSTALL.md#runtime-placement-and-progres
 The preview regression cases can be checked with:
 
 ```bash
-node --test tests/test_preview.cjs
+node --test demo/tests/test_preview.cjs
 ```
 
 These cases exercise the bundled KaTeX renderer. They do not establish runtime
