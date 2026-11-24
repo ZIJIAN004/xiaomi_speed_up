@@ -279,8 +279,16 @@ def request_one(sample, args, output, phase="steady", attempt=0, audit=None):
 
 def system_tokens_from_chatml(ids, tokenizer):
     """Parse only a verified native ChatML layout; unsupported templates return null."""
-    vocab = tokenizer.get_vocab()
-    start, end = vocab.get("<|im_start|>"), vocab.get("<|im_end|>")
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        # Direct lookups: get_vocab() rebuilds the full ~248k-entry dict (~0.22 s per call), which made
+        # reconcile_worker_records take ~48 min for 12078 IDSpace records.
+        unk = getattr(tokenizer, "unk_token_id", None)
+        start, end = (tokenizer.convert_tokens_to_ids(t) for t in ("<|im_start|>", "<|im_end|>"))
+        start = None if start == unk and unk is not None else start
+        end = None if end == unk and unk is not None else end
+    else:
+        vocab = tokenizer.get_vocab()
+        start, end = vocab.get("<|im_start|>"), vocab.get("<|im_end|>")
     if start is None or end is None or not ids or ids[0] != start:
         return None
     prefixes = {role: tokenizer.encode(role + "\n", add_special_tokens=False)
