@@ -62,6 +62,7 @@ status=0
   --dtype "${DTYPE:-auto}" --monitor-interval "${MONITOR_INTERVAL:-1}" \
   --request-timeout "${REQUEST_TIMEOUT:-600}" --warmup-request-timeout "${WARMUP_REQUEST_TIMEOUT:-1800}" \
   --profiler-dir "$RESULT_ROOT/profiler_raw" --server-processor-dir "$RESULT_ROOT/processor_raw" \
-  --output-retention all > "$RESULT_ROOT/run.log" 2>&1 || status=$?
+  --output-retention all ${SPECULATIVE_CONFIG:+--speculative-config "$SPECULATIVE_CONFIG"} \
+  > "$RESULT_ROOT/run.log" 2>&1 || status=$?
 log "Representative profile finished with status $status"
 exit "$status"

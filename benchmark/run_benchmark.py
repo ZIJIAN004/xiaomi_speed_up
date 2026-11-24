@@ -579,6 +579,9 @@ def parse_args(argv=None):
     # Raw traces are ~36 MB each; keep this many seeded-random profiled pages, reduce the rest to statistics.
     parser.add_argument("--retain-raw-traces", type=int, default=5)
     parser.add_argument("--module-map", default="{}")
+    parser.add_argument("--speculative-config",
+                        help='offline backend only: JSON vLLM speculative_config, e.g. {"method":"dspark","model":...,'
+                             '"num_speculative_tokens":15}; omitted = plain decoding')
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--skip-processor-audit", action="store_true")
     parser.add_argument("--no-logprobs", action="store_true")
@@ -596,6 +599,14 @@ def parse_args(argv=None):
         parser.error("workers>=1, warmup>=3, representatives=3..1355 and monitor-interval>0 required")
     if args.request_timeout <= 0 or args.warmup_request_timeout <= 0:
         parser.error("request-timeout and warmup-request-timeout must be positive")
+    if args.speculative_config is not None:
+        if args.backend != "offline":
+            parser.error("--speculative-config applies to the offline backend; configure an HTTP server at launch")
+        try:
+            if not isinstance(json.loads(args.speculative_config), dict):
+                raise ValueError
+        except ValueError:
+            parser.error("--speculative-config must be a JSON object")
     if args.profile_max_iterations < 1:
         parser.error("profile-max-iterations must be positive; unbounded representative traces are not enabled")
     if args.max_tokens is not None and args.max_tokens < 1:

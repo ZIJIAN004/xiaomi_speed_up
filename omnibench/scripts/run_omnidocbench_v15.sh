@@ -33,5 +33,7 @@ ARGS=(--dataset "$OMNIDOC_ROOT" --model "$MODEL_PATH" --output "$RESULT_ROOT" --
       --retain-worst "${RETAIN_WORST:-10}" --retention-seed "${RETENTION_SEED:-42}")
 [[ -z "${MAX_TOKENS:-}" ]] || ARGS+=(--max-tokens "$MAX_TOKENS")
 [[ -z "${DCGM_URL:-}" ]] || ARGS+=(--dcgm-url "$DCGM_URL")
+[[ -z "${SPECULATIVE_CONFIG:-}" ]] || ARGS+=(--speculative-config "$SPECULATIVE_CONFIG")
+[[ -z "${SERVED_MODEL_NAME:-}" ]] || ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
 echo 'OmniDocBench 1.5: offline whole pages(workers=8; no PaddleX) -> page evaluation'
 "$SPEED_UP_PYTHON" -m omnibench.run_omnidocbench_v15 "${ARGS[@]}" 2>&1 | tee "${RESULT_ROOT}.log"

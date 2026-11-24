@@ -1086,6 +1086,26 @@ class CollectorIntegrationTests(unittest.TestCase):
             self.assertTrue(all(r["status"] == "unavailable" for r in inventory if r["metric"] in ("formula_cdm", "table_teds", "text_edit")))
 
 
+class SpeculativeDecodingSummaryTest(unittest.TestCase):
+    def test_hit_rate_from_counter_deltas(self):
+        from benchmark.collect_results import speculative_decoding_summary
+        row = lambda metric, delta, labels='{engine="0"}': dict(metric=metric, labels=labels, delta=delta)
+        rows = [row("vllm:spec_decode_num_drafts_total", 100), row("vllm:spec_decode_num_draft_tokens_total", 1500),
+                row("vllm:spec_decode_num_accepted_tokens_total", 600),
+                row("vllm:spec_decode_num_accepted_tokens_per_pos_total", 90, '{engine="0",position="0"}'),
+                row("vllm:spec_decode_num_accepted_tokens_per_pos_total", 70, '{engine="0",position="1"}'),
+                row("vllm:spec_decode_num_drafts_total", None, '{engine="1"}')]  # counter reset: ignored
+        s = speculative_decoding_summary(rows)
+        self.assertTrue(s["enabled"])
+        self.assertEqual(s["acceptance_rate"], .4)
+        self.assertEqual(s["mean_acceptance_length"], 7.0)
+        self.assertEqual(s["per_position_acceptance_rate"], {0: .9, 1: .7})
+
+    def test_plain_decoding_reports_disabled(self):
+        from benchmark.collect_results import speculative_decoding_summary
+        self.assertFalse(speculative_decoding_summary([])["enabled"])
+
+
 class RunnerStepClassificationTest(unittest.TestCase):
     @staticmethod
     def step(new=(), cached=(), scheduled=None):

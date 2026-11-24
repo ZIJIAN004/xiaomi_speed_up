@@ -69,6 +69,37 @@ def prometheus_summary(run_dir, samples, start, end):
     return rows, histograms
 
 
+SPEC_COUNTERS = {"vllm:spec_decode_num_drafts_total": "drafts",
+                 "vllm:spec_decode_num_draft_tokens_total": "draft_tokens",
+                 "vllm:spec_decode_num_accepted_tokens_total": "accepted_tokens"}
+SPEC_PER_POSITION = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+
+
+def speculative_decoding_summary(rows):
+    """Run-wide speculative-decoding hit rate from vLLM counter deltas over the steady window."""
+    counts, per_position = {}, {}
+    for row in rows:
+        if row["delta"] is None:
+            continue
+        if row["metric"] in SPEC_COUNTERS:
+            key = SPEC_COUNTERS[row["metric"]]
+            counts[key] = counts.get(key, 0) + row["delta"]
+        elif row["metric"] == SPEC_PER_POSITION:
+            position = re.search(r'position="(\d+)"', row["labels"])
+            if position:
+                per_position[int(position[1])] = per_position.get(int(position[1]), 0) + row["delta"]
+    drafts = counts.get("drafts")
+    if not drafts:
+        return {"enabled": False, "reason": "no spec_decode counter deltas in the steady window"}
+    accepted, draft_tokens = counts.get("accepted_tokens", 0), counts.get("draft_tokens")
+    return {"enabled": True, **counts,
+            "acceptance_rate": ratio(accepted, draft_tokens),
+            "mean_acceptance_length": 1 + accepted / drafts,
+            "per_position_acceptance_rate": {p: per_position[p] / drafts for p in sorted(per_position)},
+            "scope": "vLLM spec_decode counters, steady window only; acceptance length counts the verifier's bonus token",
+            "per_position_definition": "share of drafts whose draft token at this position was accepted"}
+
+
 def throughput(records, elapsed):
     good = [r for r in records if r.get("success")]
     completed = [r for r in records if r.get("finish_reason") is not None]
@@ -417,6 +448,7 @@ def collect_run(run_dir, small_kernel_us=10):
                "system": {f: (compact_system.get(f, stats([])) if compact_system is not None else
                               stats([r.get(f) for r in steady_system])) for f in system_fields},
                "server_histogram_deltas": histograms,
+               "speculative_decoding": speculative_decoding_summary(prom_rows),
                "stop_statistics": {"finish_reasons": dict(finish), "completed_requests": len(completed),
                    "finish_reason_coverage": ratio(len(completed), len(records)),
                    "stop_rate": ratio(finish["stop"], len(completed)),

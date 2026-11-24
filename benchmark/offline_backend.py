@@ -107,6 +107,8 @@ class OfflineBackend:
             dtype=self.args.dtype, gpu_memory_utilization=self.args.gpu_memory_utilization,
             trust_remote_code=self.args.trust_remote_code, generation_config="vllm",
             enforce_eager=False,  # vLLM default: CUDA Graph and torch.compile enabled
+            # Only experimental variable across models: speculative decoding (e.g. DSpark); None = plain decode.
+            speculative_config=json.loads(self.args.speculative_config) if self.args.speculative_config else None,
             worker_extension_cls="benchmark.worker_extension.BenchmarkWorkerExtension",
             profiler_config=ProfilerConfig(**config), disable_log_stats=False))
         parallel = self.engine.vllm_config.parallel_config
