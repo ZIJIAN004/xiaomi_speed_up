@@ -145,7 +145,7 @@ def main() -> int:
         "--output-retention", args.output_retention,
         "--quality-command", json.dumps([
             os.environ.get("IDSPACE_SCORER_PYTHON", os.sys.executable),
-            str(Path(__file__).with_name("score_idspace_json.py")),
+            str(Path(__file__).with_name("score_json.py")),
             "--manifest", "{manifest}", "--predictions", "{predictions}", "--output", "{output}",
         ]),
     ]
