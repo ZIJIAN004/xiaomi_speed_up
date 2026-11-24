@@ -472,7 +472,7 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
                 record["cuda_event_timing"] = event_stats
                 record["cuda_event_setup"] = event_begin
                 record["gpu_ttft_ms"] = event_stats["gpu_ttft_ms"]
-                for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling"):
+                for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft"):
                     record[stage + "_time_ms"] = event_stats["stages"].get(stage, {}).get("exclusive_ms")
                     record[stage + "_cuda_event_time_ms"] = record[stage + "_time_ms"]
                     record[stage + "_host_call_span_ms"] = event_stats.get("host_call_spans", {}).get(stage, {}).get("inclusive_ms")
@@ -482,7 +482,7 @@ def profile_samples(args, samples, output, audit, monitor, tokenizer=None):
                     record[stage + "_host_call_span_source"] = event_stats.get("host_call_span_sources", {}).get(stage, "representative_worker_host_call_span")
                 n = record.get("generated_tokens")
                 record["tpot_ms"] = record["decode_time_ms"] / n if n and record.get("decode_time_ms") is not None else None
-                model_ms = sum(event_stats["stages"][stage]["exclusive_ms"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")
+                model_ms = sum(event_stats["stages"][stage]["exclusive_ms"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft")
                                if stage in event_stats["stages"])
                 record["model_only_generated_tokens_per_second"] = n * 1000 / model_ms if n and model_ms > 0 and all(stage in event_stats["stages"] for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")) else None
                 for stage in ("prefill", "decode"):
@@ -554,7 +554,8 @@ def parse_args(argv=None):
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--served-model-name", default="Xiaomi-OCR-0")
+    parser.add_argument("--served-model-name", default=None,
+                        help="defaults to the model profile name (model_profiles.py), else Xiaomi-OCR-0")
     parser.add_argument("--backend", choices=("offline", "http"), default="offline")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
@@ -607,6 +608,19 @@ def parse_args(argv=None):
                 raise ValueError
         except ValueError:
             parser.error("--speculative-config must be a JSON object")
+        if (Path(args.model) / "config.json").is_file():
+            from baseline.harness.model_profiles import check_speculative_config, profile_for
+            try:
+                check_speculative_config(profile_for(args.model), json.loads(args.speculative_config))
+            except ValueError as exc:
+                parser.error(str(exc))
+    if args.served_model_name is None:
+        args.served_model_name = "Xiaomi-OCR-0"
+        if (Path(args.model) / "config.json").is_file():
+            from baseline.harness.model_profiles import PROFILES, model_type
+            kind = model_type(args.model)
+            if kind in PROFILES:
+                args.served_model_name = PROFILES[kind]["name"]
     if args.profile_max_iterations < 1:
         parser.error("profile-max-iterations must be positive; unbounded representative traces are not enabled")
     if args.max_tokens is not None and args.max_tokens < 1:
@@ -657,6 +671,11 @@ def main(args=None):
     output.mkdir(parents=True)
     shutil.copy2(args.manifest, output / "manifest.jsonl")
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    if (Path(args.model) / "config.json").is_file():
+        from baseline.harness.model_profiles import PROFILES, model_type, preprocessor_settings, profile_for
+        if model_type(args.model) in PROFILES:
+            profile = profile_for(args.model)
+            config.update(model_profile=profile, model_preprocessing=preprocessor_settings(args.model, profile))
     config.update(benchmark_version="1.5" if samples[0].get("dataset") == "omnidocbench" else None,
                   request_unit=samples[0].get("request_unit", "page"), diagnostic_only=os.environ.get("BENCHMARK_RUNTIME_SMOKE") == "1", request_batch_size=1, actual_scheduler_batch_size=None, temperature=0,
                   top_p=0.8, repetition_penalty=1.0, dtype_policy="fixed server launch dtype",

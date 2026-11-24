@@ -1,0 +1,75 @@
+"""Per-model routing for the baseline harness, keyed by the checkpoint's config.json model_type.
+
+Everything that differs between the benchmarked OCR models lives here; the task itself (pages, prompt,
+sampling, concurrency, max_model_len, evaluator) is identical for all of them. Standard library only, so the
+launcher can query it with any python before the model environment is chosen:
+
+    python3 -m baseline.harness.model_profiles <model_dir> python   ->  interpreter for that model
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+ENVS = "/home/mr_jiang/miniforge3/envs"
+
+PROFILES = {
+    "qwen3_5": {
+        "name": "Xiaomi-OCR-0",
+        "python": f"{ENVS}/speed_up/bin/python",
+        # vLLM module paths that receive vision/projector CUDA-event ranges.
+        "vision_encoder_modules": ["visual", "model.visual"],
+        "projector_modules": ["visual.merger", "model.visual.merger"],
+        "speculative_methods": [],
+        # Image-processor settings copied into config.json for every run.
+        "preprocessor_keys": ["patch_size", "merge_size", "temporal_patch_size", "size", "min_pixels", "max_pixels"],
+    },
+    "minicpm_ocr": {
+        "name": "MiniCPM-OCR-1.0",
+        "python": f"{ENVS}/minicpm_ocr/bin/python",
+        # vpm = Idefics2 ViT; merger = final 2x2 downsample MLP. vit_merger (the in-ViT merge) is skipped in 4x mode.
+        "vision_encoder_modules": ["vpm", "model.vpm"],
+        "projector_modules": ["merger", "model.merger"],
+        "speculative_methods": ["dspark"],
+        "preprocessor_keys": ["downsample_mode", "slice_mode", "max_slice_nums", "scale_resolution", "patch_size"],
+    },
+}
+
+
+def model_type(model_dir) -> str:
+    return json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))["model_type"]
+
+
+def profile_for(model_dir) -> dict:
+    kind = model_type(model_dir)
+    if kind not in PROFILES:
+        raise ValueError(f"no benchmark profile for model_type={kind!r} ({model_dir}); known: {sorted(PROFILES)}")
+    return {"model_type": kind, **PROFILES[kind]}
+
+
+def preprocessor_settings(model_dir, profile) -> dict:
+    """Configured preprocessing as shipped with the checkpoint (preprocessor_config.json, then config.json)."""
+    found = {}
+    for name in ("config.json", "preprocessor_config.json"):
+        path = Path(model_dir) / name
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            found.update({k: data[k] for k in profile["preprocessor_keys"] if k in data})
+    return found
+
+
+def check_speculative_config(profile, speculative_config) -> None:
+    if not speculative_config:
+        return
+    method = speculative_config.get("method")
+    if method not in profile["speculative_methods"]:
+        raise ValueError(f"speculative method {method!r} not enabled for {profile['name']}; "
+                         f"allowed: {profile['speculative_methods'] or 'none'}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("usage: python -m baseline.harness.model_profiles <model_dir> <field>")
+    value = profile_for(sys.argv[1])[sys.argv[2]]
+    print(value if isinstance(value, str) else json.dumps(value))

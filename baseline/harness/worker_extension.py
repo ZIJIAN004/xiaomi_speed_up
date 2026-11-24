@@ -440,6 +440,19 @@ class BenchmarkWorkerExtension:
         candidates = {"vision_encoder": ["visual", "vision_model", "vision_tower", "model.visual", "model.vision_model"],
                       "projector": ["multi_modal_projector", "mm_projector", "projector", "visual.merger",
                                     "model.multi_modal_projector", "model.visual.merger"]}
+        # Model-specific module paths first (e.g. MiniCPM-OCR: vpm / merger), generic names as fallback.
+        model_path = getattr(getattr(self.model_runner, "model_config", None), "model", None) or \
+            getattr(getattr(getattr(self, "vllm_config", None), "model_config", None), "model", None)
+        profile_name = None
+        if model_path:
+            try:
+                from baseline.harness.model_profiles import profile_for
+                profile = profile_for(model_path)
+                profile_name = profile["name"]
+                candidates["vision_encoder"] = profile["vision_encoder_modules"] + candidates["vision_encoder"]
+                candidates["projector"] = profile["projector_modules"] + candidates["projector"]
+            except (OSError, ValueError, KeyError):
+                pass
         def make_wrapper(fn, label):
             @functools.wraps(fn)
             def wrapped(*args, **kwargs):
@@ -492,6 +505,14 @@ class BenchmarkWorkerExtension:
             sampler.forward = make_wrapper(sampler_original, "sampling")
             self._benchmark_wrapped.append((sampler, "forward", sampler_original))
             installed["sampling"] = type(sampler).__name__
+        # Speculative decoding: the V2 runner calls speculator.propose() from sample_tokens(), outside
+        # execute_model, so draft-model work gets its own range instead of falling outside every stage.
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None and hasattr(speculator, "propose"):
+            propose_original = speculator.propose
+            speculator.propose = make_wrapper(propose_original, "draft")
+            self._benchmark_wrapped.append((speculator, "propose", propose_original))
+            installed["draft"] = type(speculator).__name__
         # V0 attention metadata exposes explicit prefill/decode token counts.
         # V1 variants without these fields deliberately get no fabricated phase label.
         original = model.forward
@@ -519,6 +540,6 @@ class BenchmarkWorkerExtension:
                 return original(*args, **kwargs)
         model.forward = forward
         self._benchmark_wrapped.append((model, "forward", original))
-        return {"installed": installed, "model_modules": list(modules),
+        return {"installed": installed, "model_profile": profile_name, "model_modules": list(modules),
                 "scope": "representative_profile_only", "phase_source": "actual attention metadata",
                 "warning": "graph replay may bypass Python ranges; parent vision ranges can include projector"}

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from baseline.harness.metrics import overlap_duration, stats, union_duration, write_csv
 
-STAGE_NAMES = ("vision_encoder", "projector", "prefill", "decode", "sampling", "tokenizer_decode")
+STAGE_NAMES = ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft", "tokenizer_decode")
 STAGE_ALIASES = {
     "runner_prefill": "prefill",
     "runner_decode": "decode",

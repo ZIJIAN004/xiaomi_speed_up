@@ -9,8 +9,9 @@ set -euo pipefail
 # Usage: SOURCE_RUN=<.../omnidocbench_v15 result dir> bash baseline/scripts/run_representative_profile.sh
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE_RUN="${SOURCE_RUN:?set SOURCE_RUN to an omnidocbench_v15 result directory}"
-SPEED_UP_PYTHON="${SPEED_UP_PYTHON:-/home/mr_jiang/miniforge3/envs/speed_up/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/home/mr_jiang/models/xiaomi-ocr-0/model}"
+# Interpreter routed by model_type (baseline/harness/model_profiles.py); MODEL_PYTHON overrides.
+INFER_PYTHON="${MODEL_PYTHON:-$(cd "$PROJECT_ROOT" && python3 -m baseline.harness.model_profiles "$MODEL_PATH" python)}"
 GPU_ID="${GPU_ID:-1}"
 FREE_THRESHOLD_MIB="${FREE_THRESHOLD_MIB:-24000}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-60}"
@@ -25,7 +26,7 @@ log() { printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "$RESULT_ROOT/orchestrato
 source "$PROJECT_ROOT/envs/wsl_keepalive.sh"
 log "$(start_wsl_keepalive "$$" 2>&1)"
 
-COUNT="$("$SPEED_UP_PYTHON" - "$SELECTION" "$SOURCE_RUN/page_manifest.jsonl" "$RESULT_ROOT/page_manifest.jsonl" <<'PY'
+COUNT="$("$INFER_PYTHON" - "$SELECTION" "$SOURCE_RUN/page_manifest.jsonl" "$RESULT_ROOT/page_manifest.jsonl" <<'PY'
 import json, sys
 selection, manifest, output = sys.argv[1:]
 wanted = {s["sample_id"] for s in json.load(open(selection))["samples"]}
@@ -53,7 +54,7 @@ cd "$PROJECT_ROOT"
 export CUDA_VISIBLE_DEVICES="$GPU_ID" TOKENIZERS_PARALLELISM=false VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONPATH="$PROJECT_ROOT/baseline/harness/server_bootstrap:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 status=0
-"$SPEED_UP_PYTHON" -m baseline.harness.run_benchmark --backend offline \
+"$INFER_PYTHON" -m baseline.harness.run_benchmark --backend offline \
   --manifest "$RESULT_ROOT/page_manifest.jsonl" --output "$RESULT_ROOT/inference" \
   --model "$MODEL_PATH" --gpu "$GPU_ID" --workers 8 \
   --warmup "${WARMUP:-5}" --representatives "$COUNT" \

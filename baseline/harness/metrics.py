@@ -9,7 +9,7 @@ from pathlib import Path
 
 STAGES = (
     "file_io", "image_decode", "preprocess", "processor", "h2d",
-    "vision_encoder", "projector", "prefill", "decode", "sampling",
+    "vision_encoder", "projector", "prefill", "decode", "sampling", "draft",
     "tokenizer_decode", "postprocess", "serialization", "output_io",
 )
 TOKEN_FIELDS = (

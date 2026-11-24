@@ -259,7 +259,7 @@ def coverage_inventory(records, summary, profiles, traces, quality):
         for subfield in ("bytes", "time_ms"):
             add(field + "_" + subfield, "10", [r.get("transfers", {}).get(field, {}).get(subfield) for r in traces],
                 "actual GPU memcpy trace events", "transfer direction/size not exposed in captured trace", "cpu_gpu_transfer.csv")
-    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "tokenizer_decode"):
+    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft", "tokenizer_decode"):
         add(stage + "_profile_kernel_time_ms", "5,11", [r.get("stage_kernel_time_ms", {}).get(stage) for r in traces],
             "correlated kernel sum, exclusive deepest worker stage range; not wall latency",
             "installed model lacks stage annotation or CUDA Graph replay bypasses Python hooks", "kernel_statistics.csv")
@@ -464,7 +464,7 @@ def collect_run(run_dir, small_kernel_us=10):
                "long_document_threshold_pages": None, "long_document_rate": None,
                "long_document_unavailable_reason": "document page groups and a declared long-document threshold are required",
                "quality": quality, "server_processor": processor_status, "profile_summary": traces,
-               "profile_stage_latency_ms": {stage: stats([r.get(stage + "_time_ms") for r in profiles]) for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")},
+               "profile_stage_latency_ms": {stage: stats([r.get(stage + "_time_ms") for r in profiles]) for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft")},
                "profile_model_only_generated_tokens_per_second": stats([r.get("model_only_generated_tokens_per_second") for r in profiles]),
                "profile_gpu_ttft_ms": stats([r.get("gpu_ttft_ms") for r in profiles]),
                "profile_throughput_scope": "representative CUDA Event spans with profiler; never mixed into ordinary steady throughput",
@@ -529,7 +529,7 @@ def collect_run(run_dir, small_kernel_us=10):
     latency_rows = []
     for field in [s + "_time_ms" for s in STAGES] + ["region_crop_time_ms", "end_to_end_latency_ms", "request_latency_ms", "ttft_ms", "ttft_e2e_ms", "host_tpot_after_first_ms", "time_per_generated_token_ms", "processor_audit_time_ms", "file_io_cpu_time_ms", "image_decode_cpu_time_ms", "preprocessing_cpu_time_ms", "postprocessing_cpu_time_ms"]:
         latency_rows.append({"metric": field, "phase": "steady", "scope": "separate_processor_audit" if field == "processor_audit_time_ms" else "request_observation", **stats([r.get(field) for r in records])})
-    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "tokenizer_decode"):
+    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft", "tokenizer_decode"):
         per_sample_work = []
         for profile in profiles:
             values = [t.get("stage_kernel_time_ms", {}).get(stage) for t in profile.get("trace_analysis", [])]
@@ -538,13 +538,13 @@ def collect_run(run_dir, small_kernel_us=10):
         latency_rows.append({"metric": stage + "_kernel_work_ms", "phase": "profile",
                              "scope": "sum correlated GPU kernel time per representative; NOT wall latency",
                              **stats(per_sample_work)})
-    for field in [stage + "_time_ms" for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")] + ["gpu_ttft_ms", "tpot_ms", "runner_prefill_step_time_ms", "runner_decode_step_time_ms"]:
+    for field in [stage + "_time_ms" for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft")] + ["gpu_ttft_ms", "tpot_ms", "runner_prefill_step_time_ms", "runner_decode_step_time_ms"]:
         latency_rows.append({"metric": field, "phase": "profile", "scope": "representative current-stream CUDA Events; step fields inclusive, model stages exclusive",
                              **stats([r.get(field) for r in profiles])})
-    for field in [stage + "_host_call_span_ms" for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling")]:
+    for field in [stage + "_host_call_span_ms" for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft")]:
         latency_rows.append({"metric": field, "phase": "profile", "scope": "representative worker host call span; includes CPU/runtime waits; not additive under overlap",
                              **stats([r.get(field) for r in profiles])})
-    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling"):
+    for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft"):
         level_values = {
             "cuda_event": [r.get(stage + "_time_ms") for r in profiles],
             "host_call_span": [r.get(stage + "_host_call_span_ms") for r in profiles],
@@ -591,7 +591,7 @@ def collect_run(run_dir, small_kernel_us=10):
                   ("difficulty", "difficulty", lambda v: json.dumps(v, ensure_ascii=False, sort_keys=True) if v is not None else "unknown")]
     profile_observations = [r for r in profiles if r.get("end_to_end_latency_ms") is not None]
     for profile in profile_observations:
-        for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling"):
+        for stage in ("vision_encoder", "projector", "prefill", "decode", "sampling", "draft"):
             observed = [t.get("stage_kernel_time_ms", {}).get(stage) for t in profile.get("trace_analysis", [])]
             observed = [v for v in observed if v is not None]
             profile[stage + "_kernel_work_ms"] = sum(observed) if observed else None

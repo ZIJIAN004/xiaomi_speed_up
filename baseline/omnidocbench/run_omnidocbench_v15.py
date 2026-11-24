@@ -57,6 +57,10 @@ def main(argv=None):
     config = dict(benchmark_version='1.5',inference_mode='e2e',evaluator=provenance,
         model=str(args.model.resolve()),gpu_physical=args.gpu,workers=8,backend='offline',
         request_unit='page',score_unit='page',layout_model=None)
+    if (args.model/'config.json').is_file():
+        from baseline.harness.model_profiles import PROFILES, model_type, profile_for
+        if model_type(args.model) in PROFILES:
+            config['model_profile'] = profile_for(args.model)['name']
     dump_json(root/'config.json',config)
     os.environ.update(CUDA_VISIBLE_DEVICES=args.gpu,VLLM_WORKER_MULTIPROC_METHOD='spawn',
                       VLLM_BENCHMARK_PROCESSOR_DIR=str(root/'processor_raw'))
@@ -132,7 +136,7 @@ def main(argv=None):
         acceptance='inference/acceptance_report.json')
     dump_json(root/'summary.json',summary)
     (root/'bottleneck_report.md').write_text(
-        '# OmniDocBench v1.5 端到端评测\n\n完整页面直接进入 Xiaomi-OCR-0，不使用版面检测。\n\n'
+        '# OmniDocBench v1.5 端到端评测\n\n完整页面直接进入 '+config.get('model_profile',str(args.model))+'，不使用版面检测。\n\n'
         '质量状态：'+quality['status']+'\n\n'
         '请求、Processor、GPU、监控及profiler证据见 [推理报告](inference/bottleneck_report.md)。\n'
         '稳态吞吐排除预热、重试和profile；整条流水线与评分耗时分别记录。\n'

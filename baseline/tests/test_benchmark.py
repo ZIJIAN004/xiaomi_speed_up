@@ -1141,5 +1141,86 @@ class RunnerStepClassificationTest(unittest.TestCase):
         self.assertEqual(classify_runner_step(runner, unknown)[0], "mixed_or_unknown_step")
 
 
+def fake_checkpoint(root, model_type, **preprocessor):
+    root.mkdir(parents=True, exist_ok=True)
+    dump_json(root / "config.json", {"model_type": model_type, "downsample_mode": "4x"} if model_type == "minicpm_ocr"
+              else {"model_type": model_type})
+    dump_json(root / "preprocessor_config.json", preprocessor)
+    return root
+
+
+class ModelProfileTests(unittest.TestCase):
+    def test_routing_preprocessing_and_speculative_permission(self):
+        from baseline.harness.model_profiles import check_speculative_config, preprocessor_settings, profile_for
+        with tempfile.TemporaryDirectory() as directory:
+            minicpm = fake_checkpoint(Path(directory) / "minicpm", "minicpm_ocr", downsample_mode="4x", max_slice_nums=9,
+                                      scale_resolution=448, unrelated=1)
+            xiaomi = fake_checkpoint(Path(directory) / "xiaomi", "qwen3_5", patch_size=16, merge_size=2)
+            profile = profile_for(minicpm)
+            self.assertEqual(profile["name"], "MiniCPM-OCR-1.0")
+            self.assertTrue(profile["python"].endswith("envs/minicpm_ocr/bin/python"))
+            self.assertEqual(preprocessor_settings(minicpm, profile),
+                             {"downsample_mode": "4x", "max_slice_nums": 9, "scale_resolution": 448})
+            self.assertTrue(profile_for(xiaomi)["python"].endswith("envs/speed_up/bin/python"))
+            check_speculative_config(profile, {"method": "dspark", "model": "d"})
+            with self.assertRaisesRegex(ValueError, "not enabled"):
+                check_speculative_config(profile_for(xiaomi), {"method": "dspark"})
+            with self.assertRaisesRegex(ValueError, "no benchmark profile"):
+                profile_for(fake_checkpoint(Path(directory) / "other", "llama"))
+
+    def test_parse_args_names_model_and_rejects_unsupported_speculation(self):
+        from baseline.harness.run_benchmark import parse_args
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            minicpm = fake_checkpoint(root / "minicpm", "minicpm_ocr")
+            xiaomi = fake_checkpoint(root / "xiaomi", "qwen3_5")
+            base = ["--backend", "offline", "--gpu", "1", "--manifest", str(root / "m.jsonl")]
+            args = parse_args(base + ["--output", str(root / "a"), "--model", str(minicpm),
+                                      "--speculative-config", '{"method": "dspark", "model": "d"}'])
+            self.assertEqual(args.served_model_name, "MiniCPM-OCR-1.0")
+            self.assertEqual(parse_args(base + ["--output", str(root / "b"), "--model", str(xiaomi)]).served_model_name,
+                             "Xiaomi-OCR-0")
+            with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+                parse_args(base + ["--output", str(root / "c"), "--model", str(xiaomi),
+                                   "--speculative-config", '{"method": "dspark"}'])
+
+    def test_minicpm_modules_and_dspark_draft_ranges_install_and_restore(self):
+        import sys
+        seen = []
+        class Range:
+            def __init__(self, name):
+                self.name = name
+            def __enter__(self):
+                seen.append(self.name)
+            def __exit__(self, *args):
+                pass
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = fake_checkpoint(Path(directory) / "minicpm", "minicpm_ocr")
+            merger = SimpleNamespace(forward=lambda: None)
+            vit_merger = SimpleNamespace(forward=lambda: None)
+            vpm = SimpleNamespace(forward=lambda: None)
+            model = SimpleNamespace(forward=lambda: (vpm.forward(), merger.forward()))
+            model.named_modules = lambda: [("", model), ("vpm", vpm), ("vit_merger", vit_merger), ("merger", merger)]
+            speculator = SimpleNamespace(propose=lambda: "draft")
+            runner = SimpleNamespace(model=model, sampler=None, requests={}, speculator=speculator,
+                                     model_config=SimpleNamespace(model=str(checkpoint)))
+            original_propose = speculator.propose
+            worker = BenchmarkWorkerExtension()
+            worker.model_runner = runner
+            fake_torch = SimpleNamespace(profiler=SimpleNamespace(record_function=Range))
+            with patch.dict(sys.modules, {"torch": fake_torch}):
+                result = worker.benchmark_profile_ranges("true")
+                model.forward()
+                self.assertEqual(speculator.propose(), "draft")
+                worker.benchmark_profile_ranges("false")
+        self.assertEqual(result["model_profile"], "MiniCPM-OCR-1.0")
+        self.assertEqual(result["installed"]["vision_encoder"]["module_path"], "vpm")
+        self.assertEqual(result["installed"]["projector"]["module_path"], "merger")
+        self.assertIn("draft", result["installed"])
+        for stage in ("vision_encoder", "projector", "draft"):
+            self.assertIn("benchmark::" + stage, seen)
+        self.assertIs(speculator.propose, original_propose)
+
+
 if __name__ == "__main__":
     unittest.main()

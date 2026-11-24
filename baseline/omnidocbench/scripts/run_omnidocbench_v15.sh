@@ -15,6 +15,15 @@ GPU_ID="${GPU_ID:-1}"
 [[ -d "$OMNIDOC_ROOT/images" && -f "$OMNIDOC_ROOT/OmniDocBench.json" ]] || { echo "Missing images/ or OmniDocBench.json under $OMNIDOC_ROOT" >&2; exit 2; }
 [[ -f "$OMNIDOC_EVALUATOR_ROOT/pdf_validation.py" ]] || { echo "Missing v1_5 evaluator: $OMNIDOC_EVALUATOR_ROOT/pdf_validation.py (the dataset does not include evaluator code)." >&2; exit 2; }
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || { echo 'GPU_ID must be one physical GPU index.' >&2; exit 2; }
+# Route by the checkpoint's model_type (baseline/harness/model_profiles.py): each model runs in its own env.
+# MODEL_PYTHON overrides everything; SPEED_UP_PYTHON keeps applying to the Xiaomi (qwen3_5) env only.
+MODEL_TYPE=$(python3 -m baseline.harness.model_profiles "$MODEL_PATH" model_type 2>/dev/null || true)
+INFER_PYTHON="${MODEL_PYTHON:-}"
+if [[ -z "$INFER_PYTHON" && ( -z "$MODEL_TYPE" || "$MODEL_TYPE" == qwen3_5 ) && "$SPEED_UP_PYTHON" != python ]]; then
+  INFER_PYTHON="$SPEED_UP_PYTHON"
+fi
+[[ -n "$INFER_PYTHON" ]] || INFER_PYTHON=$(python3 -m baseline.harness.model_profiles "$MODEL_PATH" python 2>/dev/null || echo python)
+echo "model_type=${MODEL_TYPE:-unknown} -> inference python: $INFER_PYTHON"
 RESULT_ROOT="${RESULT_ROOT:-$ROOT_DIR/runs/omnidocbench_v15_$(date +%Y%m%d_%H%M%S)}"
 [[ ! -e "$RESULT_ROOT" && ! -e "${RESULT_ROOT}.log" ]] || { echo 'Result path already exists; refusing reuse.' >&2; exit 2; }
 export GPU_ID CUDA_VISIBLE_DEVICES="$GPU_ID" TOKENIZERS_PARALLELISM=false
@@ -35,5 +44,5 @@ ARGS=(--dataset "$OMNIDOC_ROOT" --model "$MODEL_PATH" --output "$RESULT_ROOT" --
 [[ -z "${DCGM_URL:-}" ]] || ARGS+=(--dcgm-url "$DCGM_URL")
 [[ -z "${SPECULATIVE_CONFIG:-}" ]] || ARGS+=(--speculative-config "$SPECULATIVE_CONFIG")
 [[ -z "${SERVED_MODEL_NAME:-}" ]] || ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
-echo 'OmniDocBench 1.5: offline whole pages(workers=8; no PaddleX) -> page evaluation'
-"$SPEED_UP_PYTHON" -m baseline.omnidocbench.run_omnidocbench_v15 "${ARGS[@]}" 2>&1 | tee "${RESULT_ROOT}.log"
+echo "OmniDocBench 1.5: offline whole pages(workers=8; no PaddleX) -> page evaluation [${MODEL_TYPE:-unknown}]"
+"$INFER_PYTHON" -m baseline.omnidocbench.run_omnidocbench_v15 "${ARGS[@]}" 2>&1 | tee "${RESULT_ROOT}.log"
