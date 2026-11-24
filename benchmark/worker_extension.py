@@ -14,6 +14,43 @@ import time
 from contextlib import contextmanager
 
 
+def _cached_prefill_len(runner, rid):
+    """Prompt/prefill length of a request the runner already holds (V1 or V2 model runner)."""
+    request = getattr(runner, "requests", {}).get(rid)  # V1: dict[str, CachedRequestState]
+    if request is not None:
+        length = getattr(request, "num_prompt_tokens", None)
+        if length is None and getattr(request, "prompt_token_ids", None) is not None:
+            length = len(request.prompt_token_ids)
+        return length
+    states = getattr(runner, "req_states", None)  # V2: RequestState indexed by req_id_to_index
+    index = getattr(states, "req_id_to_index", {}).get(rid)
+    if index is None:
+        return None
+    # V2 finishes prefill when num_computed_tokens >= prefill_len (>= prompt_len after resumption).
+    return int(states.prefill_len.np[index])
+
+
+def classify_runner_step(runner, scheduler_output):
+    """Label one engine step as prefill/decode from scheduler computed positions, not token counts."""
+    states = {}
+    for request in getattr(scheduler_output, "scheduled_new_reqs", []):
+        ids = getattr(request, "prefill_token_ids", None) or getattr(request, "prompt_token_ids", None)
+        computed = getattr(request, "num_computed_tokens", None)
+        if ids is not None and computed is not None:
+            states[request.req_id] = (len(ids), computed)
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached is not None:
+        for rid, computed in zip(getattr(cached, "req_ids", []), getattr(cached, "num_computed_tokens", [])):
+            length = _cached_prefill_len(runner, rid)
+            if length is not None:
+                states[rid] = (length, computed)
+    scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
+    kinds = {("prefill" if states[rid][1] < states[rid][0] else "decode") if rid in states else "unknown"
+             for rid in scheduled}
+    label = kinds.pop() if len(kinds) == 1 and "unknown" not in kinds else "mixed_or_unknown_step"
+    return label, states, scheduled
+
+
 class BenchmarkWorkerExtension:
     @contextmanager
     def _benchmark_range(self, stage, annotation=None):
@@ -431,34 +468,7 @@ class BenchmarkWorkerExtension:
             execute_original = runner.execute_model
             @functools.wraps(execute_original)
             def execute(scheduler_output, *args, **kwargs):
-                # Classify V1 from explicit scheduler prompt lengths/computed positions,
-                # not from the unreliable assumption that one scheduled token means decode.
-                kinds = []
-                states = {}
-                for request in getattr(scheduler_output, "scheduled_new_reqs", []):
-                    ids = getattr(request, "prompt_token_ids", None)
-                    computed = getattr(request, "num_computed_tokens", None)
-                    if ids is not None and computed is not None:
-                        states[request.req_id] = (len(ids), computed)
-                cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-                if cached is not None:
-                    requests = getattr(runner, "requests", {})
-                    for rid, computed in zip(getattr(cached, "req_ids", []), getattr(cached, "num_computed_tokens", [])):
-                        request = requests.get(rid)
-                        prompt_len = getattr(request, "num_prompt_tokens", None)
-                        if prompt_len is None:
-                            ids = getattr(request, "prompt_token_ids", None)
-                            prompt_len = len(ids) if ids is not None else None
-                        if prompt_len is not None:
-                            states[rid] = (prompt_len, computed)
-                scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
-                for rid in scheduled:
-                    if rid in states:
-                        prompt_len, computed = states[rid]
-                        kinds.append("prefill" if computed < prompt_len else "decode")
-                    else:
-                        kinds.append("unknown")
-                label = kinds[0] if kinds and len(set(kinds)) == 1 and kinds[0] != "unknown" else "mixed_or_unknown_step"
+                label, states, scheduled = classify_runner_step(runner, scheduler_output)
                 previous_phase = getattr(self, "_benchmark_current_phase", None)
                 self._benchmark_current_phase = label
                 self._benchmark_step_finishes_prompt = label == "prefill" and bool(scheduled) and all(

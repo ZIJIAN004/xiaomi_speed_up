@@ -15,7 +15,7 @@ IDSPACE_OUTPUT="${IDSPACE_OUTPUT:-$RUN_ROOT/idspace_validation}"
 OMNIDOC_ROOT="${OMNIDOC_ROOT:-$PROJECT_ROOT/benchmark/data}"
 OMNIDOC_EVALUATOR_ROOT="${OMNIDOC_EVALUATOR_ROOT:-$PROJECT_ROOT/evaluation_pipeline/OmniDocBench}"
 IDSPACE_JSONL="${IDSPACE_JSONL:-/home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl}"
-IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/Lora/runs/idspace_e3/prepared/images}"
+IDSPACE_IMAGE_ROOT="${IDSPACE_IMAGE_ROOT:-/home/mr_jiang/Lora/runs/idspace_e3/prepared}"  # JSONL image paths already start with images/
 LOG_ROOT="$RUN_ROOT/logs"
 mkdir -p "$LOG_ROOT"
 

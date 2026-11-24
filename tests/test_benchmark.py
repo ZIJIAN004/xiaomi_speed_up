@@ -18,7 +18,7 @@ from benchmark.quality import evaluate_baseline, field_quality, edit_distance
 from benchmark.run_benchmark import (consume_sse, main as benchmark_main, profile_samples, reconcile_worker_records, request_one,
                                      select_representatives, system_tokens_from_chatml, validate_manifest)
 from benchmark.trace_analysis import analyze_events, collect_traces
-from benchmark.worker_extension import BenchmarkWorkerExtension
+from benchmark.worker_extension import BenchmarkWorkerExtension, classify_runner_step
 
 
 def sse(*events):
@@ -1064,6 +1064,41 @@ class CollectorIntegrationTests(unittest.TestCase):
                 inventory = list(csv.DictReader(stream))
             self.assertEqual(len(inventory), len({r["metric"] for r in inventory}))
             self.assertTrue(all(r["status"] == "unavailable" for r in inventory if r["metric"] in ("formula_cdm", "table_teds", "text_edit")))
+
+
+class RunnerStepClassificationTest(unittest.TestCase):
+    @staticmethod
+    def step(new=(), cached=(), scheduled=None):
+        cached = list(cached)
+        return SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=r, prompt_token_ids=[0] * n, num_computed_tokens=c) for r, n, c in new],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[r for r, _ in cached], num_computed_tokens=[c for _, c in cached]),
+            num_scheduled_tokens=scheduled or {})
+
+    @staticmethod
+    def v2_runner(prefill_lens):
+        import numpy as np
+        return SimpleNamespace(req_states=SimpleNamespace(
+            req_id_to_index={rid: i for i, rid in enumerate(prefill_lens)},
+            prefill_len=SimpleNamespace(np=np.array(list(prefill_lens.values()), dtype=np.int32))))
+
+    def test_v2_model_runner_decode_is_labeled_decode(self):
+        # Regression: V2 runner has no `requests` dict; decode steps were all mixed_or_unknown_step.
+        runner = self.v2_runner({"a": 3000})
+        self.assertEqual(classify_runner_step(runner, self.step(cached=[("a", 3005)], scheduled={"a": 1}))[0], "decode")
+        self.assertEqual(classify_runner_step(runner, self.step(cached=[("a", 2048)], scheduled={"a": 952}))[0], "prefill")
+
+    def test_v1_model_runner_and_new_requests(self):
+        runner = SimpleNamespace(requests={"a": SimpleNamespace(num_prompt_tokens=100, prompt_token_ids=None)})
+        self.assertEqual(classify_runner_step(runner, self.step(cached=[("a", 120)], scheduled={"a": 1}))[0], "decode")
+        self.assertEqual(classify_runner_step(runner, self.step(new=[("b", 50, 0)], scheduled={"b": 50}))[0], "prefill")
+
+    def test_mixed_and_unknown_steps(self):
+        runner = self.v2_runner({"a": 100})
+        mixed = self.step(new=[("b", 50, 0)], cached=[("a", 120)], scheduled={"a": 1, "b": 50})
+        self.assertEqual(classify_runner_step(runner, mixed)[0], "mixed_or_unknown_step")
+        unknown = self.step(cached=[("zz", 120)], scheduled={"zz": 1})
+        self.assertEqual(classify_runner_step(runner, unknown)[0], "mixed_or_unknown_step")
 
 
 if __name__ == "__main__":

@@ -93,8 +93,8 @@ def main() -> int:
                         default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl"),
                         help="Input JSONL (default: /home/mr_jiang/Lora/runs/idspace_e3/prepared/validation.jsonl)")
     parser.add_argument("--image-root", type=Path,
-                        default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared/images"),
-                        help="Root directory for image paths from JSONL")
+                        default=Path("/home/mr_jiang/Lora/runs/idspace_e3/prepared"),
+                        help="Root that JSONL image paths (images/...) are relative to")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpu", default="0")
