@@ -40,7 +40,12 @@ pip_install "transformers>=5.22.0,<5.23.0"
 # Benchmark harness / tooling extras not pulled in by vLLM.
 pip_install psutil pyyaml modelscope
 # speculators: DSpark draft model + loss only; its transformers<=5.19 pin conflicts with MiniCPM.
-pip_install --no-deps "git+https://github.com/vllm-project/speculators.git@$SPECULATORS_COMMIT"
+# Tarball instead of `git+https`: git clones through the host proxy get cut mid-transfer.
+if "$PY" -m pip show speculators >/dev/null 2>&1; then
+  log "speculators already installed"
+else
+  pip_install --no-deps "https://codeload.github.com/vllm-project/speculators/tar.gz/$SPECULATORS_COMMIT"
+fi
 # Its remaining runtime requirements (from the package METADATA), installed with torch/transformers
 # pinned to the versions above so nothing gets downgraded.
 CONSTRAINTS="$LOG_DIR/pins.txt"
