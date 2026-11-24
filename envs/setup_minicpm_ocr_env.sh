@@ -41,12 +41,20 @@ pip_install "transformers>=5.22.0,<5.23.0"
 pip_install psutil pyyaml modelscope
 # speculators: DSpark draft model + loss only; its transformers<=5.19 pin conflicts with MiniCPM.
 pip_install --no-deps "git+https://github.com/vllm-project/speculators.git@$SPECULATORS_COMMIT"
-pip_install pydantic pydantic-settings loguru rich typer click safetensors
+# Its remaining runtime requirements (from the package METADATA), installed with torch/transformers
+# pinned to the versions above so nothing gets downgraded.
+CONSTRAINTS="$LOG_DIR/pins.txt"
+"$PY" -c "import torch, transformers; print(f'torch=={torch.__version__.split(\"+\")[0]}\ntransformers=={transformers.__version__}')" >"$CONSTRAINTS"
+pip_install -c "$CONSTRAINTS" aiohttp click "datasets>=4.0.0,<=5.1.0" httpx huggingface-hub "loguru>=0.7.2,<=0.7.3" \
+  "numpy>=2.0.0,<=2.5.4" "openai>=2.0.0" protobuf psutil "pydantic>=2.0.0" "pydantic-settings>=2.0.0" rich safetensors \
+  "tqdm>=4.66.3,<=4.70.1" "typer>=0.12.0" "hs-connectors>0.8.0,<=0.10.0a93"
 # Qwen3.5-style linear-attention kernels for HF forward during draft training (fla is Triton-only).
 pip_install "flash-linear-attention"
 # causal-conv1d compiles CUDA code when no matching wheel exists and there is no system nvcc here;
 # it only speeds up HF training forward, so a failure is logged and does not stop the setup.
-if ! pip_install causal-conv1d; then
+if "$PY" -c "import causal_conv1d" 2>/dev/null; then
+  log "causal-conv1d already installed"
+elif ! pip_install causal-conv1d; then
   log "WARNING: causal-conv1d not installed (see pip.log); HF training forward falls back to torch conv"
 fi
 
