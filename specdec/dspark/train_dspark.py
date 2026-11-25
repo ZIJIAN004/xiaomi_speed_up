@@ -33,6 +33,7 @@ from minicpm_dspark import (  # noqa: E402
     TargetFeatureExtractor, accumulate_metrics, apply_draft_vocab, attach_verifier, configure_trainable,
     draft_inputs, load_official_draft, precast_frozen, reduce_metrics, save_official,
 )
+from tracker import Tracker, add_tracker_args  # noqa: E402
 
 # speculators examples/train/dspark_qwen3_0_6b_sharegpt_online.sh
 DEFAULT_LOSS_FN = '{"ce": 0.1, "tv": 0.9}'
@@ -99,9 +100,7 @@ def parse_args(argv=None):
                         "three CUDA syncs per sample, so keep it off for real training")
     p.add_argument("--no-compile", action="store_true", help="disable torch.compile (debugging; slow)")
     p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--wandb-project", default="minicpm-ocr-dspark")
-    p.add_argument("--wandb-run-name", default=None)
-    p.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="disabled")
+    add_tracker_args(p)
     args = p.parse_args(argv)
     if args.epochs < 1 or args.grad_accum < 1 or args.max_anchors < 1 or args.grad_clip <= 0:
         p.error("epochs, grad-accum, max-anchors must be >= 1 and grad-clip > 0")
@@ -332,17 +331,7 @@ def main(argv=None):
         best, history = state["best"], state["history"]
         print(f"resumed {args.resume}: next epoch {start_epoch}, opt_step {opt_step}", flush=True)
 
-    wandb = None
-    if args.wandb_mode != "disabled":
-        import wandb as _wandb
-        wandb = _wandb
-        # Files go to <output-dir>/wandb; the run id is kept so --resume continues the same run.
-        id_path = args.output_dir / "wandb_run_id.txt"
-        run_id = id_path.read_text().strip() if id_path.is_file() else wandb.util.generate_id()
-        id_path.write_text(run_id + "\n")
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name or args.output_dir.name,
-                   mode=args.wandb_mode, dir=str(args.output_dir), id=run_id, resume="allow",
-                   config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
+    tracker = Tracker(args, {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
 
     select = f"val/{args.select_metric}"
     if best is None and val_loader is not None:
@@ -352,8 +341,7 @@ def main(argv=None):
         print_metrics("epoch=-1 (init draft)", initial)
         best = {select: initial[select], "val/loss": initial["val/loss"], "epoch": -1}
         history.append({"epoch": -1, **initial})
-        if wandb is not None:
-            wandb.log(initial, step=0)
+        tracker.log(initial, step=0, epoch=-1)
 
     def save_info(epoch, metrics):
         return {"init_draft": str(args.init_draft), "target_model": str(args.model),
@@ -411,8 +399,7 @@ def main(argv=None):
                         print(f"  ms/sample target={logged['perf/t_target_ms']:.0f} "
                               f"draft_fwd={logged['perf/t_draft_fwd_ms']:.0f} "
                               f"draft_bwd={logged['perf/t_draft_bwd_ms']:.0f}", flush=True)
-                    if wandb is not None:
-                        wandb.log(logged, step=global_step)
+                    tracker.log(logged, step=global_step)
                     window, timing = {}, {}
                 if args.max_steps and opt_step >= args.max_steps:
                     stop = True
@@ -425,8 +412,7 @@ def main(argv=None):
         if val_metrics:
             print_metrics(f"epoch={epoch} val", val_metrics)
         history.append({"epoch": epoch, **epoch_metrics, **val_metrics})
-        if wandb is not None:
-            wandb.log({**epoch_metrics, **val_metrics}, step=global_step)
+        tracker.log({**epoch_metrics, **val_metrics}, step=global_step, epoch=epoch)
 
         if is_improvement(val_metrics, best, select, args.require_loss_decrease):
             best = {select: val_metrics[select], "val/loss": val_metrics["val/loss"], "epoch": epoch}
@@ -453,8 +439,7 @@ def main(argv=None):
     if not (args.output_dir / "best").exists() and val_loader is not None:
         print(f"no epoch beat the init draft ({select} up" + (" and val/loss down" if args.require_loss_decrease
               else "") + f"); keep using {args.init_draft}", flush=True)
-    if wandb is not None:
-        wandb.finish()
+    tracker.finish()
 
 
 if __name__ == "__main__":

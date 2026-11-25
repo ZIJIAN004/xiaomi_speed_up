@@ -104,7 +104,8 @@ bash specdec/dspark/run_dspark.sh eval
 
 # 4. Train: all train rows, patched vocabulary (wrap in tmux; add --lm-head-init verifier
 #    if step 1 says so; TRAIN_SAMPLES=N for a random subset, DRAFT_VOCAB= for the official vocabulary)
-bash specdec/dspark/run_dspark.sh train --epochs 10 --wandb-mode offline
+#    Tracking: --tracker swanlab (SWANLAB_API_KEY set) | wandb | none (default); --tracker-mode offline
+bash specdec/dspark/run_dspark.sh train --epochs 10 --tracker swanlab
 
 # 5. Serve <run>/best with vLLM and measure acceptance and throughput with the benchmark harness.
 ```

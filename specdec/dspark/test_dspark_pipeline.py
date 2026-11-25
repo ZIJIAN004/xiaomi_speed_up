@@ -457,5 +457,36 @@ class MergeLoraTest(unittest.TestCase):
                 merge_lora.merge(args)
 
 
+class TrackerTest(unittest.TestCase):
+    def test_swanlab_run_id_kept_and_epoch_axis(self):
+        import os
+        from unittest import mock
+        from tracker import Tracker
+
+        calls = []
+        fake = SimpleNamespace(init=lambda **kw: calls.append(("init", kw)),
+                               define_metric=lambda key, **kw: calls.append(("define", key, kw)),
+                               log=lambda m, step: calls.append(("log", m, step)),
+                               finish=lambda: calls.append(("finish",)))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"swanlab": fake}):
+            args = SimpleNamespace(tracker="swanlab", tracker_project="p", tracker_run_name=None,
+                                   tracker_mode="online", output_dir=Path(tmp) / "run1")
+            args.output_dir.mkdir()
+            with mock.patch.dict(os.environ, {"SWANLAB_API_KEY": ""}), self.assertRaises(SystemExit):
+                Tracker(args, {})                                    # no key: fail, do not prompt
+            with mock.patch.dict(os.environ, {"SWANLAB_API_KEY": "k"}):
+                t = Tracker(args, {"lr": 1.0})
+                t.log({"val/eal": 2.0}, step=5, epoch=0)
+                t.finish()
+                first = calls[0][1]
+                self.assertEqual((first["name"], first["resume"], first["config"]), ("run1", "allow", {"lr": 1.0}))
+                self.assertIn(("define", "val/*", {"x_axis": "epoch"}), calls)
+                self.assertIn(("log", {"epoch": 0, "val/eal": 2.0}, 5), calls)
+                calls.clear()
+                Tracker(args, {})                                    # --resume: same run id
+                self.assertEqual(calls[0][1]["id"], first["id"])
+        self.assertIsNone(Tracker(SimpleNamespace(tracker="none"), {}).lib)
+
+
 if __name__ == "__main__":
     unittest.main()
