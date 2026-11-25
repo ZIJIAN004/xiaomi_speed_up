@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo  # not inside main(): a local import would make `torch` a local name there
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -260,7 +261,6 @@ def main(argv=None):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required (flex attention + fused Triton losses)")
     if args.no_compile:
-        import torch._dynamo
         torch._dynamo.config.disable = True
     device = torch.device("cuda:0")
     generator = set_seed(args.seed)
