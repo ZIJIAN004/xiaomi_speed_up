@@ -336,7 +336,12 @@ def main(argv=None):
     if args.wandb_mode != "disabled":
         import wandb as _wandb
         wandb = _wandb
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name, mode=args.wandb_mode,
+        # Files go to <output-dir>/wandb; the run id is kept so --resume continues the same run.
+        id_path = args.output_dir / "wandb_run_id.txt"
+        run_id = id_path.read_text().strip() if id_path.is_file() else wandb.util.generate_id()
+        id_path.write_text(run_id + "\n")
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name or args.output_dir.name,
+                   mode=args.wandb_mode, dir=str(args.output_dir), id=run_id, resume="allow",
                    config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
 
     select = f"val/{args.select_metric}"
