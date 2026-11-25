@@ -246,5 +246,40 @@ class OmniDocBenchPipelineTests(unittest.TestCase):
             self.assertEqual(summary['output_retention']['status'],'kept_all' if failure else 'pruned')
 
 
+class LatexTableCompatTests(unittest.TestCase):
+    """v1.5 GT tables carry only 'html'; a LaTeX-table prediction must not abort the evaluation."""
+
+    def test_missing_gt_latex_no_longer_raises_and_is_not_mutated(self):
+        import importlib
+        import sys
+        import types
+
+        def get_gt_pred_lines(gt_mix, pred_dataset_mix, line_type):  # upstream utils/match.py:54 behaviour
+            if line_type == 'latex_table':
+                return [str(item['latex']) for item in gt_mix], [item['html'] for item in gt_mix]
+            return [item['html'] for item in gt_mix], None
+
+        match = types.ModuleType('utils.match')
+        match.get_gt_pred_lines = get_gt_pred_lines
+        quick = types.ModuleType('utils.match_quick')
+        quick.get_gt_pred_lines = get_gt_pred_lines
+        utils = types.ModuleType('utils')
+        utils.match = match
+        fakes = {'utils': utils, 'utils.match': match, 'utils.match_quick': quick}
+        gt = [{'category_type': 'table', 'html': '<table></table>'}]
+        with patch.dict(sys.modules, fakes):
+            with self.assertRaises(KeyError):
+                match.get_gt_pred_lines(gt, [], 'latex_table')
+            sys.modules.pop('baseline.omnidocbench.latex_table_compat', None)
+            importlib.import_module('baseline.omnidocbench.latex_table_compat')
+            self.assertEqual(match.get_gt_pred_lines(gt, [], 'latex_table'), ([''], ['<table></table>']))
+            self.assertIs(quick.get_gt_pred_lines, match.get_gt_pred_lines)
+            self.assertNotIn('latex', gt[0])
+            kept = [{'html': 'h', 'latex': 'x'}]
+            self.assertEqual(match.get_gt_pred_lines(kept, [], 'latex_table')[0], ['x'])
+            self.assertEqual(match.get_gt_pred_lines(gt, [], 'html_table'), (['<table></table>'], None))
+            sys.modules.pop('baseline.omnidocbench.latex_table_compat', None)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -160,7 +160,7 @@ def main(argv=None):
     script = evaluator / "pdf_validation.py"
     command = [
         eval_python, "-c",
-        "import runpy, sys; import baseline.harness.skimage_compat; "
+        "import runpy, sys; import baseline.harness.skimage_compat; import baseline.omnidocbench.latex_table_compat; "
         "script, config = sys.argv[1:3]; "
         "sys.argv = [script, '--config', config]; "
         "runpy.run_path(script, run_name='__main__')",
