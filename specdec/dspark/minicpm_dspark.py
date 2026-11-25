@@ -11,6 +11,10 @@
   residual stream after k decoder layers, i.e. the output of ``layers[k-1]``
   (vLLM ``_maybe_add_hidden_state(aux, layer_idx + 1, hidden, residual)``).
   The pre-norm last hidden state comes from the final norm's input.
+* Optionally patches the draft vocabulary in place (``apply_draft_vocab``): same
+  size, some official draft ids re-pointed at other target tokens. Only d2t/t2d,
+  the draft ``lm_head`` rows and the ``markov_w2`` rows of those ids change, so
+  config.json and every tensor shape stay official.
 * Saves trained drafts in the official layout (same key set, dtypes and
   ``config.json``), which vLLM's ``qwen3_dspark.py`` loads with
   ``{"method": "dspark"}`` unchanged.
@@ -141,6 +145,7 @@ class OfficialDraft:
         self.key_shapes = key_shapes
         self.target_ids = target_ids      # [draft_vocab] target id of each draft id
         self.source_dir = source_dir
+        self.replaced_ids = torch.zeros(0, dtype=torch.long)  # draft ids re-pointed by a vocab patch
 
 
 def load_official_draft(draft_dir: str | Path, attn_impl: str = "simple_flex_attention") -> OfficialDraft:
@@ -175,6 +180,41 @@ def load_official_draft(draft_dir: str | Path, attn_impl: str = "simple_flex_att
         key_shapes={k: tuple(v.shape) for k, v in state.items()},
         target_ids=target_ids, source_dir=draft_dir,
     )
+
+
+VOCAB_PATCH_FORMAT = "minicpm_dspark_vocab_patch_v1"
+
+
+@torch.no_grad()
+def apply_draft_vocab(draft: OfficialDraft, patch_path: str | Path) -> dict[str, Any]:
+    """Re-point some draft ids at other target tokens (build_kie_draft_vocab.py output).
+
+    The patch records the official d2t it was built from; it must equal the loaded
+    one. For each replaced draft id the Markov row ``markov_w2[id]`` is zeroed (the
+    old row scored a different token). Its ``lm_head`` row is set from the target
+    head in ``attach_verifier``. Tensors indexed by target id (embedding,
+    ``markov_w1``) are untouched.
+    """
+    patch = torch.load(patch_path, map_location="cpu", weights_only=True)
+    if patch.get("format") != VOCAB_PATCH_FORMAT:
+        raise ValueError(f"{patch_path}: not a {VOCAB_PATCH_FORMAT} file")
+    model = draft.model
+    current = model.d2t.detach().long().cpu()
+    if not torch.equal(patch["base_d2t"].long(), current):
+        raise ValueError(f"{patch_path} was built from a different draft vocabulary than {draft.source_dir}")
+    d2t = patch["d2t"].long()
+    replaced = patch["replaced_draft_ids"].long()
+    if d2t.shape != current.shape:
+        raise ValueError(f"patched d2t {tuple(d2t.shape)} != draft vocab {tuple(current.shape)}")
+    changed = (d2t != current).nonzero().squeeze(-1)
+    if not torch.equal(changed, replaced.sort().values):
+        raise ValueError("patch replaced_draft_ids do not match the d2t entries it changes")
+    target_ids, t2d = vocab_maps(d2t, model.verifier_vocab_size)
+    model.load_vocab_mappings(t2d, d2t.to(model.d2t.dtype))
+    model.markov_head.markov_w2.weight[replaced] = 0
+    draft.target_ids = target_ids
+    draft.replaced_ids = replaced
+    return {"replaced": int(replaced.numel())}
 
 
 def _check_rotary(model, official: dict[str, Any]) -> None:
@@ -215,6 +255,8 @@ def attach_verifier(draft: OfficialDraft, target: nn.Module, lm_head_init: str =
     ``verifier_norm`` becomes a frozen copy of the target's own final norm, so the
     (1 + w) Qwen3.5 convention is reproduced exactly rather than re-implemented.
     ``lm_head_init="verifier"`` resets the draft head to the target head rows.
+    With ``"checkpoint"`` only rows re-pointed by a vocab patch take the target
+    head row of their new token (the official row belonged to another token).
     """
     model = draft.model
     text_model = find_text_model(target)
@@ -227,7 +269,11 @@ def attach_verifier(draft: OfficialDraft, target: nn.Module, lm_head_init: str =
     model.verifier_lm_head.weight.data = head.detach().index_select(0, index).to("cpu", torch.float32).clone()
     if lm_head_init == "verifier":
         model.lm_head.weight.data = model.verifier_lm_head.weight.data.clone()
-    elif lm_head_init != "checkpoint":
+    elif lm_head_init == "checkpoint":
+        if draft.replaced_ids.numel():
+            rows = model.verifier_lm_head.weight.data[draft.replaced_ids]
+            model.lm_head.weight.data[draft.replaced_ids] = rows.to(model.lm_head.weight.dtype)
+    else:
         raise ValueError(f"unknown lm_head_init {lm_head_init!r}")
     norm = copy.deepcopy(text_model.norm).to("cpu")
     for param in norm.parameters():

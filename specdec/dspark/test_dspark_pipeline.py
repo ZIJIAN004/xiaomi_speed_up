@@ -4,7 +4,8 @@ Run in the minicpm_ocr env:  python -m unittest specdec/dspark/test_dspark_pipel
 Covers: d2t/t2d decoding, official-layout load/save round trip, verifier
 attachment from a target, aux-feature hooks (= residual after k layers),
 the position guard, one DSpark forward/backward with frozen verifier tensors,
-and the shifted loss mask of the IDSpace dataset.
+the shifted loss mask of the IDSpace dataset, the KIE crop, the seeded training
+subset, the draft-vocabulary patch and the LoRA merge.
 """
 from __future__ import annotations
 
@@ -258,11 +259,15 @@ class FakeProcessor:
     def __init__(self):
         self.tokenizer = FakeTokenizer()
 
+        self.calls = []
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, enable_thinking=False):
         user = " ".join("<image>" if part["type"] == "image" else part["text"] for part in messages[0]["content"])
-        return f"<|im_start|> user {user} <|im_end|> <|im_start|> assistant {messages[1]['content']} <|im_end|>"
+        answer = " ".join(part["text"] for part in messages[1]["content"])
+        return f"<|im_start|> user {user} <|im_end|> <|im_start|> assistant {answer} <|im_end|>"
 
-    def __call__(self, text, images, return_tensors, padding, truncation, add_special_tokens):
+    def __call__(self, text, images, return_tensors, **kwargs):
+        self.calls.append({"size": images[0].size, **kwargs})
         ids = self.tokenizer(text[0]).input_ids
         return {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)}
 
@@ -279,7 +284,8 @@ class DatasetMaskTest(unittest.TestCase):
             target = {"name": "A B"}
             (root / "train.jsonl").write_text(json.dumps({"image": "images/a.png", "target": target}) + "\n")
             processor = FakeProcessor()
-            sample = IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="read card")[0]
+            sample = IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="read card",
+                                           max_slice_nums=None)[0]
         ids = sample["inputs"]["input_ids"][0].tolist()
         answer = processor.tokenizer(serialize_target(target)).input_ids
         start = ids.index(answer[0])
@@ -291,6 +297,152 @@ class DatasetMaskTest(unittest.TestCase):
         # loss_mask[i] == assistant_mask[i + 1]: position i's target distribution predicts token i+1.
         self.assertTrue(torch.equal(loss_mask[:-1], assistant[1:]))
         self.assertFalse(bool(loss_mask[-1]))
+        self.assertEqual(processor.calls[-1]["size"], (2048, 683))   # legacy serving resize
+        self.assertNotIn("max_slice_nums", processor.calls[-1])
+
+    def test_kie_crop_budget_and_slices(self):
+        from PIL import Image
+        from idspace_minicpm_dataset import IDSpaceMiniCPMDataset
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "images").mkdir()
+            Image.new("RGB", (4000, 3000)).save(root / "images" / "a.png")
+            (root / "train.jsonl").write_text(json.dumps({"index": 7, "image": "images/a.png",
+                                                          "target": {"name": "A"}}) + "\n")
+            processor = FakeProcessor()
+            regions = {7: [1000, 1000, 3000, 2000]}          # 2000 x 1000 crop -> scaled to the budget
+            IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="p", regions=regions)[0]
+            call = processor.calls[-1]
+            self.assertEqual(call["max_slice_nums"], 1)
+            ratio = (262144 / (2000 * 1000)) ** 0.5
+            self.assertEqual(call["size"], (int(2000 * ratio), int(1000 * ratio)))
+            with self.assertRaises(KeyError):
+                IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="p", regions={8: [0, 0, 1, 1]})
+
+
+class KieTaskTest(unittest.TestCase):
+    def test_region_union_margin_and_clip(self):
+        from kie_task import region_from_layout
+        layout = {"image_width": 1000, "image_height": 800,
+                  "blocks": [{"bbox": [100, 200, 300, 400]}, {"bbox": [250, 150, 990, 300]}]}
+        # union [100,150,990,400]; margins int(890*.03)=26, int(250*.03)=7; x2 clipped to 1000
+        self.assertEqual(region_from_layout(layout), [74, 143, 1000, 407])
+        small = {"image_width": 50, "image_height": 50, "blocks": [{"bbox": [10, 10, 20, 20]}]}
+        self.assertEqual(region_from_layout(small), [8, 8, 22, 22])    # margin at least 2 px
+        empty = {"image_width": 640, "image_height": 480, "blocks": []}
+        self.assertEqual(region_from_layout(empty), [0, 0, 640, 480])
+
+    def test_prompt_lists_the_sixteen_fields_in_order(self):
+        from kie_task import FIELDS, KIE_PROMPT
+        schema = json.loads(KIE_PROMPT.split("\n")[1])
+        self.assertEqual(tuple(schema), FIELDS)
+        self.assertEqual(len(FIELDS), 16)
+
+
+class TrainSubsetTest(unittest.TestCase):
+    def test_seeded_subset_is_recorded_and_stable(self):
+        from train_dspark import resolve_split
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(val_jsonl=Path("val.jsonl"), val_fraction=0.05, seed=42, train_samples=10,
+                                   max_samples=0, train_jsonl=Path("train.jsonl"), task="kie",
+                                   layout_jsonl=Path("layout.jsonl"), output_dir=Path(tmp))
+            train_idx, val_idx = resolve_split(100, args)
+            self.assertEqual(len(train_idx), 10)
+            self.assertEqual(val_idx, [])
+            self.assertEqual(train_idx, sorted(set(train_idx)))
+            self.assertNotEqual(train_idx, list(range(10)))          # random, not the first rows
+            self.assertEqual(resolve_split(100, args)[0], train_idx)  # restart: same rows
+            args.seed = 7
+            with self.assertRaises(ValueError):                       # same dir, different split
+                resolve_split(100, args)
+
+
+class DraftVocabPatchTest(unittest.TestCase):
+    def test_patch_repoints_tail_ids_and_survives_save(self):
+        from collections import Counter
+        from safetensors.torch import load_file
+        from build_kie_draft_vocab import plan_patch
+
+        torch.manual_seed(3)
+        target = FakeTarget().eval()
+        with tempfile.TemporaryDirectory() as tmp:
+            official = make_official_dir(Path(tmp))
+            draft = md.load_official_draft(official, attn_impl="eager")
+            ids = draft.target_ids.clone()
+            outside = sorted(set(range(V - 1)) - set(ids.tolist()))
+            # answers use two tokens missing from the draft vocab and the last official token
+            counts = Counter({outside[0]: 5, outside[1]: 9, int(ids[-1]): 3})
+            new_ids, freed, added = plan_patch(ids, counts, set(counts))
+            self.assertEqual(added, [outside[1], outside[0]])            # most frequent first
+            self.assertEqual(freed, [D_VOCAB - 2, D_VOCAB - 3])          # tail, skipping the protected last id
+            d2t = new_ids - torch.arange(D_VOCAB)
+            patch = {"format": md.VOCAB_PATCH_FORMAT, "base_d2t": draft.model.d2t.clone(), "d2t": d2t,
+                     "replaced_draft_ids": torch.tensor(freed), "added_target_ids": torch.tensor(added),
+                     "removed_target_ids": ids[freed]}
+            torch.save(patch, Path(tmp) / "vocab.pt")
+            markov_before = draft.model.markov_head.markov_w2.weight.detach().clone()
+            md.apply_draft_vocab(draft, Path(tmp) / "vocab.pt")
+            self.assertTrue(torch.equal(draft.target_ids, new_ids))
+            self.assertTrue(bool(draft.model.t2d[outside[0]]) and bool(draft.model.t2d[outside[1]]))
+            w2 = draft.model.markov_head.markov_w2.weight
+            self.assertTrue(bool((w2[freed] == 0).all()))
+            keep = [i for i in range(D_VOCAB) if i not in freed]
+            self.assertTrue(torch.equal(w2[keep], markov_before[keep]))
+
+            lm_before = draft.model.lm_head.weight.detach().clone()
+            md.attach_verifier(draft, target, "checkpoint")
+            head = target.lm_head.weight.detach()
+            self.assertTrue(torch.equal(draft.model.verifier_lm_head.weight, head[new_ids]))
+            self.assertTrue(torch.equal(draft.model.lm_head.weight[freed], head[new_ids[freed]]))
+            self.assertTrue(torch.equal(draft.model.lm_head.weight[keep], lm_before[keep]))
+
+            out = md.save_official(draft, Path(tmp) / "saved")
+            saved = load_file(str(out / "model.safetensors"))
+            self.assertTrue(torch.equal(saved["d2t"].long(), d2t))
+            self.assertEqual((out / "config.json").read_bytes(), (official / "config.json").read_bytes())
+            reloaded = md.load_official_draft(out, attn_impl="eager")
+            self.assertTrue(torch.equal(reloaded.target_ids, new_ids))
+            with self.assertRaises(ValueError):                          # built from another vocabulary
+                md.apply_draft_vocab(reloaded, Path(tmp) / "vocab.pt")
+
+
+class MergeLoraTest(unittest.TestCase):
+    def test_merge_adds_scaled_low_rank_delta(self):
+        from safetensors.torch import load_file, save_file
+        import merge_lora
+
+        torch.manual_seed(4)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, adapter = root / "base", root / "adapter"
+            base.mkdir()
+            adapter.mkdir()
+            weights = {"model.layers.0.q.weight": torch.randn(6, 4).to(torch.bfloat16),
+                       "model.norm.weight": torch.randn(4).to(torch.bfloat16)}
+            save_file(weights, str(base / "model.safetensors"), metadata={"format": "pt"})
+            (base / "config.json").write_text("{}")
+            a, b = torch.randn(2, 4), torch.randn(6, 2)
+            save_file({"base_model.model.model.layers.0.q.lora_A.weight": a,
+                       "base_model.model.model.layers.0.q.lora_B.weight": b},
+                      str(adapter / "adapter_model.safetensors"))
+            (adapter / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 4}))
+            args = SimpleNamespace(base=base, adapter=adapter, output=root / "merged", overwrite=False)
+            info = merge_lora.merge(args)
+            merged = load_file(str(root / "merged" / "model.safetensors"))
+            expected = (weights["model.layers.0.q.weight"].double() + 2.0 * (b.double() @ a.double())
+                        ).to(torch.bfloat16)
+            self.assertTrue(torch.equal(merged["model.layers.0.q.weight"], expected))
+            self.assertTrue(torch.equal(merged["model.norm.weight"], weights["model.norm.weight"]))
+            self.assertEqual(info["merged_modules"], 1)
+            self.assertTrue((root / "merged" / "config.json").is_file())
+            with self.assertRaises(FileExistsError):
+                merge_lora.merge(args)
+            (adapter / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 4,
+                                                                     "use_dora": True}))
+            args.overwrite = True
+            with self.assertRaises(ValueError):
+                merge_lora.merge(args)
 
 
 if __name__ == "__main__":

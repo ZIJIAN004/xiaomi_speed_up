@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from idspace_minicpm_dataset import collate_single  # noqa: E402
+from idspace_minicpm_dataset import add_data_args, collate_single, data_argv  # noqa: E402
 from minicpm_dspark import _load_safetensors_dir, save_official  # noqa: E402
 from train_dspark import Pipeline, build_datasets, evaluate, parse_args as train_parse_args, print_metrics  # noqa: E402
 
@@ -40,8 +40,7 @@ def parse_args():
     p.add_argument("--train-jsonl", type=Path, required=True)
     p.add_argument("--image-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--prompt-file", type=Path, default=None)
-    p.add_argument("--text-first", action="store_true", help="default: image first (official order)")
+    add_data_args(p)
     p.add_argument("--feature-samples", type=int, default=4, help="samples for the feature/target checks")
     p.add_argument("--eval-samples", type=int, default=64, help="held-out samples for eal/accept_len")
     p.add_argument("--max-anchors", type=int, default=256)
@@ -118,8 +117,7 @@ def main():
         "--output-dir", str(args.output_dir), "--max-anchors", str(args.max_anchors),
         "--seed", str(args.seed), "--val-fraction", str(args.val_fraction), "--lm-head-init", "checkpoint",
         *(["--val-jsonl", str(args.val_jsonl)] if args.val_jsonl else []),
-        *(["--prompt-file", str(args.prompt_file)] if args.prompt_file else []),
-        *(["--text-first"] if args.text_first else []),
+        *data_argv(args),
     ])
     pipe = Pipeline(targs, torch.device("cuda:0"))
     _, val_set = build_datasets(targs, pipe.processor)

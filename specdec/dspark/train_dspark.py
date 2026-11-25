@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Train a DSpark draft for (fine-tuned) MiniCPM-OCR 1.0 on IDSpace ground truth.
 
+Default task: the identity-card KIE stage (layout-region crop, 16-field prompt,
+max_slice_nums=1) exactly as the MiniCPM-OCR LoRA was trained (kie_task.py).
+
 Frozen HF target (multimodal, batch size 1) -> aux hidden states of layers
 [3,7,11,15,19] + pre-norm last hidden state -> speculators DSparkDraftModel
 (DFlash backbone + Markov head + confidence head, its own loss and metrics),
@@ -24,9 +27,9 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from idspace_minicpm_dataset import IDSPACE_PROMPT, IDSpaceMiniCPMDataset, collate_single, split_train_val  # noqa: E402
+from idspace_minicpm_dataset import add_data_args, collate_single, make_datasets_factory, split_train_val  # noqa: E402
 from minicpm_dspark import (  # noqa: E402
-    TargetFeatureExtractor, accumulate_metrics, attach_verifier, configure_trainable,
+    TargetFeatureExtractor, accumulate_metrics, apply_draft_vocab, attach_verifier, configure_trainable,
     draft_inputs, load_official_draft, precast_frozen, reduce_metrics, save_official,
 )
 
@@ -43,12 +46,15 @@ def parse_args(argv=None):
     p.add_argument("--train-jsonl", type=Path, required=True)
     p.add_argument("--image-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--prompt-file", type=Path, default=None,
-                   help="user prompt text; must be the prompt the target is served with "
-                        "(default: the IDSpace prompt of specdec/eagle3/idspace_gt_dataset.py)")
-    p.add_argument("--text-first", action="store_true",
-                   help="text before image in the user turn (default: image first, the official MiniCPM-OCR order)")
-    p.add_argument("--max-samples", type=int, default=0)
+    add_data_args(p)
+    p.add_argument("--max-samples", type=int, default=0,
+                   help="keep only the first N rows of each file (smoke runs)")
+    p.add_argument("--train-samples", type=int, default=0,
+                   help="train on a seeded random subset of N training rows (0 = all); recorded in "
+                        "data_split.json")
+    p.add_argument("--draft-vocab", type=Path, default=None,
+                   help="vocabulary patch from build_kie_draft_vocab.py (same draft vocab size, some "
+                        "official tail tokens replaced by answer tokens the official vocab lacks)")
     p.add_argument("--val-jsonl", type=Path, default=None,
                    help="separate validation file (e.g. IDSpace validation.jsonl, the benchmark set); "
                         "when given, all --train-jsonl rows train and --val-fraction is ignored")
@@ -97,6 +103,10 @@ def parse_args(argv=None):
         p.error("epochs, grad-accum, max-anchors must be >= 1 and grad-clip > 0")
     if not 0 <= args.warmup_ratio < 1:
         p.error("warmup-ratio must be in [0, 1)")
+    if args.train_samples < 0:
+        p.error("train-samples must be >= 0")
+    if args.task == "kie" and args.layout_jsonl is None:
+        p.error("--task kie needs --layout-jsonl")
     return args
 
 
@@ -110,9 +120,13 @@ def resolve_split(n_rows: int, args) -> tuple[list[int], list[int]]:
     """Seeded split shared with specdec/eagle3; recorded and verified on restart."""
     val_fraction = 0.0 if args.val_jsonl else args.val_fraction
     train_idx, val_idx = split_train_val(n_rows, val_fraction, args.seed)
+    if args.train_samples and args.train_samples < len(train_idx):
+        train_idx = sorted(random.Random(args.seed).sample(train_idx, args.train_samples))
     path = args.output_dir / "data_split.json"
     record = {"train_jsonl": str(args.train_jsonl), "val_jsonl": str(args.val_jsonl),
-              "max_samples": args.max_samples, "val_fraction": val_fraction, "seed": args.seed,
+              "max_samples": args.max_samples, "train_samples": args.train_samples,
+              "val_fraction": val_fraction, "seed": args.seed, "task": args.task,
+              "layout_jsonl": str(args.layout_jsonl),
               "train_indices": train_idx, "val_indices": val_idx}
     if path.is_file():
         saved = json.loads(path.read_text(encoding="utf-8"))
@@ -125,12 +139,11 @@ def resolve_split(n_rows: int, args) -> tuple[list[int], list[int]]:
 
 def build_datasets(args, processor):
     """(train subset, validation dataset or None) for the IDSpace files in args."""
-    prompt = args.prompt_file.read_text(encoding="utf-8").strip() if args.prompt_file else IDSPACE_PROMPT
-    dataset = IDSpaceMiniCPMDataset(args.train_jsonl, args.image_root, processor, prompt,
-                                    not args.text_first, args.max_samples)
+    make = make_datasets_factory(args, processor)
+    dataset = make(args.train_jsonl, args.max_samples)
     train_idx, val_idx = resolve_split(len(dataset), args)
     if args.val_jsonl:
-        val = IDSpaceMiniCPMDataset(args.val_jsonl, args.image_root, processor, prompt, not args.text_first)
+        val = make(args.val_jsonl, args.max_samples)
     else:
         val = Subset(dataset, val_idx) if val_idx else None
     return Subset(dataset, train_idx), val
@@ -161,6 +174,8 @@ class Pipeline:
         for param in self.target.parameters():
             param.requires_grad_(False)
         self.draft = load_official_draft(args.init_draft)
+        if args.draft_vocab is not None:
+            apply_draft_vocab(self.draft, args.draft_vocab)
         attach_verifier(self.draft, self.target, args.lm_head_init)
         self.trainable = configure_trainable(self.draft.model, args.train_lm_head)
         precast_frozen(self.draft.model, torch.bfloat16, keep=set(self.draft.key_dtypes))
@@ -239,8 +254,9 @@ def main(argv=None):
     for path in (args.model, args.init_draft, args.image_root):
         if not path.is_dir():
             raise FileNotFoundError(path)
-    if not args.train_jsonl.is_file():
-        raise FileNotFoundError(args.train_jsonl)
+    for path in (args.train_jsonl, args.val_jsonl, args.layout_jsonl, args.draft_vocab):
+        if path is not None and not path.is_file():
+            raise FileNotFoundError(path)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required (flex attention + fused Triton losses)")
     if args.no_compile:
@@ -266,6 +282,7 @@ def main(argv=None):
         print_metrics("eval_only", metrics)
         out = args.output_dir / "eval_only.json"
         out.write_text(json.dumps({"init_draft": str(args.init_draft), "model": str(args.model),
+                                   "draft_vocab": str(args.draft_vocab) if args.draft_vocab else None,
                                    **metrics}, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {out}", flush=True)
         return
@@ -319,7 +336,8 @@ def main(argv=None):
             wandb.log(initial, step=0)
 
     def save_info(epoch, metrics):
-        return {"init_draft": str(args.init_draft), "target_model": str(args.model), "epoch": epoch,
+        return {"init_draft": str(args.init_draft), "target_model": str(args.model),
+                "draft_vocab": str(args.draft_vocab) if args.draft_vocab else None, "epoch": epoch,
                 "opt_step": opt_step, "metrics": metrics,
                 "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
 

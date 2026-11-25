@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from idspace_minicpm_dataset import IDSPACE_PROMPT, IDSpaceMiniCPMDataset, collate_single  # noqa: E402
+from idspace_minicpm_dataset import add_data_args, collate_single, make_datasets_factory  # noqa: E402
 
 IMAGE_TOKEN = "<|image_pad|>"
 
@@ -30,8 +30,7 @@ def parse_args():
     p.add_argument("--train-jsonl", type=Path, required=True)
     p.add_argument("--val-jsonl", type=Path, default=None)
     p.add_argument("--image-root", type=Path, required=True)
-    p.add_argument("--prompt-file", type=Path, default=None)
-    p.add_argument("--text-first", action="store_true")
+    add_data_args(p)
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--block-size", type=int, default=15)
     p.add_argument("--max-anchors", type=int, default=256)
@@ -60,17 +59,20 @@ def measure(dataset, args, image_id, hidden_size) -> dict:
         rows["seq"].append(seq_len)
         rows["answer"].append(int(sample["assistant_mask"].sum()))
         rows["anchors"].append(int(sample["loss_mask"][0, :-args.block_size].sum()))
+        first = seq_len
         if image_id is not None:
             is_image = ids == image_id
             rows["image"].append(int(is_image.sum()))
             first = int(is_image.nonzero()[0]) if bool(is_image.any()) else seq_len
             rows["prefix"].append(first)
         # Longest token prefix shared by every sample (identical prefix => identical features).
+        # It stops at the first image token: image placeholder ids are identical across
+        # samples, but their embeddings come from different pictures.
         ids_list = ids.tolist()
         if first_ids is None:
-            first_ids, shared_prefix = ids_list, seq_len
+            first_ids, shared_prefix = ids_list, first
         else:
-            limit = min(shared_prefix, len(ids_list))
+            limit = min(shared_prefix, len(ids_list), first)
             match = 0
             while match < limit and ids_list[match] == first_ids[match]:
                 match += 1
@@ -109,13 +111,14 @@ def main():
     if image_id is None or image_id == processor.tokenizer.unk_token_id:
         print(f"note: tokenizer has no {IMAGE_TOKEN}; image token counts skipped", flush=True)
         image_id = None
-    prompt = args.prompt_file.read_text(encoding="utf-8").strip() if args.prompt_file else IDSPACE_PROMPT
-    image_first = not args.text_first
-    report = {"model": str(args.model), "image_first": image_first, "max_anchors": args.max_anchors,
+    make = make_datasets_factory(args, processor)
+    report = {"model": str(args.model), "task": args.task, "layout_jsonl": str(args.layout_jsonl),
+              "image_first": not args.text_first, "max_pixels": args.max_pixels,
+              "max_slice_nums": args.max_slice_nums, "max_anchors": args.max_anchors,
               "block_size": args.block_size, "hidden_size": hidden_size}
     splits = [("train", args.train_jsonl)] + ([("val", args.val_jsonl)] if args.val_jsonl else [])
     for name, path in splits:
-        dataset = IDSpaceMiniCPMDataset(path, args.image_root, processor, prompt, image_first, args.max_samples)
+        dataset = make(path, args.max_samples)
         report[name] = measure(dataset, args, image_id, hidden_size)
         print(name, json.dumps(report[name], indent=2), flush=True)
     if args.output:
