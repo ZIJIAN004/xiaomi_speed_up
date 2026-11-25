@@ -89,6 +89,9 @@ def parse_args(argv=None):
     p.add_argument("--select-metric", choices=("eal", "accept_len"), default="eal",
                    help="validation metric for best/: eal = greedy (temperature 0, as served), "
                         "accept_len = rejection-sampling expectation")
+    p.add_argument("--require-loss-decrease", action=argparse.BooleanOptionalAction, default=True,
+                   help="an epoch counts as better only if --select-metric rises AND val loss falls, both "
+                        "against the best checkpoint so far (initially the init draft)")
     p.add_argument("--full-target-forward", action="store_true",
                    help="run the full target (with LM head) instead of its base model for features")
     p.add_argument("--profile-stages", action="store_true",
@@ -229,6 +232,18 @@ def evaluate(pipe: Pipeline, loader, seed: int, limit: int = 0) -> dict[str, flo
     return out
 
 
+def is_improvement(val_metrics: dict[str, float], best: dict[str, float] | None, select: str,
+                   require_loss_decrease: bool) -> bool:
+    """Better than the best so far: higher ``select`` and, if required, lower val loss."""
+    if not val_metrics:
+        return False
+    if best is None:
+        return True
+    if not val_metrics[select] > best[select]:
+        return False
+    return not require_loss_decrease or val_metrics["val/loss"] < best["val/loss"]
+
+
 def trainable_state(model) -> dict[str, torch.Tensor]:
     return {k: v.detach().cpu().clone() for k, v in model.named_parameters() if v.requires_grad}
 
@@ -330,7 +345,7 @@ def main(argv=None):
         # an epoch that beats it, so a missing best/ means "keep the init draft".
         initial = evaluate(pipe, val_loader, args.seed, args.eval_limit)
         print_metrics("epoch=-1 (init draft)", initial)
-        best = initial[select]
+        best = {select: initial[select], "val/loss": initial["val/loss"], "epoch": -1}
         history.append({"epoch": -1, **initial})
         if wandb is not None:
             wandb.log(initial, step=0)
@@ -408,14 +423,17 @@ def main(argv=None):
         if wandb is not None:
             wandb.log({**epoch_metrics, **val_metrics}, step=global_step)
 
-        improved = bool(val_metrics) and (best is None or val_metrics[select] > best)
-        if improved:
-            best = val_metrics[select]
+        if is_improvement(val_metrics, best, select, args.require_loss_decrease):
+            best = {select: val_metrics[select], "val/loss": val_metrics["val/loss"], "epoch": epoch}
+            # epoch_XX/ keeps every improving epoch; best/ is always the latest of them.
+            save_official(pipe.draft, args.output_dir / f"epoch_{epoch:02d}", save_info(epoch, val_metrics))
             save_official(pipe.draft, args.output_dir / "best", save_info(epoch, val_metrics))
-            print(f"epoch={epoch} saved best/ ({select}={best:.4f})", flush=True)
+            print(f"epoch={epoch} improved: {select}={best[select]:.4f} val/loss={best['val/loss']:.4f}; "
+                  f"saved epoch_{epoch:02d}/ and best/", flush=True)
         elif val_metrics:
-            print(f"epoch={epoch} {select}={val_metrics[select]:.4f} <= best {best:.4f}; best/ unchanged",
-                  flush=True)
+            print(f"epoch={epoch} not better than epoch {best['epoch']} ({select} {val_metrics[select]:.4f} vs "
+                  f"{best[select]:.4f}, val/loss {val_metrics['val/loss']:.4f} vs {best['val/loss']:.4f}); "
+                  "best/ unchanged", flush=True)
         last = save_official(pipe.draft, args.output_dir / "last", save_info(epoch, val_metrics))
         save_trainer_state(last / "trainer_state.pt", {
             "trainable": trainable_state(pipe.model), "optimizer": optimizer.state_dict(),
@@ -428,7 +446,8 @@ def main(argv=None):
         if stop:
             break
     if not (args.output_dir / "best").exists() and val_loader is not None:
-        print(f"no epoch beat the init draft on {select}; keep using {args.init_draft}", flush=True)
+        print(f"no epoch beat the init draft ({select} up" + (" and val/loss down" if args.require_loss_decrease
+              else "") + f"); keep using {args.init_draft}", flush=True)
     if wandb is not None:
         wandb.finish()
 

@@ -7,7 +7,7 @@ set -euo pipefail
 #   bash specdec/dspark/run_dspark.sh vocab   # KIE draft-vocabulary patch -> $DRAFT_VOCAB (CPU)
 #   bash specdec/dspark/run_dspark.sh check   # alignment gate: ORIGINAL model + official draft
 #   bash specdec/dspark/run_dspark.sh eval    # official draft (unpatched) on the fine-tuned target
-#   bash specdec/dspark/run_dspark.sh train   # warm start on the fine-tuned target, $TRAIN_SAMPLES random rows
+#   bash specdec/dspark/run_dspark.sh train   # warm start on the fine-tuned target (all train rows by default)
 #   bash specdec/dspark/run_dspark.sh smoke   # train for 2 optimizer steps on 64 samples (with --profile-stages)
 #   bash specdec/dspark/run_dspark.sh lengths # token-length stats (processor only, CPU)
 #
@@ -29,7 +29,7 @@ DATA_DIR="${DATA_DIR:-/home/mr_jiang/Lora/runs/minicpm_official_9to1_20261123_23
 TRAIN_JSONL="${TRAIN_JSONL:-$DATA_DIR/train.jsonl}"
 VAL_JSONL="${VAL_JSONL:-$DATA_DIR/validation.jsonl}"
 LAYOUT_JSONL="${LAYOUT_JSONL:-$DATA_DIR/layout.jsonl}"
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-10000}"                                     # seeded random subset (0 = all rows)
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-0}"                                         # >0: seeded random subset; 0 = all rows
 DRAFT_VOCAB="${DRAFT_VOCAB-$PROJECT_ROOT/runs/dspark/kie_draft_vocab/draft_vocab.pt}"   # DRAFT_VOCAB= : official vocab
 GPU="${GPU:-1}"
 RUN_NAME="${RUN_NAME:-dspark_${MODE}_$(date +%Y%m%d_%H%M%S)}"

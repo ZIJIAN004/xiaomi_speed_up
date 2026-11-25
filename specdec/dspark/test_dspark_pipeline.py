@@ -358,6 +358,18 @@ class TrainSubsetTest(unittest.TestCase):
                 resolve_split(100, args)
 
 
+class SelectionRuleTest(unittest.TestCase):
+    def test_needs_higher_eal_and_lower_loss(self):
+        from train_dspark import is_improvement
+        best = {"val/eal": 2.0, "val/loss": 0.5, "epoch": -1}
+        self.assertTrue(is_improvement({"val/eal": 2.1, "val/loss": 0.4}, best, "val/eal", True))
+        self.assertFalse(is_improvement({"val/eal": 2.1, "val/loss": 0.6}, best, "val/eal", True))
+        self.assertFalse(is_improvement({"val/eal": 1.9, "val/loss": 0.4}, best, "val/eal", True))
+        self.assertFalse(is_improvement({"val/eal": 2.0, "val/loss": 0.4}, best, "val/eal", True))
+        self.assertTrue(is_improvement({"val/eal": 2.1, "val/loss": 0.6}, best, "val/eal", False))
+        self.assertFalse(is_improvement({}, best, "val/eal", True))
+
+
 class DraftVocabPatchTest(unittest.TestCase):
     def test_patch_repoints_tail_ids_and_survives_save(self):
         from collections import Counter

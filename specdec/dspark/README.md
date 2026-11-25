@@ -11,7 +11,7 @@ The environment is `envs/setup_minicpm_ocr_env.sh`: vLLM 0.34.0, transformers 5.
 ## Pipeline
 
 ```text
-LoRA data run: train.jsonl (random 10k of 54029 rows) / validation.jsonl (6011, held out) + layout.jsonl
+LoRA data run: train.jsonl (all 54029 rows, reshuffled every epoch) / validation.jsonl (6011, held out) + layout.jsonl
     ↓  crop = union of layout blocks + 3% margin, ≤ 262144 px; user turn = [image, 16-field prompt]
     ↓  MiniCPM processor, max_slice_nums=1, native chat template, enable_thinking=False
 Frozen fine-tuned MiniCPM-OCR = base + LoRA merged (HF, bf16, batch size 1)
@@ -54,7 +54,7 @@ Validation reports DSpark's own metrics:
 - **`accept_len`**: expectation under rejection sampling.
 - **`position_k_acc`**, `accept_rate`, and confidence calibration.
 
-`best/` is written only by an epoch whose validation `eal` (`--select-metric`) beats the initial draft on the same target. A missing `best/` means: keep the official draft.
+An epoch counts as better only if validation `eal` (`--select-metric`) rises **and** validation loss falls, both against the best checkpoint so far; the first comparison is with the initial draft on the same target (`--no-require-loss-decrease` drops the loss condition). Each better epoch is saved to `epoch_XX/` and to `best/` (always the latest better one); `last/` is the end of the most recent epoch, with `trainer_state.pt` for `--resume`. A missing `best/` means: keep the official draft.
 
 ## Files
 
@@ -102,9 +102,9 @@ bash specdec/dspark/run_dspark.sh smoke
 # 3. Official draft (unpatched) on the merged fine-tuned target (how much did fine-tuning cost?)
 bash specdec/dspark/run_dspark.sh eval
 
-# 4. Train: 10k random train rows, patched vocabulary (wrap in tmux; add --lm-head-init verifier
-#    if step 1 says so; TRAIN_SAMPLES=0 for all rows, DRAFT_VOCAB= for the official vocabulary)
-bash specdec/dspark/run_dspark.sh train --wandb-mode offline
+# 4. Train: all train rows, patched vocabulary (wrap in tmux; add --lm-head-init verifier
+#    if step 1 says so; TRAIN_SAMPLES=N for a random subset, DRAFT_VOCAB= for the official vocabulary)
+bash specdec/dspark/run_dspark.sh train --epochs 10 --wandb-mode offline
 
 # 5. Serve <run>/best with vLLM and measure acceptance and throughput with the benchmark harness.
 ```
