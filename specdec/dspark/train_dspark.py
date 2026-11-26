@@ -425,6 +425,12 @@ def main(argv=None):
         torch.save(tensors, probe_dir / f"step_{step:06d}.pt")
         (probe_dir / f"step_{step:06d}.json").write_text(json.dumps(summary) + "\n", encoding="utf-8")
         tracker.log(probe_scalars(summary), step=global_step)
+        if tracker.backend == "swanlab":
+            try:
+                from probe_charts import swanlab_charts
+                tracker.log(swanlab_charts(summary, tensors), step=global_step)
+            except Exception as error:  # a chart failure must not stop training
+                print(f"probe charts not logged: {error!r}", flush=True)
         print(f"probe opt_step={step} done in {seconds:.0f}s, gpu peak {summary['gpu_peak_gb']:.1f}GB -> "
               f"{probe_dir / f'step_{step:06d}.json'}", flush=True)
 

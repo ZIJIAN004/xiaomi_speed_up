@@ -562,6 +562,14 @@ def probe_scalars(summary: dict[str, Any]) -> dict[str, float]:
         out[f"probe/rho/slot{k:02d}"] = rho
         out[f"probe/later/slot{k:02d}"] = later
         out[f"probe/earlier/slot{k:02d}"] = earlier
+    # mean cosine between the first and the last third of the block (one number for "early vs late")
+    n = len(summary["slot_ids"])
+    third = max(1, n // 3)
+    cos = view["cos"]
+    pairs = [cos[i][j] for i in range(third) for j in range(n - third, n)]
+    pairs = [c for c in pairs if c is not None and math.isfinite(c)]
+    out["probe/cos_early_late"] = sum(pairs) / len(pairs) if pairs else None
+    out["probe/later_mean_early"] = sum(view["later"][:third]) / third
     out["probe/recon_cos"] = summary["checks"]["reconstruction"]["cos"]
     for name, check in (summary["checks"]["step"] or {}).items():
         if check:

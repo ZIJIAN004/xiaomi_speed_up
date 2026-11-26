@@ -145,6 +145,12 @@ class GradProbeModelTest(unittest.TestCase):
         self.assertEqual(tuple(next(iter(fine.values())).shape), (4, 4, BLOCK + 1, BLOCK + 1))
         scalars = probe_scalars(summary)
         self.assertIn("probe/recon_cos", scalars)
+        self.assertIn("probe/cos_early_late", scalars)
+        from probe_charts import swanlab_charts
+        summary["opt_step"] = 1
+        charts = swanlab_charts(summary, tensors)
+        self.assertEqual(set(charts), {"probe_chart/cos_heatmap", "probe_chart/slot_decomposition",
+                                       "probe_chart/whatif_later"})
         self.assertTrue(all(math.isfinite(v) for v in scalars.values()))
 
     def test_analysis_script_runs(self):
