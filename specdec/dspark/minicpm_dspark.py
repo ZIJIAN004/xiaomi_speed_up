@@ -146,16 +146,29 @@ class OfficialDraft:
         self.target_ids = target_ids      # [draft_vocab] target id of each draft id
         self.source_dir = source_dir
         self.replaced_ids = torch.zeros(0, dtype=torch.long)  # draft ids re-pointed by a vocab patch
+        self.random_init_seed: int | None = None  # set when the weights were not loaded (random init)
 
 
-def load_official_draft(draft_dir: str | Path, attn_impl: str = "simple_flex_attention") -> OfficialDraft:
-    """Build the speculators model and load the official weights (CPU, fp32)."""
+def load_official_draft(draft_dir: str | Path, attn_impl: str = "simple_flex_attention",
+                        random_init_seed: int | None = None) -> OfficialDraft:
+    """Build the speculators model and load the official weights (CPU, fp32).
+
+    ``random_init_seed`` keeps the architecture, the vocabulary (d2t) and the save
+    layout of ``draft_dir`` but not its weights: every tensor keeps the
+    speculators constructor's own initialisation (``post_init``), drawn from this
+    seed. The checkpoint key set is still checked against the model.
+    """
     from speculators.models.dspark import DSparkDraftModel
 
     draft_dir = Path(draft_dir)
     official = read_official_config(draft_dir)
     config = build_draft_config(official, attn_impl)
-    model = DSparkDraftModel(config)
+    if random_init_seed is None:
+        model = DSparkDraftModel(config)
+    else:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(random_init_seed)
+            model = DSparkDraftModel(config)
     state = _load_safetensors_dir(draft_dir)
     if "d2t" not in state:
         raise KeyError("official checkpoint has no d2t")
@@ -167,19 +180,28 @@ def load_official_draft(draft_dir: str | Path, attn_impl: str = "simple_flex_att
               "verifier head is built by explicit index", flush=True)
     model.load_vocab_mappings(t2d, state["d2t"].long())
     weights = {k: v for k, v in state.items() if k not in DERIVED}
-    missing, unexpected = model.load_state_dict(weights, strict=False)
+    if random_init_seed is None:
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+    else:
+        own = model.state_dict()
+        missing, unexpected = sorted(set(own) - set(weights)), sorted(set(weights) - set(own))
+        wrong = sorted(k for k in set(weights) & set(own) if tuple(weights[k].shape) != tuple(own[k].shape))
+        if wrong:
+            raise ValueError(f"official tensors with another shape than the model: {wrong[:5]}")
     if unexpected:
         raise ValueError(f"official tensors with no model parameter: {sorted(unexpected)}")
     not_verifier = sorted(set(missing) - VERIFIER_OWNED - DERIVED)
     if not_verifier:
         raise ValueError(f"model parameters missing from the official checkpoint: {not_verifier}")
     _check_rotary(model, official)
-    return OfficialDraft(
+    draft = OfficialDraft(
         model=model, official_config=official,
         key_dtypes={k: v.dtype for k, v in state.items()},
         key_shapes={k: tuple(v.shape) for k, v in state.items()},
         target_ids=target_ids, source_dir=draft_dir,
     )
+    draft.random_init_seed = random_init_seed
+    return draft
 
 
 VOCAB_PATCH_FORMAT = "minicpm_dspark_vocab_patch_v1"
@@ -275,6 +297,9 @@ def attach_verifier(draft: OfficialDraft, target: nn.Module, lm_head_init: str =
             model.lm_head.weight.data[draft.replaced_ids] = rows.to(model.lm_head.weight.dtype)
     else:
         raise ValueError(f"unknown lm_head_init {lm_head_init!r}")
+    if not bool(torch.isfinite(model.lm_head.weight).all()):
+        raise ValueError("draft lm_head is not initialised (random init has no trained head); "
+                         "use lm_head_init='verifier'")
     norm = copy.deepcopy(text_model.norm).to("cpu")
     for param in norm.parameters():
         param.requires_grad_(False)

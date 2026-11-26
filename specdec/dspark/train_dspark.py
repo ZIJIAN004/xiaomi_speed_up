@@ -33,6 +33,7 @@ from minicpm_dspark import (  # noqa: E402
     TargetFeatureExtractor, accumulate_metrics, apply_draft_vocab, attach_verifier, configure_trainable,
     draft_inputs, load_official_draft, precast_frozen, reduce_metrics, save_official,
 )
+from grad_probe import parse_steps, probe_due, probe_scalars, run_probe  # noqa: E402
 from tracker import Tracker, add_tracker_args  # noqa: E402
 
 # speculators examples/train/dspark_qwen3_0_6b_sharegpt_online.sh
@@ -85,8 +86,28 @@ def parse_args(argv=None):
                    help="anchor blocks per sample; fixed so the compiled draft keeps one shape")
     p.add_argument("--train-lm-head", action="store_true",
                    help="also train the draft lm_head (speculators keeps it frozen)")
-    p.add_argument("--lm-head-init", choices=("checkpoint", "verifier"), default="checkpoint",
-                   help="draft lm_head from the init checkpoint, or from the target head rows")
+    p.add_argument("--lm-head-init", choices=("checkpoint", "verifier"), default=None,
+                   help="draft lm_head from the init checkpoint, or from the target head rows (default: "
+                        "checkpoint; verifier with --random-init)")
+    p.add_argument("--random-init", action="store_true",
+                   help="start from a randomly initialised draft (speculators' own init) with the --init-draft "
+                        "architecture and vocabulary instead of its weights; the frozen draft lm_head becomes the "
+                        "target head rows, as speculators trains from scratch")
+    p.add_argument("--init-seed", type=int, default=None, help="seed of --random-init (default: --seed)")
+    p.add_argument("--probe-steps", default="",
+                   help="comma-separated optimizer steps at which grad_probe.py measures per-slot gradients "
+                        "(0 = before the first update); see grad_probe.py")
+    p.add_argument("--probe-every", type=int, default=0,
+                   help="after the last --probe-steps entry, probe every N optimizer steps (0 = never)")
+    p.add_argument("--probe-samples", type=int, default=64, help="fixed training rows used by every probe")
+    p.add_argument("--probe-groups", type=int, default=4,
+                   help="disjoint sample groups; cross-group products give the noise-free (signal) view, "
+                        "same-group ones the batch view (64/4 = the 16-sample optimizer batch). RAM: groups x "
+                        "(block_size + 1) x trainable params x 4 bytes")
+    p.add_argument("--probe-step-check", action=argparse.BooleanOptionalAction, default=True,
+                   help="also take a small real step per probe to validate the first-order predictions")
+    p.add_argument("--stop-after-steps", type=int, default=0,
+                   help="stop after N optimizer steps without shortening the LR schedule (unlike --max-steps)")
     p.add_argument("--select-metric", choices=("eal", "accept_len"), default="eal",
                    help="validation metric for best/: eal = greedy (temperature 0, as served), "
                         "accept_len = rejection-sampling expectation")
@@ -110,6 +131,20 @@ def parse_args(argv=None):
         p.error("train-samples must be >= 0")
     if args.task == "kie" and args.layout_jsonl is None:
         p.error("--task kie needs --layout-jsonl")
+    if args.random_init and args.lm_head_init == "checkpoint":
+        p.error("--random-init has no trained draft lm_head; use --lm-head-init verifier (the default with it)")
+    if args.lm_head_init is None:
+        args.lm_head_init = "verifier" if args.random_init else "checkpoint"
+    if args.init_seed is None:
+        args.init_seed = args.seed
+    try:
+        args.probe_steps = parse_steps(args.probe_steps)
+    except ValueError as error:
+        p.error(str(error))
+    if args.probe_every < 0 or args.stop_after_steps < 0:
+        p.error("probe-every and stop-after-steps must be >= 0")
+    if (args.probe_steps or args.probe_every) and (args.probe_groups < 2 or args.probe_samples < 2 * args.probe_groups):
+        p.error("probing needs --probe-groups >= 2 and --probe-samples >= 2 * --probe-groups")
     return args
 
 
@@ -176,7 +211,8 @@ class Pipeline:
         self.target.eval()
         for param in self.target.parameters():
             param.requires_grad_(False)
-        self.draft = load_official_draft(args.init_draft)
+        self.draft = load_official_draft(args.init_draft,
+                                         random_init_seed=args.init_seed if args.random_init else None)
         if args.draft_vocab is not None:
             apply_draft_vocab(self.draft, args.draft_vocab)
         attach_verifier(self.draft, self.target, args.lm_head_init)
@@ -192,6 +228,11 @@ class Pipeline:
         self.call_kwargs = train_kwargs
         self.max_anchors = args.max_anchors
         self.profile = args.profile_stages
+
+    def draft_batch(self, raw):
+        """Target features + ids + mask of one collated sample, in the layout the draft forward takes."""
+        inputs = {k: v.to(self.device) for k, v in raw["inputs"].items()}
+        return draft_inputs(self.extractor(inputs), inputs["input_ids"], raw["loss_mask"].to(self.device))
 
     def sample(self, raw):
         inputs = {k: v.to(self.device) for k, v in raw["inputs"].items()}
@@ -349,10 +390,45 @@ def main(argv=None):
                 "opt_step": opt_step, "metrics": metrics,
                 "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
 
+    # Per-slot gradient probe (grad_probe.py) on a fixed set of training rows. It
+    # restores every RNG and never touches .grad, so training runs exactly as without it.
+    probe_rows: list[int] = []
+    probe_dir = args.output_dir / "probe"
+    probe_seconds = 0.0
+    if args.probe_steps or args.probe_every:
+        n_probe = min(args.probe_samples, len(train_set))
+        probe_rows = sorted(random.Random(args.seed + 7919).sample(range(len(train_set)), n_probe))
+        probe_dir.mkdir(exist_ok=True)
+        (probe_dir / "probe_set.json").write_text(json.dumps(
+            {"train_subset_rows": probe_rows, "groups": args.probe_groups, "seed": args.seed}) + "\n",
+            encoding="utf-8")
+
+    def probe(step: int, epoch: int) -> None:
+        nonlocal probe_seconds
+        t_start = time.perf_counter()
+        py_state = random.getstate()
+        summary, tensors = run_probe(
+            pipe.model, pipe.call_kwargs,
+            lambda i: pipe.draft_batch(collate_single([train_set[probe_rows[i]]])),
+            len(probe_rows), groups=args.probe_groups, seed=args.seed, optimizer=optimizer,
+            step_check=args.probe_step_check)
+        random.setstate(py_state)
+        seconds = time.perf_counter() - t_start
+        probe_seconds += seconds
+        summary.update(opt_step=step, global_step=global_step, epoch=epoch, lr=scheduler.get_last_lr()[0],
+                       seconds=seconds)
+        torch.save(tensors, probe_dir / f"step_{step:06d}.pt")
+        (probe_dir / f"step_{step:06d}.json").write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        tracker.log(probe_scalars(summary), step=global_step)
+        print(f"probe opt_step={step} done in {seconds:.0f}s -> {probe_dir / f'step_{step:06d}.json'}", flush=True)
+
     pipe.model.train()
     optimizer.zero_grad(set_to_none=True)
+    if probe_rows and opt_step == 0 and probe_due(0, args.probe_steps, args.probe_every):
+        probe(0, start_epoch)
     stop = False
     started, start_global = time.perf_counter(), global_step
+    probe_seconds = 0.0
     for epoch in range(start_epoch, args.epochs):
         window: dict[str, float] = {}
         timing: dict[str, float] = {}  # per-sample stage seconds since the last log line
@@ -382,7 +458,8 @@ def main(argv=None):
                     logged = {f"train/{k}": v for k, v in reduce_metrics(window).items()}
                     logged.update({"train/lr": scheduler.get_last_lr()[0], "train/grad_norm": grad_norm,
                                    "train/epoch": epoch, "perf/samples_per_sec":
-                                   (global_step - start_global) / max(time.perf_counter() - started, 1e-9),
+                                   (global_step - start_global)
+                                   / max(time.perf_counter() - started - probe_seconds, 1e-9),
                                    "perf/gpu_mem_gb": torch.cuda.max_memory_allocated(device) / 1024**3})
                     if args.profile_stages:
                         n_timed = max(timing.get("n", 0), 1)
@@ -401,7 +478,10 @@ def main(argv=None):
                               f"draft_bwd={logged['perf/t_draft_bwd_ms']:.0f}", flush=True)
                     tracker.log(logged, step=global_step)
                     window, timing = {}, {}
-                if args.max_steps and opt_step >= args.max_steps:
+                if probe_rows and probe_due(opt_step, args.probe_steps, args.probe_every):
+                    probe(opt_step, epoch)
+                if (args.max_steps and opt_step >= args.max_steps) or (
+                        args.stop_after_steps and opt_step >= args.stop_after_steps):
                     stop = True
                     break
 
