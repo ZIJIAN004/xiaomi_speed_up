@@ -265,7 +265,7 @@ def _available_ram() -> int | None:
 # ---------------------------------------------------------------- Gram algebra
 
 def pair_grams(means: torch.Tensor, layout: ParamLayout, scale: torch.Tensor | None = None,
-               chunk: int = 1 << 22) -> dict[str, torch.Tensor]:
+               chunk: int = 1 << 20) -> dict[str, torch.Tensor]:
     """{fine group: [G, G, V, V] float64} with P[i, j, a, b] = <means[i, a], means[j, b]> (scaled)."""
     n_groups, n_terms, _ = means.shape
     rows = n_groups * n_terms
@@ -275,10 +275,11 @@ def pair_grams(means: torch.Tensor, layout: ParamLayout, scale: torch.Tensor | N
         for a, b in spans:
             for s in range(a, b, chunk):
                 e = min(b, s + chunk)
-                x = means[:, :, s:e].reshape(rows, e - s)
+                # float64 products: float32 sums over ~1e8 coordinates drift by percents
+                x = means[:, :, s:e].reshape(rows, e - s).double()
                 if scale is not None:
-                    x = x * scale[s:e].sqrt()
-                acc += (x @ x.T).double()
+                    x = x * scale[s:e].double().sqrt()
+                acc += x @ x.T
         out[name] = acc.view(n_groups, n_terms, n_groups, n_terms).permute(0, 2, 1, 3).contiguous()
     return out
 
@@ -502,7 +503,8 @@ def _reconstruction_check(model, call_kwargs, batch, seed, amp, layout, flat, ve
     recon = torch.zeros_like(true)
     for v in range(vectors.shape[0]):
         recon.add_(vectors[v], alpha=float(coef[v]))
-    dot, nt, nr = float((true.double() @ recon.double())), float(true.norm()), float(recon.norm())
+    true, recon = true.double(), recon.double()  # float32 norms of ~1e8 entries drift by percents
+    dot, nt, nr = float(true @ recon), float(true.norm()), float(recon.norm())
     return {"cos": dot / (nt * nr) if nt * nr > 0 else float("nan"),
             "rel_err": float((recon - true).norm()) / nt if nt > 0 else float("nan"),
             "loss_true": float(loss.detach()), "loss_split": total}

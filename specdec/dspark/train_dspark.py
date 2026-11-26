@@ -421,11 +421,12 @@ def main(argv=None):
         seconds = time.perf_counter() - t_start
         probe_seconds += seconds
         summary.update(opt_step=step, global_step=global_step, epoch=epoch, lr=scheduler.get_last_lr()[0],
-                       seconds=seconds)
+                       seconds=seconds, gpu_peak_gb=torch.cuda.max_memory_allocated(device) / 1024**3)
         torch.save(tensors, probe_dir / f"step_{step:06d}.pt")
         (probe_dir / f"step_{step:06d}.json").write_text(json.dumps(summary) + "\n", encoding="utf-8")
         tracker.log(probe_scalars(summary), step=global_step)
-        print(f"probe opt_step={step} done in {seconds:.0f}s -> {probe_dir / f'step_{step:06d}.json'}", flush=True)
+        print(f"probe opt_step={step} done in {seconds:.0f}s, gpu peak {summary['gpu_peak_gb']:.1f}GB -> "
+              f"{probe_dir / f'step_{step:06d}.json'}", flush=True)
 
     pipe.model.train()
     optimizer.zero_grad(set_to_none=True)
