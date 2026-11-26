@@ -317,6 +317,10 @@ def main(argv=None):
         raise RuntimeError("CUDA is required (flex attention + fused Triton losses)")
     if args.no_compile:
         torch._dynamo.config.disable = True
+    if args.probe_steps or args.probe_every:
+        # The probe takes 16 gradients from one graph (retain_graph=True), which compiled
+        # backwards with donated buffers refuse. Memory reuse only; numerics are unchanged.
+        torch._functorch.config.donated_buffer = False
     device = torch.device("cuda:0")
     generator = set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
