@@ -11,6 +11,9 @@ set -euo pipefail
 #
 # Re-runnable: an existing env is reused and finished downloads are skipped.
 # Usage: bash envs/setup_minicpm_ocr_env.sh   (inside WSL; keeps the distro alive itself)
+#   Other hosts: set CONDA, MODEL_ROOT and TORCH_CUDA_ARCH_LIST (default 8.9 = RTX 4090), e.g. on the
+#   RTX 5090 cloud host: CONDA=/home/ubuntu/speed_up/miniforge3/bin/conda \
+#     MODEL_ROOT=/home/ubuntu/speed_up/models/minicpm-ocr-1.0 TORCH_CUDA_ARCH_LIST=12.0 bash envs/setup_minicpm_ocr_env.sh
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ENV_NAME="${ENV_NAME:-minicpm_ocr}"
 CONDA="${CONDA:-/home/mr_jiang/miniforge3/bin/conda}"
@@ -56,13 +59,22 @@ pip_install -c "$CONSTRAINTS" aiohttp click "datasets>=4.0.0,<=5.1.0" httpx hugg
 # Qwen3.5-style linear-attention kernels for HF forward during draft training (fla is Triton-only).
 pip_install "flash-linear-attention"
 # causal-conv1d (fused short conv for HF Qwen3.5 linear-attention layers; the torch fallback also ignores
-# packed-sequence boundaries). No prebuilt wheel for torch 2.14/cu13, and the host has no system CUDA,
-# so build it against the pip-installed CUDA 13 toolkit that vLLM already pulls in (nvidia/cu13).
+# packed-sequence boundaries). No prebuilt wheel for torch 2.14/cu13, so it is built from source.
+# A system CUDA 13.0 toolkit is preferred when present: on hosts that have one, the pip-installed nvidia/cu13
+# nvcc rejects its own headers ("CUDA compiler and CUDA toolkit headers are incompatible"). Without a
+# system toolkit (Diligram WSL) the pip-installed toolkit that vLLM pulls in is used.
+# Override with CAUSAL_CONV1D_CUDA_HOME.
 if "$PY" -c "import causal_conv1d" 2>/dev/null; then
   log "causal-conv1d already installed"
 else
   pip_install ninja packaging setuptools wheel
-  CU13="$("$PY" -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13"))')"
+  CU13="${CAUSAL_CONV1D_CUDA_HOME:-}"
+  if [[ -z "$CU13" && -x /usr/local/cuda-13.0/bin/nvcc ]]; then
+    CU13=/usr/local/cuda-13.0
+  elif [[ -z "$CU13" ]]; then
+    CU13="$("$PY" -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13"))')"
+  fi
+  log "Building causal-conv1d with CUDA_HOME=$CU13"
   if ! CUDA_HOME="$CU13" PATH="$CU13/bin:$PATH" TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}" \
        CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS="${MAX_JOBS:-8}" pip_install --no-build-isolation causal-conv1d; then
     log "WARNING: causal-conv1d build failed (see pip.log); HF training forward falls back to torch conv"
