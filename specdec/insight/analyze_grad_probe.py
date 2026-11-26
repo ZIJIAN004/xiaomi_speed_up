@@ -17,7 +17,7 @@ geometry (raw, adam):
   slots whose later_k <= -threshold in every half split.
 * fig_*.png          if matplotlib is installed.
 
-    python specdec/dspark/analyze_grad_probe.py runs/dspark/<run>/probe [--out DIR]
+    python specdec/insight/analyze_grad_probe.py runs/insight/<run>/probe [--out DIR]
 """
 from __future__ import annotations
 

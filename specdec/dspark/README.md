@@ -67,39 +67,8 @@ An epoch counts as better only if validation `eal` (`--select-metric`) rises **a
 - `check_alignment.py` is the gate run before training (below).
 - `run_dspark.sh` is the launcher for `merge`, `vocab`, `check`, `eval`, `train`, `smoke` and `lengths`. It uses GPU 1 by default, refuses GPU 0, keeps WSL alive and logs to `runs/dspark/<run>/`.
 - `measure_lengths.py` reports token lengths from the processor only: sequence, image and answer tokens, anchor positions against `--max-anchors`, and the size an offline feature cache would take (the shared prefix stops at the first image token).
-- `grad_probe.py` measures per-slot gradients during training (below); `analyze_grad_probe.py` turns its outputs into tables and figures.
-- `test_dspark_pipeline.py` holds CPU checks on tiny configs: vocab maps, bit-exact load/save round trip, hooks against manual residuals, the position guard, a forward/backward step that touches only trainable tensors, the loss mask, the KIE crop, the training subset, the vocabulary patch (rows, save, reload), the LoRA merge, the random init, and the gradient probe (exact loss/gradient split, noise-free cross-group products, real-step validation, untouched training state).
-
-## Per-slot gradient probe
-
-DSpark weights slot k's loss by the fixed decay `exp(-k/γ)`, which rescales each slot's gradient but cannot change its direction. `grad_probe.py` tests whether later slots' gradients point against earlier ones. At chosen optimizer steps it:
-
-1. splits the training loss exactly by slot (plus the confidence term);
-2. takes each term's gradient on a fixed set of training rows dealt into disjoint groups;
-3. keeps per-module Gram matrices of the group means, in raw and AdamW geometry.
-
-What the Gram matrices give:
-
-- **Signal view (cross-group products).** Unbiased for the systematic directions, because the groups' noise is independent and cancels in expectation.
-- **Batch view (same-group products).** What one training batch sees. Group size = 16 matches the optimizer batch.
-- **ρ_k = 1 + earlier_k + later_k + conf_k.** Slot k's first-order progress under the joint step, relative to training it alone. A negative `later_k` means the slots after k slow slot k down.
-- **Other γ values.** Re-weighting the stored undecayed gradients evaluates any other γ without retraining.
-
-Each probe also runs two checks:
-
-- the slot gradients must sum to the real training gradient;
-- a small real step must move each slot's loss as predicted.
-
-The probe never touches `.grad` and restores every RNG, so the training run is unchanged by it. RAM need: groups × (block + 1) × trainable params × 4 bytes. For example, 4 × 16 × 179M × 4 ≈ 46 GB.
-
-```bash
-# from-scratch draft (official architecture and vocabulary, speculators' own init), probes logged to <run>/probe/
-python specdec/dspark/train_dspark.py --model $FT_MODEL --init-draft $OFFICIAL_DRAFT --random-init \
-  --draft-vocab $DRAFT_VOCAB --train-jsonl ... --val-jsonl ... --image-root ... --layout-jsonl ... \
-  --output-dir runs/dspark/probe_random_init --epochs 10 --stop-after-steps 1000 \
-  --probe-steps 0,1,2,5,10,20,50,100,200,400 --probe-every 200 --tracker swanlab
-python specdec/dspark/analyze_grad_probe.py runs/dspark/probe_random_init/probe
-```
+- `--random-init` and the `--probe-*` flags of `train_dspark.py` serve the per-slot gradient experiment in `specdec/insight/` (see its README).
+- `test_dspark_pipeline.py` holds CPU checks on tiny configs: vocab maps, bit-exact load/save round trip, hooks against manual residuals, the position guard, a forward/backward step that touches only trainable tensors, the loss mask, the KIE crop, the training subset, the vocabulary patch (rows, save, reload), the LoRA merge and the random init.
 
 ## Order of runs
 

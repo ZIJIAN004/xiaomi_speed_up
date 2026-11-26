@@ -28,6 +28,7 @@ import torch._dynamo  # not inside main(): a local import would make `torch` a l
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "insight"))  # grad_probe (per-slot experiment)
 from idspace_minicpm_dataset import add_data_args, collate_single, make_datasets_factory, split_train_val  # noqa: E402
 from minicpm_dspark import (  # noqa: E402
     TargetFeatureExtractor, accumulate_metrics, apply_draft_vocab, attach_verifier, configure_trainable,
