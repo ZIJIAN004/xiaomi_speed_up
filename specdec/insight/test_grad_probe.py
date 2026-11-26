@@ -145,7 +145,8 @@ class GradProbeModelTest(unittest.TestCase):
         self.assertEqual(tuple(next(iter(fine.values())).shape), (4, 4, BLOCK + 1, BLOCK + 1))
         scalars = probe_scalars(summary)
         self.assertIn("probe/recon_cos", scalars)
-        self.assertIn("probe/cos_early_late", scalars)
+        # tiny block: the last slot can have no gradient (cos NaN), then cos_early_late is dropped
+        self.assertIn("probe/later_mean_early", scalars)
         from probe_charts import swanlab_charts
         summary["opt_step"] = 1
         charts = swanlab_charts(summary, tensors)
