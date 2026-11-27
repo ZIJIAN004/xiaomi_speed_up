@@ -331,8 +331,7 @@ class DatasetMaskTest(unittest.TestCase):
             Image.new("RGB", (640, 400)).save(root / "small.png")
             rows = [{"index": 3, "image": str(root / "card.png"), "target": {"name": "A"}},   # absolute path
                     {"index": 4, "image": str(root / "small.png"), "target": {"name": "B"}}]
-            (root / "train.jsonl").write_text("".join(json.dumps(r) + "
-" for r in rows))
+            (root / "train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
             args = SimpleNamespace(task="whole_card", layout_jsonl=None, max_pixels=262144, max_slice_nums=1,
                                    prompt_file=None, text_first=False, image_root=root / "unused")
             processor = FakeProcessor()
