@@ -553,9 +553,8 @@ class RandomInitTest(unittest.TestCase):
         self.assertEqual((args.lm_head_init, args.init_seed), ("verifier", 7))
         with self.assertRaises(SystemExit):
             parse_args(base + ["--random-init", "--lm-head-init", "checkpoint"])
-        self.assertEqual(parse_args(base + ["--probe-steps", "5,0,5"]).probe_steps, [0, 5])
         with self.assertRaises(SystemExit):
-            parse_args(base + ["--probe-steps", "0", "--probe-samples", "6", "--probe-groups", "4"])
+            parse_args(base + ["--stop-after-steps", "-1"])
 
 
 if __name__ == "__main__":

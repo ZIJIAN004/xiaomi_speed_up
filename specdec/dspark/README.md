@@ -69,7 +69,7 @@ An epoch counts as better only if validation `eal` (`--select-metric`) rises **a
 - `check_alignment.py` is the gate run before training (below).
 - `run_dspark.sh` is the launcher for `merge`, `vocab`, `check`, `eval`, `train`, `smoke` and `lengths`. It uses GPU 1 by default, refuses GPU 0, keeps WSL alive and logs to `runs/dspark/<run>/`.
 - `measure_lengths.py` reports token lengths from the processor only: sequence, image and answer tokens, anchor positions against `--max-anchors`, and the size an offline feature cache would take (the shared prefix stops at the first image token).
-- `--random-init` and the `--probe-*` flags of `train_dspark.py` serve the per-slot gradient experiment in `specdec/insight/` (see its README).
+- `--random-init` trains a draft from the speculators initialisation instead of the official weights (draft `lm_head` = target head rows). The per-slot gradient experiment that used it was retired (no slot conflict measured, see git history before the `specdec/insight` rewrite).
 - `test_dspark_pipeline.py` holds CPU checks on tiny configs: vocab maps, bit-exact load/save round trip, hooks against manual residuals, the position guard, a forward/backward step that touches only trainable tensors, the loss mask, the KIE crop, the training subset, the vocabulary patch (rows, save, reload), the LoRA merge and the random init.
 
 ## Order of runs
