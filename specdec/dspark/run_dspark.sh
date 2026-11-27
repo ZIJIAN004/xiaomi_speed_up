@@ -5,6 +5,8 @@ set -euo pipefail
 #
 #   bash specdec/dspark/run_dspark.sh merge   # LoRA adapter + base -> $FT_MODEL, then verify vs PEFT ($MERGE_PY env)
 #   bash specdec/dspark/run_dspark.sh vocab   # KIE draft-vocabulary patch -> $DRAFT_VOCAB (CPU)
+#   bash specdec/dspark/run_dspark.sh shrink  # task-vocab draft (official + patch -> answer tokens) -> $SMALL_DRAFT (CPU)
+#                                             # then: OFFICIAL_DRAFT=$SMALL_DRAFT DRAFT_VOCAB= run_dspark.sh eval|train
 #   bash specdec/dspark/run_dspark.sh check   # alignment gate: ORIGINAL model + official draft
 #   bash specdec/dspark/run_dspark.sh eval    # official draft (unpatched) on the fine-tuned target
 #   bash specdec/dspark/run_dspark.sh train   # warm start on the fine-tuned target (all train rows by default)
@@ -17,7 +19,7 @@ set -euo pipefail
 # train.jsonl trains, validation.jsonl is held out.
 # Extra arguments after the mode go to the Python script, e.g. `train --epochs 5`.
 # Runs in the foreground with a WSL keepalive; wrap it in tmux for long runs.
-MODE="${1:?usage: run_dspark.sh merge|vocab|check|eval|train|smoke|lengths [extra args]}"; shift
+MODE="${1:?usage: run_dspark.sh merge|vocab|shrink|check|eval|train|smoke|lengths [extra args]}"; shift
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PY="${PY:-/home/mr_jiang/miniforge3/envs/minicpm_ocr/bin/python}"
 MODEL_ROOT="${MODEL_ROOT:-/home/mr_jiang/models/minicpm-ocr-1.0}"
@@ -44,6 +46,7 @@ VAL_JSONL="${VAL_JSONL:-$DATA_DIR/validation.jsonl}"
 LAYOUT_JSONL="${LAYOUT_JSONL:-$DATA_DIR/layout.jsonl}"                      # kie only
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-0}"                                         # >0: seeded random subset; 0 = all rows
 DRAFT_VOCAB="${DRAFT_VOCAB-$PROJECT_ROOT/runs/dspark/${TASK}_draft_vocab/draft_vocab.pt}"   # DRAFT_VOCAB= : official vocab
+SMALL_DRAFT="${SMALL_DRAFT:-$PROJECT_ROOT/runs/dspark/${TASK}_small_vocab_draft}"   # written by `shrink`
 GPU="${GPU:-1}"
 RUN_NAME="${RUN_NAME:-dspark_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 OUT="${OUT:-$PROJECT_ROOT/runs/dspark/$RUN_NAME}"
@@ -83,6 +86,12 @@ case "$MODE" in
     mkdir -p "$(dirname "$DRAFT_VOCAB")"
     "$PY" specdec/dspark/build_kie_draft_vocab.py --model "$BASE_MODEL" --init-draft "$OFFICIAL_DRAFT" \
       --train-jsonl "$TRAIN_JSONL" --val-jsonl "$VAL_JSONL" --output "${DRAFT_VOCAB%.pt}" "$@" 2>&1 | tee "$OUT/vocab.log" ;;
+  shrink)
+    SHRINK_VOCAB=()
+    [[ -n "$DRAFT_VOCAB" ]] && SHRINK_VOCAB=(--draft-vocab "$DRAFT_VOCAB")
+    "$PY" specdec/dspark/shrink_draft_vocab.py --draft "$OFFICIAL_DRAFT" "${SHRINK_VOCAB[@]}" \
+      --target-model "$BASE_MODEL" --train-jsonl "$TRAIN_JSONL" --val-jsonl "$VAL_JSONL" \
+      --output "$SMALL_DRAFT" "$@" 2>&1 | tee "$OUT/shrink.log" ;;
   check)
     "$PY" specdec/dspark/check_alignment.py --model "$BASE_MODEL" --init-draft "$OFFICIAL_DRAFT" \
       "${DATA_ARGS[@]}" --output-dir "$OUT" "$@" 2>&1 | tee "$OUT/check.log" ;;
