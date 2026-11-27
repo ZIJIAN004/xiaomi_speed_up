@@ -11,8 +11,10 @@ set -euo pipefail
 #   bash specdec/dspark/run_dspark.sh smoke   # train for 2 optimizer steps on 64 samples (with --profile-stages)
 #   bash specdec/dspark/run_dspark.sh lengths # token-length stats (processor only, CPU)
 #
-# Data: the KIE stage of the MiniCPM-OCR LoRA run (layout-region crop, 16-field prompt,
-# max_slice_nums=1); train.jsonl trains, validation.jsonl is held out.
+# Data (TASK): whole_card (default) = the whole_card_v2 cache (perspective-rectified,
+# orientation-corrected whole cards, no ppv3) and the LoRA trained on it; kie = the first
+# LoRA run (ppv3 layout-region crop). Both: 16-field prompt, 262144 px, max_slice_nums=1;
+# train.jsonl trains, validation.jsonl is held out.
 # Extra arguments after the mode go to the Python script, e.g. `train --epochs 5`.
 # Runs in the foreground with a WSL keepalive; wrap it in tmux for long runs.
 MODE="${1:?usage: run_dspark.sh merge|vocab|check|eval|train|smoke|lengths [extra args]}"; shift
@@ -21,16 +23,27 @@ PY="${PY:-/home/mr_jiang/miniforge3/envs/minicpm_ocr/bin/python}"
 MODEL_ROOT="${MODEL_ROOT:-/home/mr_jiang/models/minicpm-ocr-1.0}"
 BASE_MODEL="${BASE_MODEL:-$MODEL_ROOT/model}"
 OFFICIAL_DRAFT="${OFFICIAL_DRAFT:-$MODEL_ROOT/dspark}"
-LORA_DIR="${LORA_DIR:-/home/mr_jiang/speed_up/model/MiniCPM-OCR-1.0-LoRA-20261123_230559_273596-step6754}"
-ADAPTER="${ADAPTER:-$LORA_DIR/adapter}"
+TASK="${TASK:-whole_card}"
+case "$TASK" in
+  whole_card)
+    DEFAULT_LORA_DIR=/home/mr_jiang/speed_up/model/MiniCPM-OCR-1.0-LoRA-whole-card_20261126_001627_295140
+    DEFAULT_DATA_DIR=/home/mr_jiang/Lora/datasets/IDSpace/whole_card ;;
+  kie)
+    DEFAULT_LORA_DIR=/home/mr_jiang/speed_up/model/MiniCPM-OCR-1.0-LoRA-20261123_230559_273596-step6754
+    DEFAULT_DATA_DIR=/home/mr_jiang/Lora/runs/minicpm_official_9to1_20261123_230559_273596 ;;
+  *) echo "TASK must be whole_card or kie, got $TASK" >&2; exit 2 ;;
+esac
+LORA_DIR="${LORA_DIR:-$DEFAULT_LORA_DIR}"
+if [[ -d "$LORA_DIR/adapter" ]]; then DEFAULT_ADAPTER="$LORA_DIR/adapter"; else DEFAULT_ADAPTER="$LORA_DIR"; fi
+ADAPTER="${ADAPTER:-$DEFAULT_ADAPTER}"
 FT_MODEL="${FT_MODEL:-$LORA_DIR/merged}"                                   # written by `merge`
 MERGE_PY="${MERGE_PY:-/home/mr_jiang/Lora/envs/xiaomi_ocr0/bin/python}"     # env that trained the LoRA (has peft)
-DATA_DIR="${DATA_DIR:-/home/mr_jiang/Lora/runs/minicpm_official_9to1_20261123_230559_273596}"
+DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
 TRAIN_JSONL="${TRAIN_JSONL:-$DATA_DIR/train.jsonl}"
 VAL_JSONL="${VAL_JSONL:-$DATA_DIR/validation.jsonl}"
-LAYOUT_JSONL="${LAYOUT_JSONL:-$DATA_DIR/layout.jsonl}"
+LAYOUT_JSONL="${LAYOUT_JSONL:-$DATA_DIR/layout.jsonl}"                      # kie only
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-0}"                                         # >0: seeded random subset; 0 = all rows
-DRAFT_VOCAB="${DRAFT_VOCAB-$PROJECT_ROOT/runs/dspark/kie_draft_vocab/draft_vocab.pt}"   # DRAFT_VOCAB= : official vocab
+DRAFT_VOCAB="${DRAFT_VOCAB-$PROJECT_ROOT/runs/dspark/${TASK}_draft_vocab/draft_vocab.pt}"   # DRAFT_VOCAB= : official vocab
 GPU="${GPU:-1}"
 RUN_NAME="${RUN_NAME:-dspark_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 OUT="${OUT:-$PROJECT_ROOT/runs/dspark/$RUN_NAME}"
@@ -55,13 +68,17 @@ source "$PROJECT_ROOT/envs/wsl_keepalive.sh"
 start_wsl_keepalive "$$" || true
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv | tee "$OUT/gpu_before.csv"
 
-DATA_ARGS=(--train-jsonl "$TRAIN_JSONL" --image-root "$DATA_DIR" --val-jsonl "$VAL_JSONL"
-           --task kie --layout-jsonl "$LAYOUT_JSONL")
+DATA_ARGS=(--train-jsonl "$TRAIN_JSONL" --image-root "$DATA_DIR" --val-jsonl "$VAL_JSONL" --task "$TASK")
+TASK_ARGS=(--task "$TASK")
+if [[ "$TASK" == "kie" ]]; then
+  DATA_ARGS+=(--layout-jsonl "$LAYOUT_JSONL")
+  TASK_ARGS+=(--layout-jsonl "$LAYOUT_JSONL")
+fi
 cd "$PROJECT_ROOT"
 case "$MODE" in
   merge)
     "$MERGE_PY" specdec/dspark/merge_lora.py --base "$BASE_MODEL" --adapter "$ADAPTER" --output "$FT_MODEL" \
-      --data-dir "$DATA_DIR" --layout-jsonl "$LAYOUT_JSONL" --verify-samples 32 "$@" 2>&1 | tee "$OUT/merge.log" ;;
+      --data-dir "$DATA_DIR" "${TASK_ARGS[@]}" --verify-samples 32 "$@" 2>&1 | tee "$OUT/merge.log" ;;
   vocab)
     mkdir -p "$(dirname "$DRAFT_VOCAB")"
     "$PY" specdec/dspark/build_kie_draft_vocab.py --model "$BASE_MODEL" --init-draft "$OFFICIAL_DRAFT" \

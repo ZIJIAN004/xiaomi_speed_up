@@ -11,8 +11,10 @@ The environment is `envs/setup_minicpm_ocr_env.sh`: vLLM 0.34.0, transformers 5.
 ## Pipeline
 
 ```text
-LoRA data run: train.jsonl (all 54029 rows, reshuffled every epoch) / validation.jsonl (6011, held out) + layout.jsonl
-    ↓  crop = union of layout blocks + 3% margin, ≤ 262144 px; user turn = [image, 16-field prompt]
+--task whole_card (default): datasets/IDSpace/whole_card train.jsonl (53810, reshuffled every epoch) / validation.jsonl (5980)
+    ↓  image = rectified whole card (no crop), ≤ 262144 px; user turn = [image, 16-field prompt]
+--task kie (first LoRA): LoRA data run train.jsonl (54029) / validation.jsonl (6011) + layout.jsonl
+    ↓  crop = union of ppv3 layout blocks + 3% margin, ≤ 262144 px; user turn = [image, 16-field prompt]
     ↓  MiniCPM processor, max_slice_nums=1, native chat template, enable_thinking=False
 Frozen fine-tuned MiniCPM-OCR = base + LoRA merged (HF, bf16, batch size 1)
     ├── forward hooks: output of layers[k-1] for k in [3,7,11,15,19]   → hidden_states [1,T,5·1024]
@@ -33,7 +35,7 @@ best/ and last/ in the official layout (same keys, shapes, dtypes and config.jso
 - **Aux features = vLLM's.** vLLM records aux layer k as the residual stream after k decoder layers (`_maybe_add_hidden_state(aux, layer_idx+1, hidden, residual)`). In HF that is the output of `layers[k-1]`. The hooks read exactly that tensor, so `output_hidden_states` conventions never matter.
 - **Targets come from the target itself.** `verifier_norm` is a frozen copy of the target's own final norm, which uses the Qwen3.5 `(1 + w)` convention. `verifier_lm_head` holds the rows of the target head at the draft's 114688 target ids. These follow the fine-tuned target automatically.
 - **Draft RoPE is full width.** The official draft uses `rope_dim 256` and `theta 1e7`, while the target uses partial RoPE (0.25). `load_official_draft` fails if the built rotary embedding does not match.
-- **Task = the LoRA's KIE stage.** `kie_task.py` mirrors the LoRA run's `common.py`: the same 16-field prompt, union-of-blocks crop plus a 3% margin, 262144-pixel budget, and `max_slice_nums=1`. The message structure mirrors its `train.py` collate. A draft trained on other inputs would see hidden states the served target never produces. `--task idspace_legacy` keeps the earlier full-image, 12-field setup.
+- **Task = the LoRA's KIE stage.** `kie_task.py` mirrors the LoRA run's `common.py`: the same 16-field prompt, union-of-blocks crop plus a 3% margin, 262144-pixel budget, and `max_slice_nums=1`. The message structure mirrors its `train.py` collate. A draft trained on other inputs would see hidden states the served target never produces. `--task whole_card` is the same task on the `whole_card_v2` cache (`/home/mr_jiang/Lora/datasets/IDSpace/whole_card`, built by `Lora/IDextract/idcard_correction`): template and scan only, each image already perspective-rectified and orientation-corrected, so it gets only the pixel budget, as in `IDextract/official_9to1/train.py`. Its target is the whole-card LoRA (`MiniCPM-OCR-1.0-LoRA-whole-card_20261126_001627_295140`); `run_dspark.sh` defaults to it (`TASK=kie` for the first LoRA). `--task idspace_legacy` keeps the earlier full-image, 12-field setup.
 - **Vocabulary.** `d2t` is delta-encoded (`target = i + d2t[i]`) in the checkpoint, in speculators and in vLLM. `t2d` is derived from it. The official vocabulary lacks tokens that almost every compact-JSON answer uses: `":"`, `","` and pieces of field names. A draft cannot propose those, so each one ends the accepted run. `build_kie_draft_vocab.py` re-points the official vocabulary's rarest tail ids (skipping any token the answers use) at the missing answer tokens, most frequent first. The size stays 114688, so config.json, every shape and vLLM's loader are unchanged. Only those rows change: d2t/t2d, the `lm_head` row (set to the target head row of the new token) and the `markov_w2` row (zeroed). `markov_w1` and the embedding are indexed by target id and stay as they are. Its report gives the answer-token coverage before and after, on train and validation.
 - **Merged target.** `merge_lora.py` adds `(α/r)·B·A` to each base tensor in the safetensors files, so key names, dtypes and config.json stay the base's (HF and vLLM load it like the base). `--verify-samples` compares teacher-forced predictions of merged and PEFT on KIE validation samples.
 - **Loss mask.** With `sample_from_anchor=True`, slot k of the block anchored at p predicts token p+k+1 from the target distribution at p+k. speculators masks that slot with `loss_mask[p+k]`. So `loss_mask[i]` marks positions whose *next* token is an answer token or the closing `<|im_end|>`. That is the assistant mask shifted left by one; `test_dspark_pipeline.py` checks this.
@@ -79,9 +81,10 @@ PY=/home/mr_jiang/miniforge3/envs/minicpm_ocr/bin/python
 # 0. CPU unit checks
 $PY -m unittest specdec/dspark/test_dspark_pipeline.py
 
-# 0a. Merge the LoRA (base + adapter -> $LORA_DIR/merged), verified against PEFT on 32 KIE samples
+# TASK=whole_card (default) or TASK=kie selects target, data and vocabulary for every step below.
+# 0a. Merge the LoRA (base + adapter -> $LORA_DIR/merged), verified against PEFT on 32 validation samples
 bash specdec/dspark/run_dspark.sh merge
-# 0b. Vocabulary patch -> runs/dspark/kie_draft_vocab/draft_vocab.{pt,json}; check its coverage numbers
+# 0b. Vocabulary patch -> runs/dspark/${TASK}_draft_vocab/draft_vocab.{pt,json}; check its coverage numbers
 bash specdec/dspark/run_dspark.sh vocab
 
 # 1. Alignment gate: ORIGINAL model + official draft on the KIE validation.jsonl
@@ -113,7 +116,7 @@ bash specdec/dspark/run_dspark.sh train --epochs 10 --tracker swanlab
 
 ## Known limits
 
-- **Serve with `max_slice_nums=1`.** The LoRA was trained and evaluated with one image slice, while the processor default is 9. vLLM must get the same setting (`mm_processor_kwargs`) and the same crop, or both the target and the draft see other inputs.
+- **Serve with `max_slice_nums=1`.** The LoRA was trained and evaluated with one image slice, while the processor default is 9. vLLM must get the same setting (`mm_processor_kwargs`) and the same image preprocessing (crop or whole-card rectification), or both the target and the draft see other inputs.
 - **One draft for both stages.** If one vLLM server also serves the stage-1 block recognition (short `Text Recognition:` outputs), it uses this draft there too. This training covers only the KIE stage.
 
 - **Off-policy gate.** The gate uses IDSpace ground truth as the answer. The original model's own outputs differ in format, so offline `eal` and vLLM's acceptance length are expected to be close, not identical. After fine-tuning, the target's outputs approach the ground truth and the gap should shrink. Training on the target's own greedy outputs is the speculators default (response regeneration). It would need an answers file, which is not implemented here.

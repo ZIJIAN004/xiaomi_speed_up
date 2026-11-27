@@ -12,7 +12,8 @@ Plain LoRA only (no DoRA, rsLoRA, fan_in_fan_out, bias, modules_to_save, rank or
 alpha patterns); anything else is refused.
 
 ``--verify-samples N`` (needs peft, run in the env that trained the LoRA) then
-compares, on N validation KIE samples rendered as in training, the teacher-forced
+compares, on N validation samples rendered as in training (``--task kie``: layout
+crop; ``--task whole_card``: the rectified whole-card cache), the teacher-forced
 next-token predictions at the answer positions of: the base model, base + adapter
 through PEFT (unmerged), and the merged checkpoint. It fails if merged and PEFT
 argmax agree on fewer than ``--min-agreement`` of the positions.
@@ -46,8 +47,10 @@ def parse_args():
     p.add_argument("--skip-merge", action="store_true", help="only run --verify-samples on an existing --output")
     p.add_argument("--verify-samples", type=int, default=0, help="KIE validation samples to compare (needs peft)")
     p.add_argument("--min-agreement", type=float, default=0.995)
-    p.add_argument("--data-dir", type=Path, default=None, help="LoRA data run dir (validation.jsonl, images/)")
-    p.add_argument("--layout-jsonl", type=Path, default=None, help="default: <data-dir>/layout.jsonl")
+    p.add_argument("--data-dir", type=Path, default=None, help="LoRA data dir (validation.jsonl, images/)")
+    p.add_argument("--task", choices=("kie", "whole_card"), default="kie",
+                   help="input rendering the LoRA was trained with (see idspace_minicpm_dataset.py)")
+    p.add_argument("--layout-jsonl", type=Path, default=None, help="kie only; default: <data-dir>/layout.jsonl")
     p.add_argument("--device", default="cuda:0")
     return p.parse_args()
 
@@ -197,7 +200,8 @@ def verify(args) -> dict:
         raise ValueError("--verify-samples needs --data-dir")
     device = torch.device(args.device)
     processor = AutoProcessor.from_pretrained(args.base)
-    data_args = SimpleNamespace(task="kie", layout_jsonl=args.layout_jsonl or args.data_dir / "layout.jsonl",
+    layout = (args.layout_jsonl or args.data_dir / "layout.jsonl") if args.task == "kie" else None
+    data_args = SimpleNamespace(task=args.task, layout_jsonl=layout,
                                 max_pixels=262144, max_slice_nums=1, prompt_file=None, text_first=False,
                                 image_root=args.data_dir)
     dataset = make_datasets_factory(data_args, processor)(args.data_dir / "validation.jsonl", args.verify_samples)
@@ -216,7 +220,7 @@ def verify(args) -> dict:
     del model
 
     report = {
-        "samples": len(samples), "positions": int(gold.numel()),
+        "task": args.task, "samples": len(samples), "positions": int(gold.numel()),
         "merged_vs_peft_argmax_agreement": float((merged_pred == peft_pred).float().mean()),
         "merged_vs_peft_logit_max_abs": float((merged_logits - peft_logits).abs().max()),
         "merged_vs_peft_logit_mean_abs": float((merged_logits - peft_logits).abs().mean()),

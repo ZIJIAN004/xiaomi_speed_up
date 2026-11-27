@@ -16,6 +16,7 @@ PY="${PY:-/home/mr_jiang/miniforge3/envs/minicpm_ocr/bin/python}"
 MODEL_ROOT="${MODEL_ROOT:-/home/mr_jiang/models/minicpm-ocr-1.0}"
 TARGET="${TARGET:-$MODEL_ROOT/model}"                     # original model, not the LoRA merge
 DRAFT_VOCAB="${DRAFT_VOCAB:-$PROJECT_ROOT/runs/dspark/kie_draft_vocab/draft_vocab.pt}"
+TASK="${TASK:-kie}"                                       # data of the earlier probe runs
 GPU="${GPU:-1}"
 INIT_SEED="${INIT_SEED:-0}"
 PROBE_STEPS="${PROBE_STEPS:-0,1,2,5,10,20,50,100,200,400}"
@@ -35,6 +36,6 @@ case "$MODE" in
 esac
 OUT="$PROJECT_ROOT/runs/insight/$RUN_NAME"
 # run_dspark.sh supplies the data paths, the GPU 0 guard, the WSL keepalive and the log.
-FT_MODEL="$TARGET" DRAFT_VOCAB="$DRAFT_VOCAB" GPU="$GPU" RUN_NAME="$RUN_NAME" OUT="$OUT" \
+TASK="$TASK" FT_MODEL="$TARGET" DRAFT_VOCAB="$DRAFT_VOCAB" GPU="$GPU" RUN_NAME="$RUN_NAME" OUT="$OUT" \
   bash specdec/dspark/run_dspark.sh train --random-init --init-seed "$INIT_SEED" --epochs 10 \
   "${EXTRA[@]}" "$@"

@@ -1,12 +1,17 @@
 """IDSpace ground-truth samples rendered the way the fine-tuned MiniCPM-OCR sees them.
 
-Two tasks:
+Three tasks:
 
 * ``kie`` (default): the identity-card KIE stage the MiniCPM-OCR LoRA was trained
   on (``kie_task.py``). Input = layout-region crop (union of blocks + 3% margin)
   shrunk to 262144 px, ``max_slice_nums=1``, the 16-field prompt; the message
   structure is the one of the LoRA ``train.py`` collate. Rows need an ``index``
   that the layout.jsonl knows.
+* ``whole_card``: the same prompt, budget, slices and messages, on the
+  ``whole_card_v2`` cache (``/home/mr_jiang/Lora/datasets/IDSpace/whole_card``:
+  each image is already the perspective-rectified, orientation-corrected card).
+  No crop: the image only gets the 262144-px budget, as in
+  ``IDextract/official_9to1/train.py``. No layout.jsonl.
 * ``idspace_legacy``: the earlier setup (full image, serving resize to a 2048
   longest side, the 12-field IDSpace prompt of ``specdec/eagle3``).
 
@@ -49,7 +54,7 @@ __all__ = ["IDSPACE_PROMPT", "KIE_PROMPT", "IDSpaceMiniCPMDataset", "add_data_ar
            "make_datasets_factory", "serialize_target", "split_train_val"]
 
 SERVING_MAX_SIDE = 2048
-TASKS = ("kie", "idspace_legacy")
+TASKS = ("kie", "whole_card", "idspace_legacy")
 
 
 def serving_resize(image: Image.Image) -> Image.Image:
@@ -61,14 +66,15 @@ def serving_resize(image: Image.Image) -> Image.Image:
 class IDSpaceMiniCPMDataset(IDSpaceGroundTruthDataset):
     """One teacher-forced sample per row.
 
-    ``regions`` (``{row index: crop box}``) switches on the KIE input: crop, then
-    the ``max_pixels`` budget. Without it the full image gets the serving resize.
+    ``regions`` (``{row index: crop box}``) crops each image before the
+    ``max_pixels`` budget. Without regions the full image gets the ``max_pixels``
+    budget, or the legacy serving resize when ``max_pixels`` is None.
     ``max_slice_nums`` is passed to the processor when not None.
     """
 
     def __init__(self, jsonl_path, image_root, processor, prompt: str = KIE_PROMPT,
                  image_first: bool = True, max_samples: int = 0, regions: dict | None = None,
-                 max_pixels: int = KIE_MAX_PIXELS, max_slice_nums: int | None = KIE_MAX_SLICE_NUMS):
+                 max_pixels: int | None = KIE_MAX_PIXELS, max_slice_nums: int | None = KIE_MAX_SLICE_NUMS):
         super().__init__(jsonl_path, image_root, processor, max_samples)
         self.prompt = prompt
         self.image_first = image_first
@@ -84,6 +90,8 @@ class IDSpaceMiniCPMDataset(IDSpaceGroundTruthDataset):
         image_path = self._image_path(row)
         if self.regions is not None:
             return open_image(image_path, self.max_pixels, self.regions[row["index"]]), image_path
+        if self.max_pixels is not None:
+            return open_image(image_path, self.max_pixels), image_path
         with Image.open(image_path) as source:
             image = source.convert("RGB")
             image.load()
@@ -145,13 +153,14 @@ def collate_single(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def add_data_args(p: argparse.ArgumentParser) -> None:
     """Rendering options shared by train_dspark, check_alignment and measure_lengths."""
     p.add_argument("--task", choices=TASKS, default="kie",
-                   help="kie: layout-region crop + 16-field prompt, as the MiniCPM-OCR LoRA was trained "
-                        "(needs --layout-jsonl); idspace_legacy: full image + 12-field IDSpace prompt")
+                   help="kie: layout-region crop + 16-field prompt, as the first MiniCPM-OCR LoRA was trained "
+                        "(needs --layout-jsonl); whole_card: rectified whole-card cache + 16-field prompt, no crop; "
+                        "idspace_legacy: full image + 12-field IDSpace prompt")
     p.add_argument("--layout-jsonl", type=Path, default=None,
                    help="layout.jsonl of the LoRA data run (crop regions, keyed by row 'index')")
-    p.add_argument("--max-pixels", type=int, default=KIE_MAX_PIXELS, help="kie: pixel budget after the crop")
+    p.add_argument("--max-pixels", type=int, default=KIE_MAX_PIXELS, help="kie/whole_card: pixel budget")
     p.add_argument("--max-slice-nums", type=int, default=KIE_MAX_SLICE_NUMS,
-                   help="kie: processor max_slice_nums (the LoRA used 1; vLLM must serve with the same)")
+                   help="kie/whole_card: processor max_slice_nums (the LoRA used 1; vLLM must serve with the same)")
     p.add_argument("--prompt-file", type=Path, default=None,
                    help="user prompt text overriding the task default; must be the prompt the target is served with")
     p.add_argument("--text-first", action="store_true",
@@ -179,14 +188,16 @@ def make_datasets_factory(args, processor):
         if args.layout_jsonl is None:
             raise ValueError("--task kie needs --layout-jsonl (the crop regions the target was trained on)")
         regions = load_regions(args.layout_jsonl)
-        prompt, max_slice_nums = KIE_PROMPT, args.max_slice_nums
+        prompt, max_pixels, max_slice_nums = KIE_PROMPT, args.max_pixels, args.max_slice_nums
+    elif args.task == "whole_card":
+        regions, prompt, max_pixels, max_slice_nums = None, KIE_PROMPT, args.max_pixels, args.max_slice_nums
     else:
-        regions, prompt, max_slice_nums = None, IDSPACE_PROMPT, None
+        regions, prompt, max_pixels, max_slice_nums = None, IDSPACE_PROMPT, None, None
     if args.prompt_file:
         prompt = args.prompt_file.read_text(encoding="utf-8").strip()
 
     def make(jsonl_path, max_samples: int = 0):
         return IDSpaceMiniCPMDataset(jsonl_path, args.image_root, processor, prompt, not args.text_first,
-                                     max_samples, regions=regions, max_pixels=args.max_pixels,
+                                     max_samples, regions=regions, max_pixels=max_pixels,
                                      max_slice_nums=max_slice_nums)
     return make

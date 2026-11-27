@@ -285,7 +285,7 @@ class DatasetMaskTest(unittest.TestCase):
             (root / "train.jsonl").write_text(json.dumps({"image": "images/a.png", "target": target}) + "\n")
             processor = FakeProcessor()
             sample = IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="read card",
-                                           max_slice_nums=None)[0]
+                                           max_pixels=None, max_slice_nums=None)[0]
         ids = sample["inputs"]["input_ids"][0].tolist()
         answer = processor.tokenizer(serialize_target(target)).input_ids
         start = ids.index(answer[0])
@@ -319,6 +319,32 @@ class DatasetMaskTest(unittest.TestCase):
             self.assertEqual(call["size"], (int(2000 * ratio), int(1000 * ratio)))
             with self.assertRaises(KeyError):
                 IDSpaceMiniCPMDataset(root / "train.jsonl", root, processor, prompt="p", regions={8: [0, 0, 1, 1]})
+
+    def test_whole_card_budget_without_crop(self):
+        from PIL import Image
+        from idspace_minicpm_dataset import make_datasets_factory
+        from kie_task import KIE_PROMPT
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Image.new("RGB", (1600, 1000)).save(root / "card.png")
+            Image.new("RGB", (640, 400)).save(root / "small.png")
+            rows = [{"index": 3, "image": str(root / "card.png"), "target": {"name": "A"}},   # absolute path
+                    {"index": 4, "image": str(root / "small.png"), "target": {"name": "B"}}]
+            (root / "train.jsonl").write_text("".join(json.dumps(r) + "
+" for r in rows))
+            args = SimpleNamespace(task="whole_card", layout_jsonl=None, max_pixels=262144, max_slice_nums=1,
+                                   prompt_file=None, text_first=False, image_root=root / "unused")
+            processor = FakeProcessor()
+            dataset = make_datasets_factory(args, processor)(root / "train.jsonl")
+            self.assertIsNone(dataset.regions)
+            self.assertEqual(dataset.prompt, KIE_PROMPT)
+            dataset[0]
+            ratio = (262144 / (1600 * 1000)) ** 0.5
+            self.assertEqual(processor.calls[-1]["size"], (int(1600 * ratio), int(1000 * ratio)))  # whole image
+            self.assertEqual(processor.calls[-1]["max_slice_nums"], 1)
+            dataset[1]
+            self.assertEqual(processor.calls[-1]["size"], (640, 400))   # under the budget: untouched
 
 
 class KieTaskTest(unittest.TestCase):
